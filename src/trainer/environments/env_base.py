@@ -1,0 +1,59 @@
+from __future__ import annotations
+import torch
+from torch import nn
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+from transformers import PreTrainedTokenizer
+
+import abc, dataclasses
+from typing import Dict
+
+from src.trainer.actors.actors import TrainableLLMActor
+
+from dataclasses import dataclass
+from typing import Callable, Iterable
+
+
+from src.trainer.losses.base_loss import BaseRLLoss
+
+
+@dataclass
+class ActorSpec:
+    actor_name: str
+    model_factory: Callable[[], nn.Module]
+    tokenizer: PreTrainedTokenizer
+    loss_factory: Callable[[], BaseRLLoss]
+    optim_factory: Callable[[Iterable[nn.Parameter]], Optimizer]
+    scheduler_factory: Callable[[Optimizer], LRScheduler]
+    reference_model_factory: Callable[[], nn.Module] | None = None
+
+@dataclasses.dataclass
+class _Entry:
+    actor: TrainableLLMActor
+    spec: ActorSpec
+
+
+class Environment(abc.ABC):
+
+    def __init__(self) -> None:
+        self._reg: Dict[str, _Entry] = {}
+
+    def register(self, actor: TrainableLLMActor, spec: ActorSpec) -> None:
+        if actor.name != spec.actor_name:
+            raise ValueError("actor.name and spec.actor_name must match")
+        if actor.name in self._reg:
+            raise ValueError(f"duplicate actor {actor.name}")
+        self._reg[actor.name] = _Entry(actor=actor, spec=spec)
+
+    # ------------------------------------------------------------------
+    def get_actor_specs(self) -> Dict[str, tuple[TrainableLLMActor, ActorSpec]]:
+        return {k: (v.actor, v.spec) for k, v in self._reg.items()}
+
+    # ------------------------------------------------------------------
+    @abc.abstractmethod
+    def __call__(self, batch) -> Dict[str, list[dict]]:
+        """
+        Must return:  { actor_name : [ { "reward": float,
+                                         "input_ids": List[int],
+                                         "attention_mask": List[int] } ] }
+        """

@@ -1,0 +1,6 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: DEEPSPEED
+deepspeed_config:
+  deepspeed_config_file: /home/rd/Desktop/actors/zero_stage3_offload_config.json
+  zero3_init_flag: true
+num_processes: 1
