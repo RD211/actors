@@ -1,3 +1,10 @@
+import os, warnings
+os.environ["PYTHONWARNINGS"] = "ignore::UserWarning:multiprocessing.resource_tracker"
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module=r"multiprocessing\.resource_tracker",
+)
 import gc
 import deepspeed
 import torch
@@ -7,14 +14,13 @@ import ctypes
 from multiprocessing import shared_memory
 from concurrent.futures import ThreadPoolExecutor
 
-
 def get_shareable_version(meta):
     return {
         key: {k: v for k, v in meta[key].items() if k != "_shm_obj"} for key in meta
     }
 
 
-def create_shared_state_dict(state_dict, max_workers=200):
+def create_shared_state_dict(state_dict, max_workers=300):
 
     def make_shm(key, tensor):
         if tensor.device.type != "cpu":
@@ -97,7 +103,7 @@ def load_shared_state_dict(meta):
             state_dict[k] = t
     return state_dict
 
-def gather_incremental_state_dict_to_cpu(accelerator, logger, model, batch_size=120):
+def gather_incremental_state_dict_to_cpu(accelerator, logger, model, batch_size=300):
     state_dict = {}
     
     def _copy_to_cpu(name_param):
