@@ -41,16 +41,16 @@ def gpu_tracker(
         import wandb  # safe: we already know wandb exists
 
         wandb_log = {
-            f"{name}/time_s": elapsed,
+            f"Profile/{name}/time_s": elapsed,
             "step": step,
         }
 
         if not no_memory_measurement:
             wandb_log.update(
                 {
-                    f"{name}/mem_peak_mb": peak_mem / 1e6,
-                    f"{name}/mem_start_mb": start_mem / 1e6,
-                    f"{name}/mem_diff_mb": (peak_mem - start_mem) / 1e6,
+                    f"Profile/{name}/mem_peak_mb": peak_mem / 1e6,
+                    f"Profile/{name}/mem_start_mb": start_mem / 1e6,
+                    f"Profile/{name}/mem_diff_mb": (peak_mem - start_mem) / 1e6,
                 }
             )
 

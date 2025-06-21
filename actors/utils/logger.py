@@ -37,6 +37,7 @@ class Palette:
     BOLD = colorama.Style.BRIGHT
     CYAN = colorama.Fore.CYAN
     VERB = colorama.Fore.MAGENTA + colorama.Style.BRIGHT
+    YELLOW = colorama.Fore.YELLOW + colorama.Style.BRIGHT
 
 
 def colorize(text: str, style: str) -> str:

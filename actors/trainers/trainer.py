@@ -100,7 +100,8 @@ class Trainer:
         self.use_wandb = use_wandb
         self.log_every_n = log_every_n
         self.use_dashboard = use_dashboard
-        self._step = 0
+        self._step = 0  # WandB step counter - always increments for each logged metric
+        self._logical_step = 0  # Actual training step counter
         # ----- distributed / mixed precision ---------------------------------
         self.accel = Accelerator(
             mixed_precision="bf16",
@@ -318,10 +319,10 @@ class Trainer:
 
                 metrics = self.train_step(raw_batch)
 
-                if checkpoint_every_n and self._step % checkpoint_every_n == 0:
-                    path = os.path.join(run_checkpoint_path, f"step_{self._step}")
+                if checkpoint_every_n and self._logical_step % checkpoint_every_n == 0:
+                    path = os.path.join(run_checkpoint_path, f"step_{self._logical_step}")
                     if self.accel.is_main_process:
-                        self.logger.quiet(colorize(f"💾 Checkpoint saved: step_{self._step}", Palette.VERB))
+                        self.logger.quiet(colorize(f"💾 Checkpoint saved: step_{self._logical_step}", Palette.VERB))
                     self.save_checkpoint(path)
 
                     if self.accel.is_main_process and max_checkpoints_to_keep is not None:
@@ -336,7 +337,7 @@ class Trainer:
                                 self.logger.verbose(colorize(f"🗑️  Cleaned up old checkpoint {c}", Palette.VERB))
                                 shutil.rmtree(to_delete)
 
-                if self.accel.is_main_process and self._step % self.log_every_n == 0:
+                if self.accel.is_main_process and self._logical_step % self.log_every_n == 0:
                     # Calculate progress and ETA
                     progress = (total_steps / total_expected_steps) * 100
                     eta_str = "N/A"
@@ -351,9 +352,9 @@ class Trainer:
                     
                     # Clean, modern step header
                     if max_steps:
-                        header = f"🚀 STEP {self._step:,}/{max_steps:,} ({progress:.1f}%) • ETA: {eta_str}"
+                        header = f"STEP {self._logical_step:,}/{max_steps:,} ({progress:.1f}%) • ETA: {eta_str}"
                     else:
-                        header = f"🚀 STEP {self._step:,} • EPOCH {fractional_epoch:.2f}/{epochs} ({progress:.1f}%) • ETA: {eta_str}"
+                        header = f"STEP {self._logical_step:,} • EPOCH {fractional_epoch:.2f}/{epochs} ({progress:.1f}%) • ETA: {eta_str}"
 
                     # Show metrics in both normal and quiet modes (but not silent)
                     if self.logger.isEnabledFor(QUIET):
@@ -364,14 +365,60 @@ class Trainer:
                                 continue
                             
                             self.logger.quiet(colorize(f"   🎭 {actor_name}:", Palette.CYAN))
-                            # we only log the metrics for the last iteration
-                            actor_metrics = actor_metrics_list[-1]
-                            for m_name, m_val in actor_metrics.items():
-                                self.logger.quiet(colorize(f"      • {m_name}: {m_val:.3f}", Palette.CYAN))
-                                if self.use_wandb and is_wandb_active():
-                                    wandb.log({f"{actor_name}/{m_name}": m_val}, step=self._step)
+                            
+                            # Log metrics for ALL iterations, not just the last one
+                            for iteration_idx, actor_metrics in enumerate(actor_metrics_list):
+                                if not actor_metrics:
+                                    continue
+                                
+                                # Show iteration number if there are multiple iterations
+                                if self.num_iterations > 1:
+                                    self.logger.quiet(colorize(f"      📊 Iteration {iteration_idx + 1}:", Palette.YELLOW))
+                                    indent = "         "
+                                else:
+                                    indent = "      "
+                                
+                                # Static metrics that don't change between iterations (only show for first iteration)
+                                static_metrics = {"completion_len", "reward_mean", "reward_std"}
+                                
+                                for m_name, m_val in actor_metrics.items():
+                                    # Skip static metrics for iterations beyond the first
+                                    if iteration_idx > 0 and m_name in static_metrics:
+                                        continue
+                                        
+                                    self.logger.quiet(colorize(f"{indent}• {m_name}: {m_val:.3f}", Palette.CYAN))
                         
                         self.logger.quiet("")  # Add a blank line for spacing
+
+                # ALWAYS log to WandB if enabled, regardless of log_every_n or logging level
+                if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
+                    import wandb
+                    
+                    # Static metrics that don't change between iterations (only log for first iteration)
+                    static_metrics = {"completion_len", "reward_mean", "reward_std"}
+                    
+                    # Iterate over iterations first, then actors for each iteration
+                    for iteration_idx in range(self.num_iterations):
+                        # Increment step once per iteration for WandB logging
+                        if iteration_idx > 0:  # First iteration uses the step from train_step
+                            self._step += 1
+                        
+                        # Log all metrics for this iteration to WandB
+                        for actor_name, actor_metrics_list in metrics.items():
+                            if not actor_metrics_list or iteration_idx >= len(actor_metrics_list):
+                                continue
+                            
+                            actor_metrics = actor_metrics_list[iteration_idx]
+                            if not actor_metrics:
+                                continue
+                            
+                            for m_name, m_val in actor_metrics.items():
+                                # Skip static metrics for iterations beyond the first
+                                if iteration_idx > 0 and m_name in static_metrics:
+                                    continue
+                                
+                                wandb_key = f"{actor_name}/{m_name}"
+                                wandb.log({wandb_key: m_val}, step=self._step)
                 
                 total_steps += 1
 
@@ -382,7 +429,8 @@ class Trainer:
         Returns a nested dict of averaged metrics:
         `{actor_name: {"loss": float, "kl": float, ...}, ...}`
         """
-        self._step += 1
+        self._logical_step += 1
+        self._step += 1  # Increment WandB step counter
         
         # Log sampling stage in normal mode
         if self.accel.is_main_process and self.logger.isEnabledFor(NORMAL):
@@ -391,7 +439,7 @@ class Trainer:
         batch = expand_batch(raw_batch, self.group_size)
         env_out = self.env(batch)
 
-        if self.use_wandb and is_wandb_active() and self.accel.is_main_process and self._step % self.log_every_n == 0:
+        if self.use_wandb and is_wandb_active() and self.accel.is_main_process and self._logical_step % self.log_every_n == 0:
             import wandb
             for name, ta in self.actors.items():
                 if name in env_out and "input_ids" in raw_batch:
@@ -410,6 +458,7 @@ class Trainer:
                                 reward = rewards[idx]
                                 table.add_data(prompt_text, completion_text, reward)
                     
+                    # Use the current step for completions table
                     wandb.log({f"{name}/completions": table}, step=self._step)
 
         # warn about unexpected actor keys (once per step, rank==0 only)
@@ -569,7 +618,7 @@ class Trainer:
         self.accel.wait_for_everyone()
         self.accel.save_state(output_dir=path) 
         if self.accel.is_main_process:
-            state = {"step": self._step}
+            state = {"step": self._step, "logical_step": self._logical_step}
             with open(os.path.join(path, "trainer_state.json"), "w") as f:
                 json.dump(state, f)
         self.accel.wait_for_everyone()
@@ -582,6 +631,7 @@ class Trainer:
             with open(state_path, "r") as f:
                 state = json.load(f)
             self._step = state.get("step", 0)
+            self._logical_step = state.get("logical_step", 0)
         
         # Update vLLM/trainable actors with the new weights and sleep them
         if self.accel.is_main_process:

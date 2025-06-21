@@ -2,6 +2,7 @@ import torch
 from actors.environments.env_base import Environment, ActorSpec
 from actors.actors import vLLMActor
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from actors.losses.grpo_loss import GRPOLoss
 from actors.losses.liger_grpo_loss import LigerLoss
 from torch.optim.lr_scheduler import LinearLR, ConstantLR
@@ -28,12 +29,12 @@ class MyEnv(Environment):
                 "Qwen/Qwen2.5-0.5B-Instruct", torch_dtype=torch.bfloat16, use_cache=False, trust_remote_code=True
             ),
             tokenizer    = tok,
-            loss_factory = lambda: GRPOLoss(beta=0.0, temperature=1.0),
+            loss_factory = lambda: GRPOLoss(beta=0.04, temperature=1.0),
             optim_factory=lambda p: bnb.optim.PagedAdam8bit(p, lr=2e-6),
             scheduler_factory=lambda o: ConstantLR(o, factor=1.0, total_iters=1),
-            # reference_model_factory=lambda: AutoModelForCausalLM.from_pretrained(
-            #     "Qwen/Qwen2.5-3B-Instruct", torch_dtype=torch.bfloat16, use_cache=False, trust_remote_code=True
-            # )
+            reference_model_factory=lambda: AutoModelForCausalLM.from_pretrained(
+                "Qwen/Qwen2.5-0.5B-Instruct", torch_dtype=torch.bfloat16, use_cache=False, trust_remote_code=True
+            )
         )
         actor.sleep(1)
         self.register(actor, spec)
@@ -69,7 +70,7 @@ def main():
                       group_size=4, 
                       batch_size=16,
                       grad_accumulation_steps=1, 
-                      num_iterations=2,
+                      num_iterations=8,
                       reference_batch_size=2,
                       log_every_n=1,
                       )

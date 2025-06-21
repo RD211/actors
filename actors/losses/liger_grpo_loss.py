@@ -28,9 +28,8 @@ class LigerLoss(BaseRLLoss):
         self,
         *,
         beta: float,
-        loss_type: AllowedLoss,
-        use_ref_model: bool,
-        temperature: float,
+        temperature: float = 1.0,
+        loss_type: AllowedLoss = "bnpo",
     ) -> None:
         super().__init__()
 
@@ -39,11 +38,10 @@ class LigerLoss(BaseRLLoss):
 
         self.core: LigerFusedLinearGRPOLoss = LigerFusedLinearGRPOLoss(
             beta=beta,
-            use_ref_model=use_ref_model,
+            use_ref_model=beta > 0.0,
             loss_type=loss_type,
             temperature=temperature,
         )
-        self.use_ref_model: bool = use_ref_model
 
     # ---------------------------------------------------------------- forward
     def forward(
@@ -64,7 +62,7 @@ class LigerLoss(BaseRLLoss):
         tgt_ids: Tensor = input_ids[:, 1:]
         mask: Tensor = attention_mask[:, 1:]
 
-        loss, (kl,) = self.core(
+        loss, (kl,_) = self.core(
             _input=hidden,
             lin_weight=policy.lm_head.weight,
             bias=policy.lm_head.bias,
