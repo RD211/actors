@@ -1,13 +1,13 @@
 import torch
-from src.trainer.environments.env_base import Environment, ActorSpec
-from src.trainer.actors.actors import vLLMActor
+from actors.trainer.environments.env_base import Environment, ActorSpec
+from actors.trainer.actors.actors import vLLMActor
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from src.trainer.losses.grpo_loss import GRPOLoss
-from src.trainer.losses.liger_grpo_loss import LigerLoss
+from actors.trainer.losses.grpo_loss import GRPOLoss
+from actors.trainer.losses.liger_grpo_loss import LigerLoss
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, ConstantLR
 from vllm import SamplingParams
-from src.trainer.trainers.trainer import Trainer
+from actors.trainer.trainers.trainer import Trainer
 import bitsandbytes as bnb
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 
@@ -75,7 +75,7 @@ def main():
                       grad_accumulation_steps=1, 
                       num_iterations=1,
                       reference_batch_size=2,
-                      gradient_checkpointing=False,
+                      gradient_checkpointing=True,
                       )
     data = {
         "text": [
@@ -88,7 +88,7 @@ def main():
 
     # Initialize wandb
     import wandb
-    wandb.init(project="test_actors", entity="rd211", name="test-no-gradient-checkpointing")
+    wandb.init(project="test_actors", entity="rd211", name="test")
 
     for _ in range(10000):  # Run for 10 training steps
         metrics = trainer.train_step(data)

@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 
 import torch
 from vllm import RequestOutput, SamplingParams
+import ray
 
 from actors.utils.logger import Palette, colorize, logger
 from actors.server.worker import ModelWorker
@@ -28,7 +29,7 @@ class ModelRecord:
     is_v1: bool
     gpu_groups: List[List[int]]
     kwargs: Dict[str, Any]
-    workers: List[ModelWorker] = field(default_factory=list)
+    workers: List[Any] = field(default_factory=list)
     stats: ModelStats = field(default_factory=ModelStats)
 
 
@@ -56,7 +57,7 @@ class ModelPool:
             return
         self.total_gpus = torch.cuda.device_count()
         self.models: Dict[str, ModelRecord] = {}
-        threading.Thread(target=self._dashboard_loop, daemon=True).start()
+        ray.init(ignore_reinit_error=True)
         self._init_done = True
     # ------------- dashboard --------------------------------------
     def _render_dashboard(self) -> str:
@@ -98,12 +99,6 @@ class ModelPool:
 
         return "\n".join(prettified)
 
-
-    def _dashboard_loop(self) -> None:
-        while True:
-            time.sleep(self.DASH_INTERVAL)
-            logger.info("\n" + self._render_dashboard())
-
     # ------------- RPC helpers ------------------------------------
     def list_models(self) -> List[str]:
         return list(self.models)
@@ -135,20 +130,15 @@ class ModelPool:
             size = math.ceil(len(ids) / gpu_groups)
             gpu_groups = [ids[i * size : (i + 1) * size] for i in range(gpu_groups)]
 
-        logger.info(colorize(f"⏳  Loading {name}", Palette.INFO))
+        logger.info(colorize(f"⏳  Loading {name} on {len(gpu_groups)} GPU groups", Palette.INFO))
         start = time.monotonic()
         workers = [
-            ModelWorker(name, model_path, grp, use_v1_engine, engine_kwargs)
+            ModelWorker.remote(name, model_path, grp, use_v1_engine, engine_kwargs)
             for grp in gpu_groups
         ]
-        for w in workers:
-            w.start()
 
         # wait for readiness
-        for w in workers:
-            status, *detail = w.outbox.get()
-            if status != "READY":
-                raise RuntimeError(detail[0])
+        ray.get([w.ready.remote() for w in workers])
         logger.info(
             colorize(
                 f"✅  Ready {name} in {time.monotonic()-start:.1f}s", Palette.SUCCESS
@@ -164,43 +154,47 @@ class ModelPool:
         if not rec:
             raise RuntimeError("no such model")
         for w in rec.workers:
-            w.inbox.put(("QUIT", None))
-            w.join()
+            ray.kill(w)
         logger.warning(colorize(f"✖️   Unloaded {name}", Palette.WARNING))
 
     # ------------- sleep / wake -----------------------------------
     def sleep(self, name: str, level: int = 1) -> None:
         rec = self.models[name]
-        for w in rec.workers:
-            w.inbox.put(("SLEEP", level))
-            w.outbox.get()
+        ray.get([w.sleep.remote(level) for w in rec.workers])
         logger.warning(colorize(f"🛌  Sleep {name}", Palette.WARNING))
 
     def wake(self, name: str) -> None:
         rec = self.models[name]
-        for w in rec.workers:
-            w.inbox.put(("WAKE", None))
-            w.outbox.get()
+        ray.get([w.wake.remote() for w in rec.workers])
         logger.warning(colorize(f"⚡  Wake {name}", Palette.WARNING))
 
     # ------------- weights swap -----------------------------------
-    def update_weights(self, name: str, meta_blob: dict) -> None:
+    def start_update(self, name: str) -> None:
         rec = self.models[name]
-        logger.info(colorize(f"♻️  Weights {name}", Palette.INFO))
+        logger.info(colorize(f"♻️  Starting weight update for {name}", Palette.INFO))
+        ray.get([w.start_update.remote() for w in rec.workers])
 
-        # We make sure the model is not sleeping
-        self.wake(name)
-
-        for w in rec.workers:
-            w.inbox.put(("UPDATE_WEIGHTS", meta_blob))
-            status, *msg = w.outbox.get()
+    def update_weights_batch(self, name: str, ipc_handles_batch: dict) -> None:
+        rec = self.models[name]
+        results = ray.get(
+            [w.update_weights_batch.remote(ipc_handles_batch) for w in rec.workers]
+        )
+        for status, msg in results:
             if status == "ERROR":
-                raise RuntimeError(msg[0])
+                raise RuntimeError(msg)
+
+    def finalize_update(self, name: str) -> None:
+        rec = self.models[name]
+        self.wake(name)
+        results = ray.get([w.finalize_update.remote() for w in rec.workers])
+        for status, msg in results:
+            if status == "ERROR":
+                raise RuntimeError(msg)
         logger.info(colorize(f"✅  Finished updating {name} weights", Palette.SUCCESS))
 
     # ------------- inference internal -----------------------------
     @staticmethod
-    def _scatter(batch: List[Any], workers: List[ModelWorker]) -> List[list]:
+    def _scatter(batch: List[Any], workers: List[Any]) -> List[list]:
         shards: List[list] = [[] for _ in workers]
         for idx, item in enumerate(batch):
             shards[idx % len(workers)].append((idx, item))
@@ -222,23 +216,20 @@ class ModelPool:
         rec = self.models[name]
         shards = self._scatter(payload, rec.workers)
 
-        request_id = uuid.uuid4().hex
         start = time.monotonic()
 
+        futures = []
+        infer_fn_name = "generate" if msg_type == "GENERATE" else "chat"
         for worker, shard in zip(rec.workers, shards):
-            worker.inbox.put((msg_type, (request_id, shard, sampling_params)))
+            if shard:
+                futures.append(getattr(worker, infer_fn_name).remote(shard, sampling_params))
 
-        collected: List[list] = []
-        for worker in rec.workers:
-            status, *detail = worker.outbox.get()
-            if status == "ERROR":
-                raise RuntimeError(detail[0])
-            _, shard = detail
-            collected.append(shard)
-
+        collected: List[list] = ray.get(futures)
 
         duration = time.monotonic() - start
         merged = self._gather(collected)
+        if not merged:
+            return []
         produced_tokens = sum(len(o.outputs[0].token_ids) for o in merged)
 
         rec.stats.request_count += len(payload)

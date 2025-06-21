@@ -1,11 +1,13 @@
 from __future__ import annotations
-import abc, contextlib, logging, random, time
+import abc, logging, random, time
 from typing import Dict, List, Sequence
 import openai, torch
-from multiprocessing import managers
 from vllm import SamplingParams, RequestOutput
-from actors.utils.shm_utils import create_shared_state_dict, get_shareable_version
 from actors.utils.logger import init_logger
+from actors.server.pool import ModelPool
+from torch.multiprocessing.reductions import reduce_tensor
+from vllm.platforms import current_platform
+
 
 logger = init_logger(__name__, level=logging.INFO)
 
@@ -22,7 +24,16 @@ class LLMActor(abc.ABC):
 
 class TrainableLLMActor(LLMActor):
     @abc.abstractmethod
-    def update_weights(self, state_dict: Dict[str, torch.Tensor]): ...
+    def start_weight_update(self):
+        ...
+
+    @abc.abstractmethod
+    def update_weights_batch(self, state_dict: Dict[str, torch.Tensor]):
+        ...
+
+    @abc.abstractmethod
+    def finalize_weight_update(self):
+        ...
 
 
 class vLLMActor(TrainableLLMActor):
@@ -31,14 +42,12 @@ class vLLMActor(TrainableLLMActor):
         *,
         name: str,
         model_path: str,
-        server_host: str = "localhost",
-        server_port: int = 6000,
         gpu_groups: List[List[int]] | int | None = None,
         use_v1_engine: bool = True,
         engine_kwargs: Dict[str, any] | None = None,
     ):
         super().__init__(name)
-        self.pool = self._connect(server_host, server_port, auth="secret")
+        self.pool = ModelPool()
         if name not in self.pool.list_models():
             self.pool.load_model(
                 name=name,
@@ -47,15 +56,6 @@ class vLLMActor(TrainableLLMActor):
                 use_v1_engine=use_v1_engine,
                 engine_kwargs=engine_kwargs,
             )
-
-    @staticmethod
-    def _connect(host: str, port: int, auth: str | None):
-        class _Mgr(managers.BaseManager): ...
-
-        _Mgr.register("ModelPool")
-        m = _Mgr(address=(host, port), authkey=(auth.encode() if auth else None))
-        m.connect()
-        return m.ModelPool()
 
     def generate(
         self, prompts: Sequence[str], sampling_params: SamplingParams | None = None
@@ -69,15 +69,40 @@ class vLLMActor(TrainableLLMActor):
         sampling = sampling_params or SamplingParams()
         return self.pool.chat(self.name, list(dialogs), sampling)
 
-    def update_weights(self, state_dict: Dict[str, torch.Tensor]):
-        meta = create_shared_state_dict(state_dict)
-        try:
-            self.pool.update_weights(self.name, get_shareable_version(meta))
-        finally:
-            for blob in meta.values():
-                with contextlib.suppress(Exception):
-                    blob["_shm_obj"].close()
-                    blob["_shm_obj"].unlink()
+    def start_weight_update(self):
+        self.pool.start_update(self.name)
+
+    def update_weights_batch(self, state_dict: Dict[str, torch.Tensor]):
+        if not state_dict:
+            return
+
+        # Group tensors by device to handle multi-GPU training scenarios
+        tensors_by_device: Dict[torch.device, Dict[str, torch.Tensor]] = {}
+        for name, tensor in state_dict.items():
+            device = tensor.device
+            if device not in tensors_by_device:
+                tensors_by_device[device] = {}
+            tensors_by_device[device][name] = tensor
+
+        all_ipc_handles = {}
+        for device, tensors in tensors_by_device.items():
+            if device.type == "cuda":
+                device_uuid = current_platform.get_device_uuid(device.index)
+
+                ipc_handles = {
+                    name: reduce_tensor(p.detach()) for name, p in tensors.items()
+                }
+
+                all_ipc_handles[device_uuid] = ipc_handles
+
+        if not all_ipc_handles:
+            # This can happen if the batch is empty or contains only non-CUDA tensors
+            return
+
+        self.pool.update_weights_batch(self.name, all_ipc_handles)
+
+    def finalize_weight_update(self):
+        self.pool.finalize_update(self.name)
 
     def sleep(self, level: int = 1):
         self.pool.sleep(self.name, level)

@@ -13,7 +13,7 @@ from transformers import PreTrainedTokenizerBase
 
 # ----- project-local helpers -------------------------------------------------
 from actors.utils.logger import init_logger, colorize, Palette
-from actors.utils.shm_utils import gather_incremental_state_dict_to_cpu
+from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.trainer.environments.env_base import Environment
 from actors.trainer.losses.base_loss import BaseRLLoss
 from actors.utils.tracker import gpu_profiler
@@ -361,10 +361,21 @@ class Trainer:
     # ------------------------------------------------------------------ #
     @gpu_profiler(name='update_actor_weights')
     def _update_actor_weights(self, ta: TrainableLLMActor) -> None:
-        state = gather_incremental_state_dict_to_cpu(self.accel, self.logger, ta.model)
-        if self.accel.is_main_process:
-            ta.actor.update_weights(state)
+        # On each node, the local main process will orchestrate the update.
+        if self.accel.is_local_main_process:
+            ta.actor.start_weight_update()
 
+        # This callback will be executed on the local main process of each node for each batch.
+        def stream_batch_callback(batch_state_dict):
+            if self.accel.is_local_main_process:
+                ta.actor.update_weights_batch(batch_state_dict)
+
+        gather_and_stream_state_dict(
+            self.accel, self.logger, ta.model, stream_batch_callback
+        )
+
+        if self.accel.is_local_main_process:
+            ta.actor.finalize_weight_update()
 
 
     # ------------------------------------------------------------------ #
