@@ -62,3 +62,7 @@ venv.bak/
 
 # Wandb
 wandb/
+
+# Others
+checkpoints/
+checkpoint/

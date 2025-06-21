@@ -33,7 +33,7 @@ class OpenAIActor(LLMActor):
             try:
                 return fn(*args, **kwargs)
             except Exception as e:
-                logger.warning(f"[retry {attempt}] OpenAI error: {e}")
+                logger.verbose(f"[retry {attempt}] OpenAI error: {e}")
                 if attempt == self.retries:
                     raise
                 time.sleep(backoff + random.uniform(0, 1))

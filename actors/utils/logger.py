@@ -14,6 +14,18 @@ import torch
 colorama.init(autoreset=True)
 pynvml.nvmlInit()
 
+# Custom logging levels
+VERBOSE = 5      # Very detailed debug info with timing and extra details
+NORMAL = 20      # Standard operation logs (same as INFO)
+QUIET = 30       # Only important operations (same as WARNING)
+SILENT = 50      # Only critical errors
+
+# Add custom levels to logging module
+logging.addLevelName(VERBOSE, "VERBOSE")
+logging.addLevelName(NORMAL, "NORMAL")
+logging.addLevelName(QUIET, "QUIET")
+logging.addLevelName(SILENT, "SILENT")
+
 
 class Palette:
     SUCCESS = colorama.Fore.GREEN + colorama.Style.BRIGHT
@@ -22,6 +34,9 @@ class Palette:
     INFO = colorama.Fore.CYAN
     MUTED = colorama.Fore.BLUE
     RESET = colorama.Style.RESET_ALL
+    BOLD = colorama.Style.BRIGHT
+    CYAN = colorama.Fore.CYAN
+    VERB = colorama.Fore.MAGENTA + colorama.Style.BRIGHT
 
 
 def colorize(text: str, style: str) -> str:
@@ -31,11 +46,15 @@ def colorize(text: str, style: str) -> str:
 
 # ─────────────────────── GPU + RAM formatter ───────────────────────────
 _LEVEL_COLOURS: Dict[int, str] = {
+    VERBOSE: colorama.Fore.LIGHTBLACK_EX,
     logging.DEBUG: colorama.Fore.CYAN,
     logging.INFO: colorama.Fore.GREEN,
+    NORMAL: colorama.Fore.GREEN,
     logging.WARNING: colorama.Fore.YELLOW,
+    QUIET: colorama.Fore.YELLOW,
     logging.ERROR: colorama.Fore.RED,
     logging.CRITICAL: colorama.Fore.MAGENTA,
+    SILENT: colorama.Fore.MAGENTA,
 }
 
 
@@ -44,6 +63,9 @@ class GPUFormatter(logging.Formatter):
         super().__init__()
         self.show_rank = show_rank
         self.show_date = show_date
+        
+        # Check if we should show system stats based on environment variable
+        self.show_system_stats = os.getenv("ACTORS_LOGGING_LEVEL", "").lower() == "verbose"
 
     # ----------------------------------------- helpers
     @staticmethod
@@ -75,8 +97,50 @@ class GPUFormatter(logging.Formatter):
         if self.show_rank:
             parts.append(f"rk:{os.getenv('RANK', 0)}")
 
-        parts += [self._gpu_summary(), self._ram_summary(), record.getMessage()]
+        # Only add GPU/RAM stats if environment flag is set
+        if self.show_system_stats:
+            parts += [self._gpu_summary(), self._ram_summary()]
+        
+        parts.append(record.getMessage())
         return " | ".join(parts)
+
+
+# ───────────────────────────── convenience functions ─────────────────────────────
+def verbose(logger: logging.Logger, message: str, *args, **kwargs):
+    """Log a message with severity 'VERBOSE' (detailed debug info with timing)."""
+    if logger.isEnabledFor(VERBOSE):
+        logger._log(VERBOSE, message, args, **kwargs)
+
+def normal(logger: logging.Logger, message: str, *args, **kwargs):
+    """Log a message with severity 'NORMAL' (standard operation logs)."""
+    if logger.isEnabledFor(NORMAL):
+        logger._log(NORMAL, message, args, **kwargs)
+
+def quiet(logger: logging.Logger, message: str, *args, **kwargs):
+    """Log a message with severity 'QUIET' (only important operations)."""
+    if logger.isEnabledFor(QUIET):
+        logger._log(QUIET, message, args, **kwargs)
+
+def silent(logger: logging.Logger, message: str, *args, **kwargs):
+    """Log a message with severity 'SILENT' (only critical errors)."""
+    if logger.isEnabledFor(SILENT):
+        logger._log(SILENT, message, args, **kwargs)
+
+# Add methods to Logger class
+logging.Logger.verbose = lambda self, message, *args, **kwargs: verbose(self, message, *args, **kwargs)
+logging.Logger.normal = lambda self, message, *args, **kwargs: normal(self, message, *args, **kwargs)
+logging.Logger.quiet = lambda self, message, *args, **kwargs: quiet(self, message, *args, **kwargs)
+logging.Logger.silent = lambda self, message, *args, **kwargs: silent(self, message, *args, **kwargs)
+
+
+# ───────────────────────────── utility functions ─────────────────────────────
+def should_use_tqdm() -> bool:
+    """Check if tqdm should be enabled based on logging level."""
+    return os.getenv("ACTORS_LOGGING_LEVEL", "normal").lower() == "verbose"
+
+def get_logging_level() -> str:
+    """Get the current logging level from environment."""
+    return os.getenv("ACTORS_LOGGING_LEVEL", "normal").lower()
 
 
 # ───────────────────────────── init_logger ─────────────────────────────
@@ -100,7 +164,36 @@ def init_logger(
         If True, show full date; otherwise time only.
     level:
         Logging level threshold.
+        
+    Logging Levels:
+    - VERBOSE (5): Very detailed debug info with timing, GPU/RAM stats, tqdm enabled
+    - NORMAL (20): Standard operation logs including training metrics
+    - QUIET (30): Only important operations (checkpoints, epochs, errors)
+    - SILENT (50): Only critical errors
+    
+    Environment Variables:
+    - ACTORS_LOGGING_LEVEL: "verbose", "normal" (default), "quiet", "silent"
     """
+    # Override level based on environment variable if set
+    env_level = os.getenv("ACTORS_LOGGING_LEVEL", "normal").lower()
+    if env_level == "verbose":
+        level = VERBOSE
+        # Set vLLM logging environment for verbose mode
+        os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+        os.environ["VLLM_CONFIGURE_LOGGING"] = "1"
+    elif env_level == "normal":
+        level = NORMAL
+    elif env_level == "quiet":
+        level = QUIET
+        # Suppress vLLM logs in quiet mode
+        os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
+        os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
+    elif env_level == "silent":
+        level = SILENT
+        # Suppress vLLM logs in silent mode
+        os.environ["VLLM_LOGGING_LEVEL"] = "CRITICAL"
+        os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
+    
     logger = logging.getLogger(name)
     logger.setLevel(level)
 
@@ -117,5 +210,5 @@ logger = init_logger(
     name="server",
     show_rank=False,
     show_date=False,
-    level=logging.INFO,
+    level=NORMAL,
 )

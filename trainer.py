@@ -43,7 +43,6 @@ class MyEnv(Environment):
 
         self.actor.wake()
         texts = batch["text"]
-        print("Input texts:", texts)
         generations = self.actor.chat(
             [[{ "role": "user", "content": text }] for text in texts],
             sampling_params=SamplingParams(
@@ -53,7 +52,6 @@ class MyEnv(Environment):
         )
         generated_texts = [self.tokenizer.apply_chat_template([{"role": "user", "content": text}, 
                                                                {"role": "assistant", "content": gen.outputs[0].text}], tokenize=False) for text, gen in zip(texts, generations)]
-        print("Generated texts:", generated_texts[0])
         rewards = [-len(gen)/1000 for text, gen in zip(texts, generated_texts)]
         self.actor.sleep(1)
         return {
@@ -71,34 +69,26 @@ def main():
                       group_size=4, 
                       batch_size=16,
                       grad_accumulation_steps=1, 
-                      num_iterations=1,
+                      num_iterations=2,
                       reference_batch_size=2,
-                      gradient_checkpointing=True,
+                      log_every_n=1,
                       )
-    data = {
-        "text": [
-            "What is the capital of France?",
-            "Explain the theory of relativity.",
-            "What is the meaning of life?",
-            "Describe the process of photosynthesis."
-        ]
-    }
+    data = [
+            {"text": "What is the capital of France?"},
+            {"text":"Explain the theory of relativity."},
+            {"text": "How does quantum computing work?"},
+            {"text": "What is the weather like today?"},
+            {"text": "Tell me a joke."},
+            {"text": "What is the largest mammal?"},
+            {"text": "Who wrote 'To Kill a Mockingbird'?"},
+            {"text": "What is the speed of light?"},
+            {"text": "How do you make a cake?"},
+    ] * 120
 
     # Initialize wandb
     import wandb
     wandb.init(project="test_actors", entity="rd211", name="test")
-
-    for _ in range(10000):  # Run for 10 training steps
-        metrics = trainer.train_step(data)
-        # Pretty print the metrics
-        print("-" * 40)
-        for actor_name, actor_metrics in metrics.items():
-            print(f"Actor: {actor_name}")
-            for iteration in actor_metrics:
-                for metric_name, metric_value in iteration.items():
-                    print(f"  {metric_name}: {metric_value:.4f}")
-        print("-" * 40)
-    print("Training step completed successfully.")
+    trainer.train(data, checkpoint_every_n=30)
 
 if __name__ == "__main__":
     main()

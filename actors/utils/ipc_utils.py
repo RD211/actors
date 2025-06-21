@@ -17,7 +17,6 @@ def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model: tor
     
     params = list(model.named_parameters())
     total = len(params)
-    logger.info(f"Streaming {total} parameters in batches of {batch_size}")
 
     for start in range(0, total, batch_size):
         end = min(total, start + batch_size)
@@ -28,7 +27,6 @@ def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model: tor
         # Gathers the full parameters on all processes, but we only process it on the local main process.
         with deepspeed.zero.GatheredParameters(batch_params, modifier_rank=None):
             if accelerator.is_local_main_process:
-                logger.info(f"Gathering parameters {start} to {end} on local main process.")
                 batch_state_dict = {}
                 with ThreadPoolExecutor() as executor:
                     futures = executor.map(_copy_tensor, batch)
@@ -42,6 +40,5 @@ def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model: tor
                 callback(batch_state_dict)
             
         torch.cuda.empty_cache()
-        logger.info(f"Processed parameters {start} to {end}")
     
     accelerator.wait_for_everyone()

@@ -5,6 +5,7 @@ from typing import Callable, Optional
 
 import torch
 from .wandb import is_wandb_active
+from .logger import get_logging_level
 
 @contextmanager
 def gpu_tracker(
@@ -24,6 +25,12 @@ def gpu_tracker(
 
     elapsed = time.perf_counter() - start_time
     peak_mem = torch.cuda.max_memory_allocated(device)
+
+    # Log timing information in verbose mode
+    if get_logging_level() == "verbose":
+        from .logger import logger
+        mem_info = f" | Peak mem: {peak_mem/1e6:.1f}MB" if not no_memory_measurement else ""
+        logger.verbose(f"⏱️  {name}: {elapsed:.3f}s{mem_info}")
 
     # ----------------- WandB logging guard ---------------- #
     if (

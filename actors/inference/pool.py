@@ -105,7 +105,7 @@ class ModelPool:
 
     def print_models(self) -> str:
         board = self._render_dashboard()
-        logger.info("\n" + board)
+        logger.verbose("\n" + board)
         return board
 
     # ------------- model lifecycle --------------------------------
@@ -130,7 +130,7 @@ class ModelPool:
             size = math.ceil(len(ids) / gpu_groups)
             gpu_groups = [ids[i * size : (i + 1) * size] for i in range(gpu_groups)]
 
-        logger.info(colorize(f"⏳  Loading {name} on {len(gpu_groups)} GPU groups", Palette.INFO))
+        logger.normal(colorize(f"⏳  Loading {name} on {len(gpu_groups)} GPU groups", Palette.INFO))
         start = time.monotonic()
         workers = [
             ModelWorker.remote(name, model_path, grp, use_v1_engine, engine_kwargs)
@@ -139,7 +139,7 @@ class ModelPool:
 
         # wait for readiness
         ray.get([w.ready.remote() for w in workers])
-        logger.info(
+        logger.normal(
             colorize(
                 f"✅  Ready {name} in {time.monotonic()-start:.1f}s", Palette.SUCCESS
             )
@@ -155,23 +155,23 @@ class ModelPool:
             raise RuntimeError("no such model")
         for w in rec.workers:
             ray.kill(w)
-        logger.warning(colorize(f"✖️   Unloaded {name}", Palette.WARNING))
+        logger.quiet(colorize(f"✖️   Unloaded {name}", Palette.WARNING))
 
     # ------------- sleep / wake -----------------------------------
     def sleep(self, name: str, level: int = 1) -> None:
         rec = self.models[name]
         ray.get([w.sleep.remote(level) for w in rec.workers])
-        logger.warning(colorize(f"🛌  Sleep {name}", Palette.WARNING))
+        logger.verbose(colorize(f"🛌  Sleep {name}", Palette.WARNING))
 
     def wake(self, name: str) -> None:
         rec = self.models[name]
         ray.get([w.wake.remote() for w in rec.workers])
-        logger.warning(colorize(f"⚡  Wake {name}", Palette.WARNING))
+        logger.verbose(colorize(f"⚡  Wake {name}", Palette.WARNING))
 
     # ------------- weights swap -----------------------------------
     def start_update(self, name: str) -> None:
         rec = self.models[name]
-        logger.info(colorize(f"♻️  Starting weight update for {name}", Palette.INFO))
+        # Remove the "Starting weight update" log - it's too verbose
         ray.get([w.start_update.remote() for w in rec.workers])
 
     def update_weights_batch(self, name: str, ipc_handles_batch: dict) -> None:
@@ -190,7 +190,7 @@ class ModelPool:
         for status, msg in results:
             if status == "ERROR":
                 raise RuntimeError(msg)
-        logger.info(colorize(f"✅  Finished updating {name} weights", Palette.SUCCESS))
+        logger.normal(colorize(f"✅  Updated {name} weights", Palette.SUCCESS))
 
     # ------------- inference internal -----------------------------
     @staticmethod
@@ -236,7 +236,7 @@ class ModelPool:
         rec.stats.token_count += produced_tokens
         rec.stats.elapsed += duration
 
-        logger.info(
+        logger.normal(
             colorize(
                 f"📝 {msg_type} {len(payload)} requests {produced_tokens} tokens generated in {duration:.2f}s",
                 Palette.INFO,

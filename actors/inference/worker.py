@@ -3,6 +3,7 @@ import os, traceback, torch
 from typing import Any, Dict, List
 import ray
 from vllm import LLM, SamplingParams
+from actors.utils.logger import should_use_tqdm
 
 
 @ray.remote
@@ -82,7 +83,7 @@ class ModelWorker:
             return []
 
         indices, inputs = zip(*shard)
-        outputs = self.engine.generate(list(inputs), sampling_params)
+        outputs = self.engine.generate(list(inputs), sampling_params, use_tqdm=should_use_tqdm())
         return list(zip(indices, outputs))
 
     def chat(self, shard: list, sampling_params: SamplingParams) -> list:
@@ -92,5 +93,5 @@ class ModelWorker:
             return []
 
         indices, inputs = zip(*shard)
-        outputs = self.engine.chat(list(inputs), sampling_params)
+        outputs = self.engine.chat(list(inputs), sampling_params, use_tqdm=should_use_tqdm())
         return list(zip(indices, outputs))

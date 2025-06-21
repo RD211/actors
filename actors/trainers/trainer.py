@@ -1,22 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+import shutil
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
-import deepspeed                                    # noqa: F401 – used implicitly by Accelerate
 import torch
+from torch.utils.data import DataLoader, Dataset, RandomSampler
 from accelerate import Accelerator, InitProcessGroupKwargs
 from transformers import PreTrainedTokenizerBase
+from datasets import Dataset as HFDataset, DatasetDict
 
 # ----- project-local helpers -------------------------------------------------
-from actors.utils.logger import init_logger, colorize, Palette
+from actors.utils.logger import init_logger, colorize, Palette, VERBOSE, NORMAL, QUIET
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.environments.env_base import Environment
 from actors.losses.base_loss import BaseRLLoss
 from actors.utils.tracker import gpu_profiler
+from actors.utils.wandb import is_wandb_active
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Pure-data container (no helper methods)
@@ -72,20 +76,30 @@ class Trainer:
         self,
         env: Environment,
         *,
-        grad_accumulation_steps: int = 1,
-        batch_size: int = 4,
-        group_size: int = 4,
-        reference_batch_size: int = 1,
+        
+        batch_size: int = 4, # group size * samples per batch
+        group_size: int = 4, # number of samples per group
+        grad_accumulation_steps: int = 1, 
+        reference_batch_size: int = 1, # batch size for computing reference log-probabilities (also for hot model when num_iterations > 1)
+        
         num_iterations: int = 1,
         max_grad_norm: float = 1.0,
         temperature: float = 1.0,
-        gradient_checkpointing: bool = False,
+        gradient_checkpointing: bool = True,
+
+        # logging
+        use_wandb: bool = True,
+        log_every_n: int = 10,
+        use_dashboard: bool = True,
     ):
         self.env = env
         self.max_grad_norm = max_grad_norm
         self.num_iterations = num_iterations
         self.temperature = temperature
         self.gradient_checkpointing = gradient_checkpointing
+        self.use_wandb = use_wandb
+        self.log_every_n = log_every_n
+        self.use_dashboard = use_dashboard
         self._step = 0
         # ----- distributed / mixed precision ---------------------------------
         self.accel = Accelerator(
@@ -225,6 +239,142 @@ class Trainer:
     # ═════════════════════════════════════════════════════════════════════
     # public API
     # ═════════════════════════════════════════════════════════════════════
+    def train(
+        self,
+        data: Union[List[Dict[str, Any]], Dataset, HFDataset, DatasetDict],
+        epochs: int = 1,
+        max_steps: Optional[int] = None,
+        checkpoint_every_n: Optional[int] = None,
+        checkpoint_path: str = "checkpoints",
+        max_checkpoints_to_keep: Optional[int] = 3,
+    ):
+        """
+        Main training loop.
+
+        Args:
+            data: A list of dictionaries, a torch Dataset, or a Huggingface Dataset or DatasetDict.
+            epochs: The number of epochs to train for.
+            max_steps: The maximum number of training steps. If provided, it overrides `epochs`.
+            checkpoint_every_n: Save a checkpoint every N steps.
+            checkpoint_path: Path to save checkpoints.
+            max_checkpoints_to_keep: The maximum number of checkpoints to keep. If set,
+                older checkpoints will be deleted to maintain only this number of checkpoints.
+        """
+        if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
+            import wandb
+
+        # Create a unique folder for this training run
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_checkpoint_path = os.path.join(checkpoint_path, f"run_{timestamp}")
+        if self.accel.is_main_process:
+            os.makedirs(run_checkpoint_path, exist_ok=True)
+
+        if isinstance(data, DatasetDict):
+            if "train" in data:
+                data = data["train"]
+            else:
+                key = list(data.keys())[0]
+                self.logger.normal(f"No 'train' split found, using '{key}' split.")
+                data = data[key]
+
+        def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, List[Any]]:
+            if not batch:
+                return {}
+            keys = batch[0].keys()
+            return {k: [d[k] for d in batch] for k in keys}
+
+        # All ranks get the same data, user will distribute manually if needed.
+        g = torch.Generator()
+        sampler = RandomSampler(data, generator=g)
+        
+        # expand_batch will multiply the batch size by group_size, so we divide here.
+        dataloader = DataLoader(
+            data,
+            batch_size=self.batch_size // self.group_size,
+            sampler=sampler,
+            collate_fn=collate_fn,
+        )
+
+        total_steps = 0
+        start_time = time.time()
+        
+        # Calculate total steps for ETA estimation
+        steps_per_epoch = len(dataloader)
+        total_expected_steps = max_steps if max_steps is not None else epochs * steps_per_epoch
+        
+        for epoch in range(epochs):
+            g.manual_seed(epoch)
+
+            for step_in_epoch, raw_batch in enumerate(dataloader):
+                # Ensure all data is in list format, not tensors, for downstream processing
+                for k, v in raw_batch.items():
+                    if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
+                        raw_batch[k] = [t.tolist() for t in v]
+
+                if max_steps is not None and total_steps >= max_steps:
+                    if self.accel.is_main_process:
+                        self.logger.normal("Max steps reached, stopping training.")
+                        return
+
+                metrics = self.train_step(raw_batch)
+
+                if checkpoint_every_n and self._step % checkpoint_every_n == 0:
+                    path = os.path.join(run_checkpoint_path, f"step_{self._step}")
+                    if self.accel.is_main_process:
+                        self.logger.quiet(colorize(f"💾 Checkpoint saved: step_{self._step}", Palette.VERB))
+                    self.save_checkpoint(path)
+
+                    if self.accel.is_main_process and max_checkpoints_to_keep is not None:
+                        checkpoints = [
+                            d for d in os.listdir(run_checkpoint_path)
+                            if d.startswith("step_") and os.path.isdir(os.path.join(run_checkpoint_path, d))
+                        ]
+                        if len(checkpoints) > max_checkpoints_to_keep:
+                            checkpoints.sort(key=lambda x: int(x.split("_")[1]))
+                            for c in checkpoints[:-max_checkpoints_to_keep]:
+                                to_delete = os.path.join(run_checkpoint_path, c)
+                                self.logger.verbose(colorize(f"🗑️  Cleaned up old checkpoint {c}", Palette.VERB))
+                                shutil.rmtree(to_delete)
+
+                if self.accel.is_main_process and self._step % self.log_every_n == 0:
+                    # Calculate progress and ETA
+                    progress = (total_steps / total_expected_steps) * 100
+                    eta_str = "N/A"
+                    if total_steps > 0:
+                        elapsed = time.time() - start_time
+                        avg_time_per_step = elapsed / total_steps
+                        eta_seconds = avg_time_per_step * (total_expected_steps - total_steps)
+                        eta_str = str(timedelta(seconds=int(eta_seconds)))
+                    
+                    # Calculate fractional epoch progress
+                    fractional_epoch = epoch + (step_in_epoch + 1) / steps_per_epoch
+                    
+                    # Clean, modern step header
+                    if max_steps:
+                        header = f"🚀 STEP {self._step:,}/{max_steps:,} ({progress:.1f}%) • ETA: {eta_str}"
+                    else:
+                        header = f"🚀 STEP {self._step:,} • EPOCH {fractional_epoch:.2f}/{epochs} ({progress:.1f}%) • ETA: {eta_str}"
+
+                    # Show metrics in both normal and quiet modes (but not silent)
+                    if self.logger.isEnabledFor(QUIET):
+                        self.logger.quiet(colorize(header, Palette.BOLD))
+                        
+                        for actor_name, actor_metrics_list in metrics.items():
+                            if not actor_metrics_list or not any(actor_metrics_list):
+                                continue
+                            
+                            self.logger.quiet(colorize(f"   🎭 {actor_name}:", Palette.CYAN))
+                            # we only log the metrics for the last iteration
+                            actor_metrics = actor_metrics_list[-1]
+                            for m_name, m_val in actor_metrics.items():
+                                self.logger.quiet(colorize(f"      • {m_name}: {m_val:.3f}", Palette.CYAN))
+                                if self.use_wandb and is_wandb_active():
+                                    wandb.log({f"{actor_name}/{m_name}": m_val}, step=self._step)
+                        
+                        self.logger.quiet("")  # Add a blank line for spacing
+                
+                total_steps += 1
+
     def train_step(self, raw_batch: Dict[str, List[Any]]) -> Dict[str, Dict[str, float]]:
         """
         One environment interaction + optimisation step.
@@ -233,13 +383,40 @@ class Trainer:
         `{actor_name: {"loss": float, "kl": float, ...}, ...}`
         """
         self._step += 1
+        
+        # Log sampling stage in normal mode
+        if self.accel.is_main_process and self.logger.isEnabledFor(NORMAL):
+            self.logger.normal(colorize("🎲 Sampling...", Palette.INFO))
+        
         batch = expand_batch(raw_batch, self.group_size)
         env_out = self.env(batch)
+
+        if self.use_wandb and is_wandb_active() and self.accel.is_main_process and self._step % self.log_every_n == 0:
+            import wandb
+            for name, ta in self.actors.items():
+                if name in env_out and "input_ids" in raw_batch:
+                    prompts_ids = raw_batch["input_ids"]
+                    completions_ids = env_out[name]["input_ids"]
+                    rewards = env_out[name]["rewards"]
+
+                    table = wandb.Table(columns=["prompt", "completion", "reward"])
+
+                    for i in range(len(prompts_ids)):
+                        prompt_text = ta.tokenizer.decode(prompts_ids[i], skip_special_tokens=True)
+                        for j in range(self.group_size):
+                            idx = i * self.group_size + j
+                            if idx < len(completions_ids):
+                                completion_text = ta.tokenizer.decode(completions_ids[idx], skip_special_tokens=True)
+                                reward = rewards[idx]
+                                table.add_data(prompt_text, completion_text, reward)
+                    
+                    wandb.log({f"{name}/completions": table}, step=self._step)
 
         # warn about unexpected actor keys (once per step, rank==0 only)
         if self.rank == 0:
             for k in env_out.keys() - self.actors.keys():
-                self.logger.warning(colorize(f"env produced data for unknown actor '{k}'",
+                logger_method = self.logger.verbose if self.logger.isEnabledFor(VERBOSE) else self.logger.quiet
+                logger_method(colorize(f"env produced data for unknown actor '{k}'",
                                              Palette.WARNING))
 
         # collect metrics
@@ -283,6 +460,12 @@ class Trainer:
 
         # iterate over grad-accumulation micro-batches
         for it in range(self.num_iterations):
+            # Log backprop iteration in normal mode
+            if self.accel.is_main_process and self.logger.isEnabledFor(NORMAL):
+                if self.num_iterations > 1:
+                    self.logger.normal(colorize(f"🔄 Backprop iter {it+1}/{self.num_iterations} for actor '{name}'", Palette.INFO))
+                else:
+                    self.logger.normal(colorize(f"🔄 Backprop for actor '{name}'", Palette.INFO))
             for adv_slice, id_slice, m_slice, old_slice, ref_slice in zip(
                 split_for_grad_accum(advantages, self.grad_accumulation_steps),
                 split_for_grad_accum(ids_list,   self.grad_accumulation_steps),
@@ -399,3 +582,17 @@ class Trainer:
             with open(state_path, "r") as f:
                 state = json.load(f)
             self._step = state.get("step", 0)
+        
+        # Update vLLM/trainable actors with the new weights and sleep them
+        if self.accel.is_main_process:
+            self.logger.normal(colorize("🔄 Updating actor weights from checkpoint...", Palette.INFO))
+        
+        for name, ta in self.actors.items():
+            # Update actor weights using the same mechanism as during training
+            self._update_actor_weights(ta)
+            
+            # Sleep the actor after updating weights
+            if self.accel.is_local_main_process:
+                ta.actor.sleep(1)
+                if self.accel.is_main_process:
+                    self.logger.normal(colorize(f"😴 Actor '{name}' put to sleep after checkpoint load", Palette.INFO))
