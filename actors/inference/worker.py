@@ -24,7 +24,7 @@ class ModelWorker:
         # This is for the new weight update mechanism
         engine_kwargs[
             "worker_extension_cls"
-        ] = "actors.server.rlhf_utils.ColocateWorkerExtension"
+        ] = "actors.inference.rlhf_utils.ColocateWorkerExtension"
 
         self.engine = LLM(
             model=model_path,

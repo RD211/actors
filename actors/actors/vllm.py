@@ -1,39 +1,11 @@
 from __future__ import annotations
-import abc, logging, random, time
 from typing import Dict, List, Sequence
-import openai, torch
+import torch
 from vllm import SamplingParams, RequestOutput
-from actors.utils.logger import init_logger
-from actors.server.pool import ModelPool
+from actors.inference.pool import ModelPool
 from torch.multiprocessing.reductions import reduce_tensor
 from vllm.platforms import current_platform
-
-
-logger = init_logger(__name__, level=logging.INFO)
-
-
-class LLMActor(abc.ABC):
-    def __init__(self, name: str):
-        self.name = name
-
-    @abc.abstractmethod
-    def generate(self, prompts: Sequence[str], **kwargs): ...
-    @abc.abstractmethod
-    def chat(self, dialogs: Sequence[list], **kwargs): ...
-
-
-class TrainableLLMActor(LLMActor):
-    @abc.abstractmethod
-    def start_weight_update(self):
-        ...
-
-    @abc.abstractmethod
-    def update_weights_batch(self, state_dict: Dict[str, torch.Tensor]):
-        ...
-
-    @abc.abstractmethod
-    def finalize_weight_update(self):
-        ...
+from .base import TrainableLLMActor
 
 
 class vLLMActor(TrainableLLMActor):
@@ -76,7 +48,6 @@ class vLLMActor(TrainableLLMActor):
         if not state_dict:
             return
 
-        # Group tensors by device to handle multi-GPU training scenarios
         tensors_by_device: Dict[torch.device, Dict[str, torch.Tensor]] = {}
         for name, tensor in state_dict.items():
             device = tensor.device
@@ -96,7 +67,6 @@ class vLLMActor(TrainableLLMActor):
                 all_ipc_handles[device_uuid] = ipc_handles
 
         if not all_ipc_handles:
-            # This can happen if the batch is empty or contains only non-CUDA tensors
             return
 
         self.pool.update_weights_batch(self.name, all_ipc_handles)
@@ -109,48 +79,3 @@ class vLLMActor(TrainableLLMActor):
         
     def wake(self):
         self.pool.wake(self.name)
-
-
-class OpenAIActor(LLMActor):
-    def __init__(
-        self,
-        *,
-        name: str,
-        api_key: str,
-        base_url: str = "https://api.openai.com/v1",
-        retries: int = 5,
-        backoff_start: float = 1.0,
-        backoff_cap: float = 30.0,
-    ):
-        super().__init__(name)
-        openai.api_key = api_key
-        openai.base_url = base_url
-        self.retries = retries
-        self.backoff_start = backoff_start
-        self.backoff_cap = backoff_cap
-
-    def _retry(self, fn, *args, **kwargs):
-        backoff = self.backoff_start
-        for attempt in range(1, self.retries + 1):
-            try:
-                return fn(*args, **kwargs)
-            except Exception as e:
-                logger.warning(f"[retry {attempt}] OpenAI error: {e}")
-                if attempt == self.retries:
-                    raise
-                time.sleep(backoff + random.uniform(0, 1))
-                backoff = min(backoff * 2, self.backoff_cap)
-
-    def generate(self, prompts: Sequence[str], **params):
-        return [
-            self._retry(openai.Completion.create, model=self.name, prompt=p, **params)
-            for p in prompts
-        ]
-
-    def chat(self, dialogs: Sequence[list], **params):
-        return [
-            self._retry(
-                openai.ChatCompletion.create, model=self.name, messages=d, **params
-            )
-            for d in dialogs
-        ]

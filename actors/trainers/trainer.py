@@ -14,8 +14,8 @@ from transformers import PreTrainedTokenizerBase
 # ----- project-local helpers -------------------------------------------------
 from actors.utils.logger import init_logger, colorize, Palette
 from actors.utils.ipc_utils import gather_and_stream_state_dict
-from actors.trainer.environments.env_base import Environment
-from actors.trainer.losses.base_loss import BaseRLLoss
+from actors.environments.env_base import Environment
+from actors.losses.base_loss import BaseRLLoss
 from actors.utils.tracker import gpu_profiler
 
 # ═════════════════════════════════════════════════════════════════════════════

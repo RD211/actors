@@ -8,7 +8,7 @@ from vllm import RequestOutput, SamplingParams
 import ray
 
 from actors.utils.logger import Palette, colorize, logger
-from actors.server.worker import ModelWorker
+from actors.inference.worker import ModelWorker
 
 
 @dataclass

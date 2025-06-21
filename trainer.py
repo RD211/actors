@@ -1,15 +1,13 @@
 import torch
-from actors.trainer.environments.env_base import Environment, ActorSpec
-from actors.trainer.actors.actors import vLLMActor
+from actors.environments.env_base import Environment, ActorSpec
+from actors.actors import vLLMActor
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from actors.trainer.losses.grpo_loss import GRPOLoss
-from actors.trainer.losses.liger_grpo_loss import LigerLoss
-from torch.optim import AdamW
+from actors.losses.grpo_loss import GRPOLoss
+from actors.losses.liger_grpo_loss import LigerLoss
 from torch.optim.lr_scheduler import LinearLR, ConstantLR
 from vllm import SamplingParams
-from actors.trainer.trainers.trainer import Trainer
+from actors import Trainer
 import bitsandbytes as bnb
-from deepspeed.ops.adam import DeepSpeedCPUAdam
 
 class MyEnv(Environment):
     def __init__(self):

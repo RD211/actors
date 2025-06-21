@@ -8,13 +8,13 @@ from transformers import PreTrainedTokenizer
 import abc, dataclasses
 from typing import Dict
 
-from actors.trainer.actors.actors import TrainableLLMActor
+from actors import TrainableLLMActor
 
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
 
-from actors.trainer.losses.base_loss import BaseRLLoss
+from actors.losses.base_loss import BaseRLLoss
 
 
 @dataclass
