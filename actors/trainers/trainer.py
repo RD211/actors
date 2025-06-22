@@ -16,11 +16,13 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler
 from accelerate import Accelerator, InitProcessGroupKwargs
 from transformers import PreTrainedTokenizerBase
 from datasets import Dataset as HFDataset, DatasetDict
+from accelerate.utils import DeepSpeedPlugin
 
 # ----- project-local helpers -------------------------------------------------
 from actors.utils.logger import init_logger, colorize, Palette, VERBOSE, NORMAL, QUIET
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.environments.env_base import Environment
+from actors.environments.types import EnvironmentOutput, ActorOutput
 from actors.losses.base_loss import BaseRLLoss
 from actors.utils.tracker import gpu_profiler
 from actors.utils.wandb import is_wandb_active
@@ -36,6 +38,7 @@ class TrainableLLMActor:
     loss_fn: BaseRLLoss
     optim: torch.optim.Optimizer
     sched: torch.optim.lr_scheduler._LRScheduler
+    accel: Accelerator 
     reference_model: Optional[torch.nn.Module] = None
 
 
@@ -86,70 +89,87 @@ class Trainer:
         env: Environment,
         *,
         data: Union[List[Dict[str, Any]], Dataset, HFDataset, DatasetDict],
-        batch_size: int = 4,           # group_size * samples per batch
-        group_size: int = 4,           # number of samples per group
+        batch_size: int = 8,
+        group_size: int = 8,
         grad_accumulation_steps: int = 1,
-        reference_batch_size: int = 1, # batch size for reference log-probs
+        reference_batch_size: int = 1,
         num_iterations: int = 1,
         max_grad_norm: float = 1.0,
         temperature: float = 1.0,
         gradient_checkpointing: bool = True,
         # logging
         use_wandb: bool = True,
-        log_every_n: int = 10,
+        log_every_n: int = 1,
         use_dashboard: bool = True,
     ):
-        # ─── env & training settings ───────────────────────────────────────
-        self.env = env
-        self.max_grad_norm = max_grad_norm
+        # ─── trainer-level bookkeeping ────────────────────────────────
+        self.env   = env
+        self.max_grad_norm  = max_grad_norm
         self.num_iterations = num_iterations
-        self.temperature = temperature
+        self.temperature    = temperature
         self.gradient_checkpointing = gradient_checkpointing
         self.use_wandb = use_wandb
         self.log_every_n = log_every_n
         self.use_dashboard = use_dashboard
-        self._step = 0            # global (WandB) step counter
-        self._logical_step = 0    # “true” optimiser step counter
+        self._step = 0
+        self._logical_step = 0
 
-        # ─── data & sampler state ──────────────────────────────────────────
+        # ─── data / RNG setup ──────────────────────────────
         self._data = self._normalise_hf_splits(data)
-        self._data_state: Dict[str, Any] = {
-            "epoch": 0,
-            "step_in_epoch": 0,
-            "current_generator_seed": 0,
-        }
-        self._rng = torch.Generator()              # single RNG for sampling
-        self.group_size = group_size
-        self.batch_size = batch_size
+        self._data_state = {"epoch": 0, "step_in_epoch": 0, "current_generator_seed": 0}
+        self._rng = torch.Generator()
+        self.group_size  = group_size
+        self.batch_size  = batch_size
         self.grad_accumulation_steps = grad_accumulation_steps
-        self.reference_batch_size = reference_batch_size
-        self._build_dataloader()                   # creates self._dataloader
+        self.reference_batch_size    = reference_batch_size
+        self._build_dataloader()
 
-        # ─── distributed / mixed precision ────────────────────────────────
-        self.accel = Accelerator(
-            mixed_precision="bf16",
-            kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=10))],
-        )
-        self.number_of_devices = self.accel.num_processes
-        self.rank = self.accel.process_index
-        self.logger = init_logger(f"trainer{self.rank}")
+        # ═══════════════════════════════════════════════════════════════
+        # 1.  one DeepSpeedPlugin per actor – default config first
+        # ═══════════════════════════════════════════════════════════════
+        self.ds_plugins: Dict[str, DeepSpeedPlugin] = {
+            name: DeepSpeedPlugin() for name in env.get_actor_specs().keys()
+        }
 
-        # DeepSpeed config tweaks
-        ds_cfg = self.accel.state.deepspeed_plugin.deepspeed_config
-        ds_cfg['max_grad_norm'] = max_grad_norm
-        ds_cfg["train_batch_size"] = batch_size
-        ds_cfg["gradient_accumulation_steps"] = grad_accumulation_steps
-        ds_cfg["train_micro_batch_size_per_gpu"] = (
-            batch_size // self.accel.num_processes // grad_accumulation_steps
-        )
-        if self.gradient_checkpointing:
-            ds_cfg.setdefault("activation_checkpointing", {
-                "partition_activations": True,
-                "contiguous_memory_optimization": True,
-                "number_checkpoints": 1,
-                "synchronize_checkpoint_boundary": False,
-            })
+        # tweak each plugin’s config **after** creation (no base template)
+        for plug in self.ds_plugins.values():
+            cfg = plug.deepspeed_config                             # default “auto” dict
+            cfg["max_grad_norm"] = max_grad_norm
+            cfg["train_batch_size"] = batch_size
+            cfg["gradient_accumulation_steps"] = grad_accumulation_steps
+            cfg["train_micro_batch_size_per_gpu"] = (
+                batch_size // grad_accumulation_steps // torch.cuda.device_count()
+            )
+            if gradient_checkpointing:
+                cfg.setdefault("activation_checkpointing", {
+                    "partition_activations": True,
+                    "contiguous_memory_optimization": True,
+                    "number_checkpoints": 1,
+                    "synchronize_checkpoint_boundary": False,
+                })
 
+        # ═══════════════════════════════════════════════════════════════
+        # 2.  one Accelerator per actor
+        # ═══════════════════════════════════════════════════════════════
+        first_actor = next(iter(self.ds_plugins))
+        self.accelerators: Dict[str, Accelerator] = {
+            first_actor: Accelerator(
+                mixed_precision="bf16",
+                deepspeed_plugins=self.ds_plugins,
+                kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=10))],
+            )
+        }
+        for name in self.ds_plugins:
+            if name != first_actor:
+                self.accelerators[name] = Accelerator()  # shares AcceleratorState
+
+        # main handle used for cross-actor ops (metrics gather etc.)
+        self.main_accel = self.accelerators[first_actor]
+        self.number_of_devices = self.main_accel.num_processes
+        self.rank              = self.main_accel.process_index
+        self.logger            = init_logger(f"trainer{self.rank}")
+
+        # ─── basic sanity checks ───────────────────────────
         if batch_size % group_size:
             raise ValueError("batch_size must be divisible by group_size")
         if (batch_size // grad_accumulation_steps) % self.number_of_devices:
@@ -157,41 +177,58 @@ class Trainer:
         if batch_size % (reference_batch_size * self.number_of_devices):
             raise ValueError("batch_size must be divisible by reference_batch_size*world_size")
 
-        # ─── build TrainableLLMActor registry ──────────────────────────────
+        # ═══════════════════════════════════════════════════════════════
+        # 3.  build TrainableLLMActor registry
+        # ═══════════════════════════════════════════════════════════════
         self.actors: Dict[str, TrainableLLMActor] = {}
-        for name, (actor, spec) in env.get_actor_specs().items():
+
+        for name, (actor_obj, spec) in env.get_actor_specs().items():
+            accel = self.accelerators[name]
+            accel.state.select_deepspeed_plugin(name)   # activate this engine
+
+            # ── create & optionally checkpoint-enable model ────────────
             model = spec.model_factory()
-            if self.gradient_checkpointing:
-                model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": False}
-                )
+            if gradient_checkpointing:
+                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
                 model.config.use_cache = False
                 if hasattr(model, "enable_input_require_grads"):
                     model.enable_input_require_grads()
                     model.config.gradient_checkpointing = True
-
             model = model.train()
-            ref_model = spec.reference_model_factory().eval() if spec.reference_model_factory else None
 
+            # ── loss / reference model (if any) ────────────────────────
+            loss_fn = spec.loss_factory()
+            beta    = getattr(loss_fn, "beta", 0.0)
+            ref_model = (
+                spec.reference_model_factory().eval()
+                if spec.reference_model_factory and beta != 0.0
+                else None
+            )
+
+            # ── optimiser / scheduler ─────────────────────────────────
             optim = spec.optim_factory(model.parameters())
             sched = spec.scheduler_factory(optim)
 
-            # devices via Accelerate/DeepSpeed
-            model, optim, sched = self.accel.prepare(model, optim, sched)
-            if ref_model is not None and ds_cfg['zero_optimization']['stage'] == 3:
-                ref_model = self.accel.prepare(ref_model)
-            else:
-                ref_model = ref_model.to(self.accel.device) if ref_model is not None else None
+            # ── wrap with this actor’s accelerator ────────────────────
+            model, optim, sched = accel.prepare(model, optim, sched)
+            if ref_model is not None:
+                accel.state.select_deepspeed_plugin(name)
+                if self.ds_plugins[name].config["zero_optimization"]["stage"] == 3:
+                    ref_model = accel.prepare(ref_model)
+                else:
+                    ref_model = ref_model.to(accel.device)
 
+            # ── register ──────────────────────────────────────────────
             self.actors[name] = TrainableLLMActor(
-                name=name,
-                actor=actor,
-                model=model,
-                tokenizer=spec.tokenizer,
-                loss_fn=spec.loss_factory(),
-                optim=optim,
-                sched=sched,
-                reference_model=ref_model,
+                name           = name,
+                actor          = actor_obj,
+                model          = model,
+                tokenizer      = spec.tokenizer,
+                loss_fn        = loss_fn,
+                optim          = optim,
+                sched          = sched,
+                reference_model= ref_model,
+                accel          = accel,
             )
 
     # ------------------------------------------------------------------ #
@@ -263,11 +300,11 @@ class Trainer:
             lengths = [len(seq) for seq in batch_ids]
 
             padded = tokenizer.pad({"input_ids": batch_ids}, padding="longest", return_tensors="pt")
-            input_ids = padded["input_ids"].to(self.accel.device)
+            input_ids = padded["input_ids"].to(model.device)
 
             L = input_ids.size(1)
-            rng = torch.arange(L, device=self.accel.device).unsqueeze(0)
-            att_mask = (rng < torch.tensor(lengths, device=self.accel.device).unsqueeze(1)).long()
+            rng = torch.arange(L, device=self.ma.device).unsqueeze(0)
+            att_mask = (rng < torch.tensor(lengths, device=model.device).unsqueeze(1)).long()
 
             with torch.no_grad():
                 logits = model(input_ids=input_ids, attention_mask=att_mask).logits / temperature
@@ -279,7 +316,7 @@ class Trainer:
             for row, ln in zip(lp, lengths):
                 local_logps.append(row[: ln - 1].cpu().tolist())
 
-        gathered = self.accel.gather_for_metrics(local_logps)
+        gathered = self.main_accel.gather_for_metrics(local_logps)
         return gathered[:total]
 
     # ═════════════════════════════════════════════════════════════════════
@@ -300,13 +337,13 @@ class Trainer:
         Call exactly once; afterwards you can resume with `load_checkpoint()`
         and call `train()` again for the remaining epochs/steps.
         """
-        if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
+        if self.use_wandb and is_wandb_active() and self.main_accel.is_main_process:
             import wandb
 
         # unique folder for this training run
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_checkpoint_path = os.path.join(checkpoint_path, f"run_{timestamp}")
-        if self.accel.is_main_process:
+        if self.main_accel.is_main_process:
             os.makedirs(run_checkpoint_path, exist_ok=True)
 
         start_time = time.time()
@@ -333,7 +370,7 @@ class Trainer:
                         raw_batch[k] = [t.tolist() for t in v]
 
                 if max_steps is not None and total_steps >= max_steps:
-                    if self.accel.is_main_process:
+                    if self.main_accel.is_main_process:
                         self.logger.normal("Max steps reached, stopping training.")
                     return
 
@@ -350,14 +387,14 @@ class Trainer:
                     and self._logical_step % checkpoint_every_n == 0
                 ):
                     path = os.path.join(run_checkpoint_path, f"step_{self._logical_step}")
-                    if self.accel.is_main_process:
+                    if self.main_accel.is_main_process:
                         self.logger.quiet(
                             colorize(f"💾 Checkpoint saved: step_{self._logical_step}", Palette.VERB)
                         )
                     self.save_checkpoint(path)
 
                     # prune old checkpoints
-                    if self.accel.is_main_process and max_checkpoints_to_keep is not None:
+                    if self.main_accel.is_main_process and max_checkpoints_to_keep is not None:
                         checkpoints = [
                             d for d in os.listdir(run_checkpoint_path)
                             if d.startswith("step_") and os.path.isdir(os.path.join(run_checkpoint_path, d))
@@ -368,7 +405,7 @@ class Trainer:
                                 shutil.rmtree(os.path.join(run_checkpoint_path, c))
 
                 # ─── console / WandB logging (unchanged) ─────────────────
-                if self.accel.is_main_process and self._logical_step % self.log_every_n == 0:
+                if self.main_accel.is_main_process and self._logical_step % self.log_every_n == 0:
                     progress = (total_steps / total_expected_steps) * 100
                     eta_str = "N/A"
                     if total_steps:
@@ -399,7 +436,12 @@ class Trainer:
                                         colorize(f"      📊 Iter {iteration_idx+1}:", Palette.YELLOW)
                                     )
                                     indent = "         "
+                                # Include reward component metrics in static set
                                 static = {"completion_len", "reward_mean", "reward_std"}
+                                for metric_name in actor_metrics.keys():
+                                    if metric_name.endswith("_mean") or metric_name.endswith("_std"):
+                                        static.add(metric_name)
+                                        
                                 for m, v in actor_metrics.items():
                                     if iteration_idx and m in static:
                                         continue
@@ -408,9 +450,18 @@ class Trainer:
                                     )
                         self.logger.quiet("")
 
-                if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
+                if self.use_wandb and is_wandb_active() and self.main_accel.is_main_process:
                     import wandb
+                    # Build static metrics set dynamically to include reward components
                     static = {"completion_len", "reward_mean", "reward_std"}
+                    
+                    # Add reward component metrics to static set
+                    for actor_metrics_list in metrics.values():
+                        if actor_metrics_list:
+                            for metric_name in actor_metrics_list[0].keys():
+                                if metric_name.endswith("_mean") or metric_name.endswith("_std"):
+                                    static.add(metric_name)
+                    
                     for iteration_idx in range(self.num_iterations):
                         if iteration_idx > 0:
                             self._step += 1
@@ -434,7 +485,7 @@ class Trainer:
         if save_strategy in {SaveStrategy.FINAL, SaveStrategy.ALL}:
             final_path = os.path.join(run_checkpoint_path, "final_models")
             self.save_pretrained(final_path)
-            if self.accel.is_main_process:
+            if self.main_accel.is_main_process:
                 self.logger.quiet(colorize("💾 Models saved", Palette.VERB))
 
 
@@ -450,49 +501,75 @@ class Trainer:
         self._step += 1  # Increment WandB step counter
         
         # Log sampling stage in normal mode
-        if self.accel.is_main_process and self.logger.isEnabledFor(NORMAL):
+        if self.main_accel.is_main_process and self.logger.isEnabledFor(NORMAL):
             self.logger.normal(colorize("🎲 Sampling...", Palette.INFO))
         
         batch = expand_batch(raw_batch, self.group_size)
         env_out = self.env(batch)
+        
+        # Ensure we have the new EnvironmentOutput format
+        if not isinstance(env_out, EnvironmentOutput):
+            raise TypeError(f"Environment must return EnvironmentOutput, got {type(env_out)}")
 
-        if self.use_wandb and is_wandb_active() and self.accel.is_main_process and self._logical_step % self.log_every_n == 0:
+        if self.use_wandb and is_wandb_active() and self.main_accel.is_main_process and self._logical_step % self.log_every_n == 0:
             import wandb
             for name, ta in self.actors.items():
-                if name in env_out:
+                if name in env_out.actors:
+                    actor_output = env_out.actors[name]
                     # Raw batch keys
                     batch_keys = list(batch.keys())
-                    completions_ids = env_out[name]["input_ids"]
-                    rewards = env_out[name]["rewards"]
+                    completions_ids = actor_output.input_ids
+                    total_rewards = actor_output.rewards
 
-                    table = wandb.Table(columns=batch_keys + ["completion", "reward"])
+                    # Create table columns for batch keys, completion, total reward, and reward components
+                    columns = batch_keys + ["completion", "total_reward"]
+                    if actor_output.reward_components:
+                        # Add columns for each reward component
+                        component_names = list(actor_output.reward_components.keys())
+                        columns.extend(component_names)
+                    
+                    table = wandb.Table(columns=columns)
 
                     for i in range(len(completions_ids)):
-                        row = {k: batch[k][i] for k in batch_keys}
-                        row["completion"] = ta.tokenizer.decode(completions_ids[i], skip_special_tokens=False)
-                        row["reward"] = rewards[i]
-                        table.add_data(*row.values())
+                        row = [batch[k][i] for k in batch_keys]
+                        row.append(ta.tokenizer.decode(completions_ids[i], skip_special_tokens=False))
+                        row.append(total_rewards[i])
+                        
+                        # Add reward component values
+                        if actor_output.reward_components:
+                            for comp_name in component_names:
+                                row.append(actor_output.reward_components[comp_name][i])
+                        
+                        table.add_data(*row)
                     
                     # Use the current step for completions table
                     wandb.log({f"completions_{name}/completions_{self._logical_step}": table}, step=self._step)
 
         # warn about unexpected actor keys (once per step, rank==0 only)
         if self.rank == 0:
-            for k in env_out.keys() - self.actors.keys():
+            for k in env_out.actors.keys() - self.actors.keys():
                 logger_method = self.logger.verbose if self.logger.isEnabledFor(VERBOSE) else self.logger.quiet
                 logger_method(colorize(f"env produced data for unknown actor '{k}'",
                                              Palette.WARNING))
 
-        # collect metrics
-        metrics = {name: [dict(loss=[], kl=[], grad_norm=[],
-                            completion_len=[], reward_mean=[], reward_std=[])
-                        for _ in range(self.num_iterations)]
-                for name in self.actors}
+        # collect metrics - include reward component means
+        base_metrics = dict(loss=[], kl=[], grad_norm=[], completion_len=[], 
+                          reward_mean=[], reward_std=[])
+        
+        # Add reward component metrics for all actors
+        for name in self.actors:
+            if name in env_out.actors and env_out.actors[name].reward_components:
+                for comp_name in env_out.actors[name].reward_components.keys():
+                    base_metrics[f"{comp_name}_mean"] = []
+                    base_metrics[f"{comp_name}_std"] = []
+        
+        metrics = {name: [base_metrics.copy() for _ in range(self.num_iterations)]
+                  for name in self.actors}
 
         for name, ta in self.actors.items():
-            if name not in env_out:
+            if name not in env_out.actors:
                 continue
-            self._process_actor_step(name, ta, env_out[name], metrics[name])
+            self._process_actor_step(name, ta, env_out.actors[name], metrics[name])
 
         # aggregate over grad-steps and (internally) over ranks
         out: Dict[str, Dict[str, List[float]]] = {}
@@ -507,14 +584,14 @@ class Trainer:
         self,
         name: str,
         ta: TrainableLLMActor,
-        items: Dict[str, Any],
+        actor_output: ActorOutput,
         buckets: List[Dict[str, List[float]]]) -> None:
         
-        rewards = items["rewards"]
-        advantages = norm_advantages(rewards, self.group_size)
+        total_rewards = actor_output.rewards
+        advantages = norm_advantages(total_rewards, self.group_size)
 
-        ids_list = items["input_ids"]
-        mask_list = items["attention_mask"]
+        ids_list = actor_output.input_ids
+        mask_list = actor_output.attention_mask
 
         # compute reference log-ps once (if any)
         old_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, 
@@ -525,11 +602,11 @@ class Trainer:
         # iterate over grad-accumulation micro-batches
         for it in range(self.num_iterations):
             # Log backprop iteration in normal mode
-            if self.accel.is_main_process and self.logger.isEnabledFor(NORMAL):
+            if self.main_accel.is_main_process and self.logger.isEnabledFor(NORMAL):
                 if self.num_iterations > 1:
-                    self.logger.normal(colorize(f"🔄 Backprop iter {it+1}/{self.num_iterations} for actor '{name}'", Palette.INFO))
+                    self.logger.normal(colorize(f"🔄 Backwards iter {it+1}/{self.num_iterations} for actor '{name}'", Palette.INFO))
                 else:
-                    self.logger.normal(colorize(f"🔄 Backprop for actor '{name}'", Palette.INFO))
+                    self.logger.normal(colorize(f"🔄 Backwards for actor '{name}'", Palette.INFO))
             for adv_slice, id_slice, m_slice, old_slice, ref_slice in zip(
                 split_for_grad_accum(advantages, self.grad_accumulation_steps),
                 split_for_grad_accum(ids_list,   self.grad_accumulation_steps),
@@ -543,12 +620,22 @@ class Trainer:
 
             self._optim_step(ta)
 
-            # rewards / completion stats identical across iterations
+            # total rewards / completion stats identical across iterations
             b = buckets[it]
             if not b["reward_mean"]:
-                b["reward_mean"].append(sum(rewards) / len(rewards))
-                b["reward_std"].append(torch.tensor(rewards).float().std(unbiased=False).item())
+                b["reward_mean"].append(sum(total_rewards) / len(total_rewards))
+                b["reward_std"].append(torch.tensor(total_rewards).float().std(unbiased=False).item())
+                
+                # Add reward component statistics
+                if actor_output.reward_components:
+                    for comp_name, comp_rewards in actor_output.reward_components.items():
+                        mean_key = f"{comp_name}_mean"
+                        std_key = f"{comp_name}_std"
+                        if mean_key in b:
+                            b[mean_key].append(sum(comp_rewards) / len(comp_rewards))
+                            b[std_key].append(torch.tensor(comp_rewards).float().std(unbiased=False).item())
         self._update_actor_weights(ta)
+        ta.actor.sleep(1)
 
     # ------------------------------------------------------------------ #
     @gpu_profiler(name='backward_one_slice')
@@ -589,7 +676,7 @@ class Trainer:
             ref_logps    = ref_lp,
             old_logps    = old_lp,
         )
-        self.accel.backward(loss)
+        ta.accel.backward(loss)
 
         bucket["loss"].append(loss.item())
         if "kl" in stats:
@@ -603,25 +690,25 @@ class Trainer:
         ta.optim.step()
         ta.sched.step()
         ta.optim.zero_grad()
-        self.accel.wait_for_everyone()
+        ta.accel.wait_for_everyone()
 
     # ------------------------------------------------------------------ #
     @gpu_profiler(name='update_actor_weights')
     def _update_actor_weights(self, ta: TrainableLLMActor) -> None:
         # On each node, the local main process will orchestrate the update.
-        if self.accel.is_local_main_process:
+        if self.main_accel.is_local_main_process:
             ta.actor.start_weight_update()
 
         # This callback will be executed on the local main process of each node for each batch.
         def stream_batch_callback(batch_state_dict):
-            if self.accel.is_local_main_process:
+            if self.main_accel.is_local_main_process:
                 ta.actor.update_weights_batch(batch_state_dict)
 
         gather_and_stream_state_dict(
-            self.accel, self.logger, ta.model, stream_batch_callback
+            ta.accel, self.logger, ta.model, stream_batch_callback
         )
 
-        if self.accel.is_local_main_process:
+        if self.main_accel.is_local_main_process:
             ta.actor.finalize_weight_update()
 
 
@@ -629,44 +716,83 @@ class Trainer:
     # checkpointing
     # ------------------------------------------------------------------ #
     def save_checkpoint(self, path: str):
-        """Save models, optims, schedulers, plus RNG & sampler state."""
-        self.accel.wait_for_everyone()
-        self.accel.save_state(output_dir=path)
-        if self.accel.is_main_process:
+        """
+        Save every actor's DeepSpeed engine plus the trainer's
+        bookkeeping (steps, RNG, sampler position…).
+
+        Layout:
+            <path>/
+                trainer_state.pt
+                <actor_0>/  (DeepSpeed files)
+                <actor_1>/
+                …
+        """
+        self.main_accel.wait_for_everyone()
+
+        if self.main_accel.is_main_process:
+            os.makedirs(path, exist_ok=True)
+
+        # 1️⃣ model/optim/sched for each actor
+        for name, ta in self.actors.items():
+            subdir = os.path.join(path, name)
+            if ta.accel.is_main_process:
+                os.makedirs(subdir, exist_ok=True)
+            ta.accel.save_state(output_dir=subdir)
+
+        self.main_accel.wait_for_everyone()
+
+        # 2️⃣ trainer-level bookkeeping (once)
+        if self.main_accel.is_main_process:
             torch.save(
                 {
-                    "step": self._step,
-                    "logical_step": self._logical_step,
-                    "data_state": self._data_state,
-                    "rng_state": self._rng.get_state(),
+                    "step":           self._step,
+                    "logical_step":   self._logical_step,
+                    "data_state":     self._data_state,
+                    "rng_state":      self._rng.get_state(),
                 },
                 os.path.join(path, "trainer_state.pt"),
             )
-        self.accel.wait_for_everyone()
+        self.main_accel.wait_for_everyone()
 
+    # ------------------------------------------------------------------
     def load_checkpoint(self, path: str):
-        """Restore everything, including exact sampler position."""
-        self.accel.load_state(path)
+        """
+        Restore trainer bookkeeping **and** each actor's DeepSpeed engine.
+        Afterwards the vLLM weights are pushed to the actors as usual.
+        """
+        # 1️⃣ trainer bookkeeping --------------------------------------
         state = torch.load(os.path.join(path, "trainer_state.pt"), map_location="cpu")
-        self._step = state["step"]
-        self._logical_step = state["logical_step"]
-        self._data_state = state["data_state"]
+        self._step          = state["step"]
+        self._logical_step  = state["logical_step"]
+        self._data_state    = state["data_state"]
 
         self._rng = torch.Generator()
         self._rng.set_state(state["rng_state"])
         self._build_dataloader()
 
-        # update vLLM / actor weights
-        if self.accel.is_main_process:
+        # 2️⃣ per-actor engine state -----------------------------------
+        for name, ta in self.actors.items():
+            subdir = os.path.join(path, name)
+
+            # make sure the right plugin is active for *this* accelerator
+            ta.accel.state.select_deepspeed_plugin(name)
+            ta.accel.load_state(subdir)
+
+        self.main_accel.wait_for_everyone()
+
+        # 3️⃣ push weights into the serving actors ---------------------
+        if self.main_accel.is_main_process:
             self.logger.normal(colorize("🔄 Updating actor weights from checkpoint…", Palette.INFO))
+
         for ta in self.actors.values():
             self._update_actor_weights(ta)
-            if self.accel.is_local_main_process:
+            if self.main_accel.is_local_main_process:
                 ta.actor.sleep(1)
-                if self.accel.is_main_process:
+                if self.main_accel.is_main_process:
                     self.logger.normal(
                         colorize(f"😴 Actor '{ta.name}' put to sleep after resume", Palette.INFO)
                     )
+
     def save_pretrained(self, output_dir: str):
         """
         Save all actors' models **and** tokenizers so they can later be

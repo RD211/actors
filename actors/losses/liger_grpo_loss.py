@@ -42,6 +42,8 @@ class LigerLoss(BaseRLLoss):
             loss_type=loss_type,
             temperature=temperature,
         )
+        self.beta: float = beta
+        self.loss_type: AllowedLoss = loss_type
 
     # ---------------------------------------------------------------- forward
     def forward(
@@ -62,7 +64,7 @@ class LigerLoss(BaseRLLoss):
         tgt_ids: Tensor = input_ids[:, 1:]
         mask: Tensor = attention_mask[:, 1:]
 
-        loss, (kl,_) = self.core(
+        loss, metrics = self.core(
             _input=hidden,
             lin_weight=policy.lm_head.weight,
             bias=policy.lm_head.bias,
@@ -72,5 +74,10 @@ class LigerLoss(BaseRLLoss):
             ref_per_token_logps=ref_logps,
             old_per_token_logps=old_logps,
         )
+
+        if self.beta > 0.0:
+            kl = metrics[0]
+        else:
+            kl = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
         return loss, {"kl": kl.item()}

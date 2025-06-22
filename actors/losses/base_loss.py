@@ -1,6 +1,6 @@
 from __future__ import annotations
 import abc, torch
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Optional
 
 class BaseRLLoss(abc.ABC):
     """Every loss must return (scalar_loss, metrics:dict[str,float])."""

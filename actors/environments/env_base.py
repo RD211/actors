@@ -6,9 +6,10 @@ from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedTokenizer
 
 import abc, dataclasses
-from typing import Dict
+from typing import Dict, Union
 
 from actors import TrainableLLMActor
+from actors.environments.types import EnvironmentOutput
 
 from dataclasses import dataclass
 from typing import Callable, Iterable
@@ -51,9 +52,19 @@ class Environment(abc.ABC):
 
     # ------------------------------------------------------------------
     @abc.abstractmethod
-    def __call__(self, batch) -> Dict[str, list[dict]]:
+    def __call__(self, batch) -> Union[Dict[str, dict], EnvironmentOutput]:
         """
-        Must return:  { actor_name : [ { "reward": float,
-                                         "input_ids": List[int],
-                                         "attention_mask": List[int] } ] }
+        Process a batch and return environment outputs.
+        
+        Can return either:
+        1. Legacy format: Dict[str, dict] with structure:
+           { actor_name : { "rewards": List[float],
+                           "input_ids": List[List[int]], 
+                           "attention_mask": List[List[int]],
+                           "reward_components": Optional[Dict[str, List[float]]],
+                           "metadata": Optional[Dict[str, Any]] } }
+        
+        2. New typed format: EnvironmentOutput instance
+        
+        The new format provides better type safety and support for multiple reward types.
         """
