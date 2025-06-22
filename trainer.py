@@ -58,22 +58,14 @@ class MyEnv(Environment):
         return {
             "main": {
                 "input_ids": self.tokenizer(generated_texts).input_ids,
-                "rewards": rewards,
                 "attention_mask": self.tokenizer(generated_texts).attention_mask,
+                "rewards": rewards,
             }
         }
     
 
 def main():
     env = MyEnv()
-    trainer = Trainer(env, 
-                      group_size=4, 
-                      batch_size=16,
-                      grad_accumulation_steps=1, 
-                      num_iterations=8,
-                      reference_batch_size=2,
-                      log_every_n=1,
-                      )
     data = [
             {"text": "What is the capital of France?"},
             {"text":"Explain the theory of relativity."},
@@ -85,11 +77,21 @@ def main():
             {"text": "What is the speed of light?"},
             {"text": "How do you make a cake?"},
     ] * 120
+    trainer = Trainer(env, 
+                      group_size=4, 
+                      batch_size=16,
+                      grad_accumulation_steps=1, 
+                      num_iterations=8,
+                      reference_batch_size=2,
+                      log_every_n=1,
+                      data=data,
+                      )
 
     # Initialize wandb
     import wandb
     wandb.init(project="test_actors", entity="rd211", name="test")
-    trainer.train(data, checkpoint_every_n=30)
+    trainer.train(checkpoint_every_n=30)
+    trainer.push_to_hub('rd211/test_actors', private=True)
 
 if __name__ == "__main__":
     main()

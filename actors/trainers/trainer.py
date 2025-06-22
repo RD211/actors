@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import Enum, auto
+import itertools
 import json
 import os
 import shutil
 import time
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+import warnings
 
 import torch
 from torch.utils.data import DataLoader, Dataset, RandomSampler
@@ -23,8 +26,6 @@ from actors.utils.tracker import gpu_profiler
 from actors.utils.wandb import is_wandb_active
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Pure-data container (no helper methods)
-# ═════════════════════════════════════════════════════════════════════════════
 @dataclass(frozen=True)
 class TrainableLLMActor:
     """Immutable record that bundles everything the trainer needs for one actor."""
@@ -37,6 +38,14 @@ class TrainableLLMActor:
     sched: torch.optim.lr_scheduler._LRScheduler
     reference_model: Optional[torch.nn.Module] = None
 
+
+
+class SaveStrategy(Enum):
+    """Allowed checkpointing modes."""
+    NONE   = auto()  # never save
+    STEPS  = auto()  # checkpoint_every_n only
+    FINAL  = auto()  # one model save at the very end
+    ALL    = auto()  # both periodic + final
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Stateless helper functions
@@ -76,22 +85,21 @@ class Trainer:
         self,
         env: Environment,
         *,
-        
-        batch_size: int = 4, # group size * samples per batch
-        group_size: int = 4, # number of samples per group
-        grad_accumulation_steps: int = 1, 
-        reference_batch_size: int = 1, # batch size for computing reference log-probabilities (also for hot model when num_iterations > 1)
-        
+        data: Union[List[Dict[str, Any]], Dataset, HFDataset, DatasetDict],
+        batch_size: int = 4,           # group_size * samples per batch
+        group_size: int = 4,           # number of samples per group
+        grad_accumulation_steps: int = 1,
+        reference_batch_size: int = 1, # batch size for reference log-probs
         num_iterations: int = 1,
         max_grad_norm: float = 1.0,
         temperature: float = 1.0,
         gradient_checkpointing: bool = True,
-
         # logging
         use_wandb: bool = True,
         log_every_n: int = 10,
         use_dashboard: bool = True,
     ):
+        # ─── env & training settings ───────────────────────────────────────
         self.env = env
         self.max_grad_norm = max_grad_norm
         self.num_iterations = num_iterations
@@ -100,14 +108,33 @@ class Trainer:
         self.use_wandb = use_wandb
         self.log_every_n = log_every_n
         self.use_dashboard = use_dashboard
-        self._step = 0  # WandB step counter - always increments for each logged metric
-        self._logical_step = 0  # Actual training step counter
-        # ----- distributed / mixed precision ---------------------------------
+        self._step = 0            # global (WandB) step counter
+        self._logical_step = 0    # “true” optimiser step counter
+
+        # ─── data & sampler state ──────────────────────────────────────────
+        self._data = self._normalise_hf_splits(data)
+        self._data_state: Dict[str, Any] = {
+            "epoch": 0,
+            "step_in_epoch": 0,
+            "current_generator_seed": 0,
+        }
+        self._rng = torch.Generator()              # single RNG for sampling
+        self.group_size = group_size
+        self.batch_size = batch_size
+        self.grad_accumulation_steps = grad_accumulation_steps
+        self.reference_batch_size = reference_batch_size
+        self._build_dataloader()                   # creates self._dataloader
+
+        # ─── distributed / mixed precision ────────────────────────────────
         self.accel = Accelerator(
             mixed_precision="bf16",
             kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=10))],
         )
-        # make DeepSpeed match user args
+        self.number_of_devices = self.accel.num_processes
+        self.rank = self.accel.process_index
+        self.logger = init_logger(f"trainer{self.rank}")
+
+        # DeepSpeed config tweaks
         ds_cfg = self.accel.state.deepspeed_plugin.deepspeed_config
         ds_cfg['max_grad_norm'] = max_grad_norm
         ds_cfg["train_batch_size"] = batch_size
@@ -123,15 +150,6 @@ class Trainer:
                 "synchronize_checkpoint_boundary": False,
             })
 
-        # ----- sanity checks --------------------------------------------------
-        self.group_size = group_size
-        self.batch_size = batch_size
-        self.grad_accumulation_steps = grad_accumulation_steps
-        self.reference_batch_size = reference_batch_size
-        self.number_of_devices = self.accel.num_processes
-        self.rank = self.accel.process_index
-        self.logger = init_logger(f"trainer{self.rank}")
-
         if batch_size % group_size:
             raise ValueError("batch_size must be divisible by group_size")
         if (batch_size // grad_accumulation_steps) % self.number_of_devices:
@@ -139,7 +157,7 @@ class Trainer:
         if batch_size % (reference_batch_size * self.number_of_devices):
             raise ValueError("batch_size must be divisible by reference_batch_size*world_size")
 
-        # ----- build TrainableLLMActor registry ------------------------------
+        # ─── build TrainableLLMActor registry ──────────────────────────────
         self.actors: Dict[str, TrainableLLMActor] = {}
         for name, (actor, spec) in env.get_actor_specs().items():
             model = spec.model_factory()
@@ -147,21 +165,18 @@ class Trainer:
                 model.gradient_checkpointing_enable(
                     gradient_checkpointing_kwargs={"use_reentrant": False}
                 )
-
-                model.config.use_cache = False            # :contentReference[oaicite:3]{index=3}
-                # LoRA / PEFT or frozen-layer edge-case
+                model.config.use_cache = False
                 if hasattr(model, "enable_input_require_grads"):
                     model.enable_input_require_grads()
                     model.config.gradient_checkpointing = True
 
             model = model.train()
-
             ref_model = spec.reference_model_factory().eval() if spec.reference_model_factory else None
 
             optim = spec.optim_factory(model.parameters())
             sched = spec.scheduler_factory(optim)
 
-            # put model/optim onto devices via Accelerate/DeepSpeed
+            # devices via Accelerate/DeepSpeed
             model, optim, sched = self.accel.prepare(model, optim, sched)
             if ref_model is not None and ds_cfg['zero_optimization']['stage'] == 3:
                 ref_model = self.accel.prepare(ref_model)
@@ -172,13 +187,43 @@ class Trainer:
                 name=name,
                 actor=actor,
                 model=model,
-                tokenizer=spec.tokenizer,          # 🤗 tokenizer
+                tokenizer=spec.tokenizer,
                 loss_fn=spec.loss_factory(),
                 optim=optim,
                 sched=sched,
                 reference_model=ref_model,
             )
 
+    # ------------------------------------------------------------------ #
+    # data helpers
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _normalise_hf_splits(
+        data: Union[List[Dict[str, Any]], Dataset, HFDataset, DatasetDict]
+    ):
+        """Return a single split no matter what HuggingFace object is given."""
+        if isinstance(data, DatasetDict):
+            return data.get("train", next(iter(data.values())))
+        return data
+
+    def _build_dataloader(self):
+        """Create a DataLoader with the current RNG seed & generator state."""
+        self._rng.manual_seed(self._data_state["current_generator_seed"])
+        sampler = RandomSampler(self._data, generator=self._rng)
+
+        def collate_fn(batch):
+            if not batch:
+                return {}
+            keys = batch[0].keys()
+            return {k: [d[k] for d in batch] for k in keys}
+
+        self._dataloader = DataLoader(
+            self._data,
+            batch_size=self.batch_size // self.group_size,
+            sampler=sampler,
+            collate_fn=collate_fn,
+        )
+        
     # --------------------------------------------------------------------- #
     # (tiny) utilities
     # --------------------------------------------------------------------- #
@@ -242,72 +287,47 @@ class Trainer:
     # ═════════════════════════════════════════════════════════════════════
     def train(
         self,
-        data: Union[List[Dict[str, Any]], Dataset, HFDataset, DatasetDict],
         epochs: int = 1,
         max_steps: Optional[int] = None,
-        checkpoint_every_n: Optional[int] = None,
+        *,
+        checkpoint_every_n: Optional[int] = 10,
         checkpoint_path: str = "checkpoints",
         max_checkpoints_to_keep: Optional[int] = 3,
+        save_strategy: SaveStrategy = SaveStrategy.ALL,
     ):
         """
         Main training loop.
-
-        Args:
-            data: A list of dictionaries, a torch Dataset, or a Huggingface Dataset or DatasetDict.
-            epochs: The number of epochs to train for.
-            max_steps: The maximum number of training steps. If provided, it overrides `epochs`.
-            checkpoint_every_n: Save a checkpoint every N steps.
-            checkpoint_path: Path to save checkpoints.
-            max_checkpoints_to_keep: The maximum number of checkpoints to keep. If set,
-                older checkpoints will be deleted to maintain only this number of checkpoints.
+        Call exactly once; afterwards you can resume with `load_checkpoint()`
+        and call `train()` again for the remaining epochs/steps.
         """
         if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
             import wandb
 
-        # Create a unique folder for this training run
+        # unique folder for this training run
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_checkpoint_path = os.path.join(checkpoint_path, f"run_{timestamp}")
         if self.accel.is_main_process:
             os.makedirs(run_checkpoint_path, exist_ok=True)
 
-        if isinstance(data, DatasetDict):
-            if "train" in data:
-                data = data["train"]
-            else:
-                key = list(data.keys())[0]
-                self.logger.normal(f"No 'train' split found, using '{key}' split.")
-                data = data[key]
+        start_time = time.time()
+        total_steps = 0
 
-        def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, List[Any]]:
-            if not batch:
-                return {}
-            keys = batch[0].keys()
-            return {k: [d[k] for d in batch] for k in keys}
-
-        # All ranks get the same data, user will distribute manually if needed.
-        g = torch.Generator()
-        sampler = RandomSampler(data, generator=g)
-        
-        # expand_batch will multiply the batch size by group_size, so we divide here.
-        dataloader = DataLoader(
-            data,
-            batch_size=self.batch_size // self.group_size,
-            sampler=sampler,
-            collate_fn=collate_fn,
+        # total steps for ETA
+        steps_per_epoch = len(self._dataloader)
+        total_expected_steps = (
+            max_steps if max_steps is not None else epochs * steps_per_epoch
         )
 
-        total_steps = 0
-        start_time = time.time()
-        
-        # Calculate total steps for ETA estimation
-        steps_per_epoch = len(dataloader)
-        total_expected_steps = max_steps if max_steps is not None else epochs * steps_per_epoch
-        
-        for epoch in range(epochs):
-            g.manual_seed(epoch)
+        # fast-forward dataloader if we resumed mid-epoch
+        dataloader = self._dataloader
+        if self._data_state["step_in_epoch"]:
+            dataloader = itertools.islice(
+                dataloader, self._data_state["step_in_epoch"], None
+            )
 
-            for step_in_epoch, raw_batch in enumerate(dataloader):
-                # Ensure all data is in list format, not tensors, for downstream processing
+        for epoch in range(self._data_state["epoch"], epochs):
+            for raw_batch in dataloader:
+                # ensure lists, not tensors
                 for k, v in raw_batch.items():
                     if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                         raw_batch[k] = [t.tolist() for t in v]
@@ -315,16 +335,28 @@ class Trainer:
                 if max_steps is not None and total_steps >= max_steps:
                     if self.accel.is_main_process:
                         self.logger.normal("Max steps reached, stopping training.")
-                        return
+                    return
 
                 metrics = self.train_step(raw_batch)
 
-                if checkpoint_every_n and self._logical_step % checkpoint_every_n == 0:
+                # ─── update sampler bookkeeping ───────────────────────────
+                self._data_state["step_in_epoch"] += 1
+                total_steps += 1
+
+                # ─── checkpointing ────────────────────────────────────────
+                if (
+                    save_strategy in {SaveStrategy.STEPS, SaveStrategy.ALL}
+                    and checkpoint_every_n
+                    and self._logical_step % checkpoint_every_n == 0
+                ):
                     path = os.path.join(run_checkpoint_path, f"step_{self._logical_step}")
                     if self.accel.is_main_process:
-                        self.logger.quiet(colorize(f"💾 Checkpoint saved: step_{self._logical_step}", Palette.VERB))
+                        self.logger.quiet(
+                            colorize(f"💾 Checkpoint saved: step_{self._logical_step}", Palette.VERB)
+                        )
                     self.save_checkpoint(path)
 
+                    # prune old checkpoints
                     if self.accel.is_main_process and max_checkpoints_to_keep is not None:
                         checkpoints = [
                             d for d in os.listdir(run_checkpoint_path)
@@ -333,94 +365,79 @@ class Trainer:
                         if len(checkpoints) > max_checkpoints_to_keep:
                             checkpoints.sort(key=lambda x: int(x.split("_")[1]))
                             for c in checkpoints[:-max_checkpoints_to_keep]:
-                                to_delete = os.path.join(run_checkpoint_path, c)
-                                self.logger.verbose(colorize(f"🗑️  Cleaned up old checkpoint {c}", Palette.VERB))
-                                shutil.rmtree(to_delete)
+                                shutil.rmtree(os.path.join(run_checkpoint_path, c))
 
+                # ─── console / WandB logging (unchanged) ─────────────────
                 if self.accel.is_main_process and self._logical_step % self.log_every_n == 0:
-                    # Calculate progress and ETA
                     progress = (total_steps / total_expected_steps) * 100
                     eta_str = "N/A"
-                    if total_steps > 0:
+                    if total_steps:
                         elapsed = time.time() - start_time
-                        avg_time_per_step = elapsed / total_steps
-                        eta_seconds = avg_time_per_step * (total_expected_steps - total_steps)
+                        eta_seconds = elapsed / total_steps * (total_expected_steps - total_steps)
                         eta_str = str(timedelta(seconds=int(eta_seconds)))
-                    
-                    # Calculate fractional epoch progress
-                    fractional_epoch = epoch + (step_in_epoch + 1) / steps_per_epoch
-                    
-                    # Clean, modern step header
-                    if max_steps:
-                        header = f"STEP {self._logical_step:,}/{max_steps:,} ({progress:.1f}%) • ETA: {eta_str}"
-                    else:
-                        header = f"STEP {self._logical_step:,} • EPOCH {fractional_epoch:.2f}/{epochs} ({progress:.1f}%) • ETA: {eta_str}"
 
-                    # Show metrics in both normal and quiet modes (but not silent)
+                    fractional_epoch = epoch + (self._data_state["step_in_epoch"] / steps_per_epoch)
+                    header = (
+                        f"STEP {self._logical_step:,}/{max_steps:,} ({progress:.1f}%) • ETA: {eta_str}"
+                        if max_steps
+                        else f"STEP {self._logical_step:,} • EPOCH {fractional_epoch:.2f}/{epochs} "
+                             f"({progress:.1f}%) • ETA: {eta_str}"
+                    )
                     if self.logger.isEnabledFor(QUIET):
                         self.logger.quiet(colorize(header, Palette.BOLD))
-                        
+
                         for actor_name, actor_metrics_list in metrics.items():
                             if not actor_metrics_list or not any(actor_metrics_list):
                                 continue
-                            
                             self.logger.quiet(colorize(f"   🎭 {actor_name}:", Palette.CYAN))
-                            
-                            # Log metrics for ALL iterations, not just the last one
                             for iteration_idx, actor_metrics in enumerate(actor_metrics_list):
                                 if not actor_metrics:
                                     continue
-                                
-                                # Show iteration number if there are multiple iterations
+                                indent = "      "
                                 if self.num_iterations > 1:
-                                    self.logger.quiet(colorize(f"      📊 Iteration {iteration_idx + 1}:", Palette.YELLOW))
+                                    self.logger.quiet(
+                                        colorize(f"      📊 Iter {iteration_idx+1}:", Palette.YELLOW)
+                                    )
                                     indent = "         "
-                                else:
-                                    indent = "      "
-                                
-                                # Static metrics that don't change between iterations (only show for first iteration)
-                                static_metrics = {"completion_len", "reward_mean", "reward_std"}
-                                
-                                for m_name, m_val in actor_metrics.items():
-                                    # Skip static metrics for iterations beyond the first
-                                    if iteration_idx > 0 and m_name in static_metrics:
+                                static = {"completion_len", "reward_mean", "reward_std"}
+                                for m, v in actor_metrics.items():
+                                    if iteration_idx and m in static:
                                         continue
-                                        
-                                    self.logger.quiet(colorize(f"{indent}• {m_name}: {m_val:.3f}", Palette.CYAN))
-                        
-                        self.logger.quiet("")  # Add a blank line for spacing
+                                    self.logger.quiet(
+                                        colorize(f"{indent}• {m}: {v:.3f}", Palette.CYAN)
+                                    )
+                        self.logger.quiet("")
 
-                # ALWAYS log to WandB if enabled, regardless of log_every_n or logging level
                 if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
                     import wandb
-                    
-                    # Static metrics that don't change between iterations (only log for first iteration)
-                    static_metrics = {"completion_len", "reward_mean", "reward_std"}
-                    
-                    # Iterate over iterations first, then actors for each iteration
+                    static = {"completion_len", "reward_mean", "reward_std"}
                     for iteration_idx in range(self.num_iterations):
-                        # Increment step once per iteration for WandB logging
-                        if iteration_idx > 0:  # First iteration uses the step from train_step
+                        if iteration_idx > 0:
                             self._step += 1
-                        
-                        # Log all metrics for this iteration to WandB
                         for actor_name, actor_metrics_list in metrics.items():
-                            if not actor_metrics_list or iteration_idx >= len(actor_metrics_list):
+                            if iteration_idx >= len(actor_metrics_list):
                                 continue
-                            
-                            actor_metrics = actor_metrics_list[iteration_idx]
-                            if not actor_metrics:
-                                continue
-                            
-                            for m_name, m_val in actor_metrics.items():
-                                # Skip static metrics for iterations beyond the first
-                                if iteration_idx > 0 and m_name in static_metrics:
+                            for m, v in actor_metrics_list[iteration_idx].items():
+                                if iteration_idx and m in static:
                                     continue
-                                
-                                wandb_key = f"{actor_name}/{m_name}"
-                                wandb.log({wandb_key: m_val}, step=self._step)
-                
-                total_steps += 1
+                                wandb.log({f"{actor_name}/{m}": v}, step=self._step)
+
+            # ─── epoch boundary ───────────────────────────────────────────
+            self._data_state.update(
+                epoch=self._data_state["epoch"] + 1,
+                step_in_epoch=0,
+                current_generator_seed=self._data_state["current_generator_seed"] + 1,
+            )
+            self._build_dataloader()
+            dataloader = self._dataloader   # fresh iterator for next epoch
+        # ─── final model save ───────────────────────────────────────────
+        if save_strategy in {SaveStrategy.FINAL, SaveStrategy.ALL}:
+            final_path = os.path.join(run_checkpoint_path, "final_models")
+            self.save_pretrained(final_path)
+            if self.accel.is_main_process:
+                self.logger.quiet(colorize("💾 Models saved", Palette.VERB))
+
+
 
     def train_step(self, raw_batch: Dict[str, List[Any]]) -> Dict[str, Dict[str, float]]:
         """
@@ -442,24 +459,22 @@ class Trainer:
         if self.use_wandb and is_wandb_active() and self.accel.is_main_process and self._logical_step % self.log_every_n == 0:
             import wandb
             for name, ta in self.actors.items():
-                if name in env_out and "input_ids" in raw_batch:
-                    prompts_ids = raw_batch["input_ids"]
+                if name in env_out:
+                    # Raw batch keys
+                    batch_keys = list(batch.keys())
                     completions_ids = env_out[name]["input_ids"]
                     rewards = env_out[name]["rewards"]
 
-                    table = wandb.Table(columns=["prompt", "completion", "reward"])
+                    table = wandb.Table(columns=batch_keys + ["completion", "reward"])
 
-                    for i in range(len(prompts_ids)):
-                        prompt_text = ta.tokenizer.decode(prompts_ids[i], skip_special_tokens=True)
-                        for j in range(self.group_size):
-                            idx = i * self.group_size + j
-                            if idx < len(completions_ids):
-                                completion_text = ta.tokenizer.decode(completions_ids[idx], skip_special_tokens=True)
-                                reward = rewards[idx]
-                                table.add_data(prompt_text, completion_text, reward)
+                    for i in range(len(completions_ids)):
+                        row = {k: batch[k][i] for k in batch_keys}
+                        row["completion"] = ta.tokenizer.decode(completions_ids[i], skip_special_tokens=False)
+                        row["reward"] = rewards[i]
+                        table.add_data(*row.values())
                     
                     # Use the current step for completions table
-                    wandb.log({f"{name}/completions": table}, step=self._step)
+                    wandb.log({f"completions_{name}/completions_{self._logical_step}": table}, step=self._step)
 
         # warn about unexpected actor keys (once per step, rank==0 only)
         if self.rank == 0:
@@ -614,35 +629,158 @@ class Trainer:
     # checkpointing
     # ------------------------------------------------------------------ #
     def save_checkpoint(self, path: str):
-        """Save all models, optimizers, schedulers, and state to the given directory."""
+        """Save models, optims, schedulers, plus RNG & sampler state."""
         self.accel.wait_for_everyone()
-        self.accel.save_state(output_dir=path) 
+        self.accel.save_state(output_dir=path)
         if self.accel.is_main_process:
-            state = {"step": self._step, "logical_step": self._logical_step}
-            with open(os.path.join(path, "trainer_state.json"), "w") as f:
-                json.dump(state, f)
+            torch.save(
+                {
+                    "step": self._step,
+                    "logical_step": self._logical_step,
+                    "data_state": self._data_state,
+                    "rng_state": self._rng.get_state(),
+                },
+                os.path.join(path, "trainer_state.pt"),
+            )
         self.accel.wait_for_everyone()
 
     def load_checkpoint(self, path: str):
-        """Load model, optimizer, scheduler states from the checkpoint directory."""
+        """Restore everything, including exact sampler position."""
         self.accel.load_state(path)
-        state_path = os.path.join(path, "trainer_state.json")
-        if os.path.isfile(state_path):
-            with open(state_path, "r") as f:
-                state = json.load(f)
-            self._step = state.get("step", 0)
-            self._logical_step = state.get("logical_step", 0)
-        
-        # Update vLLM/trainable actors with the new weights and sleep them
+        state = torch.load(os.path.join(path, "trainer_state.pt"), map_location="cpu")
+        self._step = state["step"]
+        self._logical_step = state["logical_step"]
+        self._data_state = state["data_state"]
+
+        self._rng = torch.Generator()
+        self._rng.set_state(state["rng_state"])
+        self._build_dataloader()
+
+        # update vLLM / actor weights
         if self.accel.is_main_process:
-            self.logger.normal(colorize("🔄 Updating actor weights from checkpoint...", Palette.INFO))
-        
-        for name, ta in self.actors.items():
-            # Update actor weights using the same mechanism as during training
+            self.logger.normal(colorize("🔄 Updating actor weights from checkpoint…", Palette.INFO))
+        for ta in self.actors.values():
             self._update_actor_weights(ta)
-            
-            # Sleep the actor after updating weights
             if self.accel.is_local_main_process:
                 ta.actor.sleep(1)
                 if self.accel.is_main_process:
-                    self.logger.normal(colorize(f"😴 Actor '{name}' put to sleep after checkpoint load", Palette.INFO))
+                    self.logger.normal(
+                        colorize(f"😴 Actor '{ta.name}' put to sleep after resume", Palette.INFO)
+                    )
+    def save_pretrained(self, output_dir: str):
+        """
+        Save all actors' models **and** tokenizers so they can later be
+        re-loaded with `from_pretrained`.
+
+        • If there is a single actor, files are written directly to
+          ``output_dir`` (mirrors HF default).
+        • If there are >1 actors, each actor gets its own sub-folder,
+          ``output_dir/<actor_name>/``.
+
+        Only the model and tokenizer are saved - no optimiser / scheduler
+        state (just like HF `Trainer.save_model`).
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        multi = len(self.actors) > 1
+
+        for name, ta in self.actors.items():
+            tgt = os.path.join(output_dir, name) if multi else output_dir
+            os.makedirs(tgt, exist_ok=True)
+
+            # 1️⃣ model
+            if hasattr(ta.model, "save_pretrained"):
+                ta.model.save_pretrained(tgt)
+            else:
+                raise AttributeError(f"Actor '{name}' model lacks save_pretrained()")
+
+            # 2️⃣ tokenizer (some setups deliberately omit a tokenizer)
+            if ta.tokenizer is not None:
+                ta.tokenizer.save_pretrained(tgt)
+            else:
+                warnings.warn(f"Actor '{name}' has no tokenizer - skipped.")
+    # ------------------------------------------------------------------ #
+    # Hugging Face Hub upload
+    # ------------------------------------------------------------------ #
+    def push_to_hub(
+        self,
+        repo_map: Union[str, Dict[str, str]],
+        *,
+        private: bool = False,
+        commit_message: str | None = None,
+        **push_kwargs,
+    ):
+        """
+        Upload model(s) & tokenizer(s) to the Hugging Face Hub.
+
+        Parameters
+        ----------
+        repo_map
+            • str  - repository ID for a **single** actor setup.
+            • dict - {actor_name: repo_id} for multi-actor setups.
+        private
+            Create / push to a private repository.
+        commit_message
+            Git commit message.
+        **push_kwargs
+            Forwarded to `model.push_to_hub` / `tokenizer.push_to_hub`.
+        """
+        if commit_message is None:
+            commit_message = "Upload model trained with Actors"
+
+        # ─── single-actor convenience ───────────────────────────────────
+        if isinstance(repo_map, str):
+            if len(self.actors) != 1:
+                raise ValueError(
+                    "repo_map is a string but multiple actors exist. "
+                    "Provide a dict mapping each actor to a repo ID."
+                )
+            name, ta = next(iter(self.actors.items()))
+            self._push_single_actor(
+                ta,
+                repo_map,
+                private=private,
+                commit_message=commit_message,
+                **push_kwargs,
+            )
+            return
+
+        # ─── multi-actor case ───────────────────────────────────────────
+        if not isinstance(repo_map, dict):
+            raise TypeError("repo_map must be a str or a dict[str, str].")
+
+        for name, ta in self.actors.items():
+            if name not in repo_map:
+                raise KeyError(f"No repo ID supplied for actor '{name}'.")
+            self._push_single_actor(
+                ta,
+                repo_map[name],
+                private=private,
+                commit_message=commit_message,
+                **push_kwargs,
+            )
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _push_single_actor(
+        ta: TrainableLLMActor,
+        repo_id: str,
+        *,
+        private: bool,
+        commit_message: str,
+        **push_kwargs,
+    ):
+        # 1️⃣ model
+        ta.model.push_to_hub(
+            repo_id,
+            private=private,
+            commit_message=commit_message,
+            **push_kwargs,
+        )
+        # 2️⃣ tokenizer (if present)
+        if ta.tokenizer is not None:
+            ta.tokenizer.push_to_hub(
+                repo_id,
+                private=private,
+                commit_message=commit_message,
+                **push_kwargs,
+            )
