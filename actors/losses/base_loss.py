@@ -4,6 +4,8 @@ from typing import Dict, Optional
 
 class BaseRLLoss(abc.ABC):
     """Every loss must return (scalar_loss, metrics:dict[str,float])."""
+    beta: float = 0.4 
+    temperature: float = 1.0 
 
     @abc.abstractmethod
     def forward(

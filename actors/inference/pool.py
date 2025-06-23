@@ -1,4 +1,5 @@
 from __future__ import annotations
+import atexit
 import math, time, threading, uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
@@ -59,6 +60,30 @@ class ModelPool:
         self.models: Dict[str, ModelRecord] = {}
         ray.init(ignore_reinit_error=True)
         self._init_done = True
+        # Register cleanup on exit
+        atexit.register(self._cleanup_on_exit)
+
+    def _cleanup_on_exit(self):
+        """Clean up all models and Ray resources on program exit."""
+        try:
+            # Unload all models
+            model_names = list(self.models.keys())
+            for name in model_names:
+                try:
+                    self.unload_model(name)
+                except Exception:
+                    # Silently ignore individual model cleanup errors
+                    pass
+            
+            # Shutdown Ray
+            try:
+                ray.shutdown()
+            except Exception:
+                # Silently ignore Ray shutdown errors
+                pass
+        except Exception:
+            # Silently ignore all cleanup errors to prevent segfaults
+            pass
     # ------------- dashboard --------------------------------------
     def _render_dashboard(self) -> str:
         if not self.models:
@@ -153,9 +178,17 @@ class ModelPool:
         rec = self.models.pop(name, None)
         if not rec:
             raise RuntimeError("no such model")
-        for w in rec.workers:
-            ray.kill(w)
-        logger.quiet(colorize(f"✖️   Unloaded {name}", Palette.WARNING))
+        try:
+            for w in rec.workers:
+                try:
+                    ray.kill(w)
+                except Exception:
+                    # Ignore individual worker kill errors
+                    pass
+            logger.quiet(colorize(f"✖️   Unloaded {name}", Palette.WARNING))
+        except Exception:
+            # Ignore overall unload errors but still log success
+            logger.quiet(colorize(f"✖️   Unloaded {name} (with warnings)", Palette.WARNING))
 
     # ------------- sleep / wake -----------------------------------
     def sleep(self, name: str, level: int = 1) -> None:

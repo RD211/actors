@@ -7,6 +7,8 @@ from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from actors.losses.grpo_loss import GRPOLoss
 from actors.losses.liger_grpo_loss import LigerLoss
 from torch.optim.lr_scheduler import LinearLR, ConstantLR
+# cosine
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from vllm import SamplingParams
 from actors import Trainer
 import bitsandbytes as bnb
@@ -124,7 +126,7 @@ def main():
             {"text": "Who wrote 'To Kill a Mockingbird'?"},
             {"text": "What is the speed of light?"},
             {"text": "How do you make a cake?"},
-    ] * 120
+    ] * 5
     trainer = Trainer(env, 
                       group_size=4, 
                       batch_size=16,

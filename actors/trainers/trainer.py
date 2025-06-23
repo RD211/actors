@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum, auto
@@ -19,6 +20,7 @@ from datasets import Dataset as HFDataset, DatasetDict
 from accelerate.utils import DeepSpeedPlugin
 
 # ----- project-local helpers -------------------------------------------------
+from actors.actors.base import TrainableLLMActor
 from actors.utils.logger import init_logger, colorize, Palette, VERBOSE, NORMAL, QUIET
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.environments.env_base import Environment
@@ -28,16 +30,16 @@ from actors.utils.tracker import gpu_profiler
 from actors.utils.wandb import is_wandb_active
 
 # ═════════════════════════════════════════════════════════════════════════════
-@dataclass(frozen=True)
-class TrainableLLMActor:
+@dataclass(frozen=False)
+class InitializedTrainableLLMActor:
     """Immutable record that bundles everything the trainer needs for one actor."""
     name: str
-    actor: object                                  # Env-side proxy that owns the rollout workers
+    actor: TrainableLLMActor
     model: torch.nn.Module
     tokenizer: PreTrainedTokenizerBase
     loss_fn: BaseRLLoss
     optim: torch.optim.Optimizer
-    sched: torch.optim.lr_scheduler._LRScheduler
+    sched: Optional[torch.optim.lr_scheduler.LRScheduler]
     accel: Accelerator 
     reference_model: Optional[torch.nn.Module] = None
 
@@ -95,7 +97,6 @@ class Trainer:
         reference_batch_size: int = 1,
         num_iterations: int = 1,
         max_grad_norm: float = 1.0,
-        temperature: float = 1.0,
         gradient_checkpointing: bool = True,
         # logging
         use_wandb: bool = True,
@@ -106,7 +107,6 @@ class Trainer:
         self.env   = env
         self.max_grad_norm  = max_grad_norm
         self.num_iterations = num_iterations
-        self.temperature    = temperature
         self.gradient_checkpointing = gradient_checkpointing
         self.use_wandb = use_wandb
         self.log_every_n = log_every_n
@@ -128,7 +128,7 @@ class Trainer:
         # 1.  one DeepSpeedPlugin per actor – default config first
         # ═══════════════════════════════════════════════════════════════
         self.ds_plugins: Dict[str, DeepSpeedPlugin] = {
-            name: DeepSpeedPlugin() for name in env.get_actor_specs().keys()
+            name: DeepSpeedPlugin() for name in env.get_trainable_actors().keys()
         }
 
         # tweak each plugin’s config **after** creation (no base template)
@@ -180,14 +180,14 @@ class Trainer:
         # ═══════════════════════════════════════════════════════════════
         # 3.  build TrainableLLMActor registry
         # ═══════════════════════════════════════════════════════════════
-        self.actors: Dict[str, TrainableLLMActor] = {}
+        self.actors: Dict[str, InitializedTrainableLLMActor] = {}
 
-        for name, (actor_obj, spec) in env.get_actor_specs().items():
+        for name, actor_obj in env.get_trainable_actors().items():
             accel = self.accelerators[name]
             accel.state.select_deepspeed_plugin(name)   # activate this engine
 
             # ── create & optionally checkpoint-enable model ────────────
-            model = spec.model_factory()
+            model = actor_obj.training_config.model_factory()
             if gradient_checkpointing:
                 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
                 model.config.use_cache = False
@@ -197,36 +197,34 @@ class Trainer:
             model = model.train()
 
             # ── loss / reference model (if any) ────────────────────────
-            loss_fn = spec.loss_factory()
+            loss_fn = actor_obj.training_config.loss_factory()
             beta    = getattr(loss_fn, "beta", 0.0)
             ref_model = (
-                spec.reference_model_factory().eval()
-                if spec.reference_model_factory and beta != 0.0
+                actor_obj.training_config.reference_model_factory().eval()
+                if actor_obj.training_config.reference_model_factory and beta != 0.0
                 else None
             )
 
             # ── optimiser / scheduler ─────────────────────────────────
-            optim = spec.optim_factory(model.parameters())
-            sched = spec.scheduler_factory(optim)
-
+            optim = actor_obj.training_config.optim_factory(model.parameters())
             # ── wrap with this actor’s accelerator ────────────────────
-            model, optim, sched = accel.prepare(model, optim, sched)
+            model, optim = accel.prepare(model, optim)
             if ref_model is not None:
                 accel.state.select_deepspeed_plugin(name)
-                if self.ds_plugins[name].config["zero_optimization"]["stage"] == 3:
+                if self.ds_plugins[name].deepspeed_config["zero_optimization"]["stage"] == 3:
                     ref_model = accel.prepare(ref_model)
                 else:
                     ref_model = ref_model.to(accel.device)
 
             # ── register ──────────────────────────────────────────────
-            self.actors[name] = TrainableLLMActor(
+            self.actors[name] = InitializedTrainableLLMActor(
                 name           = name,
                 actor          = actor_obj,
                 model          = model,
-                tokenizer      = spec.tokenizer,
+                tokenizer      = actor_obj.training_config.tokenizer_factory(),
                 loss_fn        = loss_fn,
                 optim          = optim,
-                sched          = sched,
+                sched          = None,
                 reference_model= ref_model,
                 accel          = accel,
             )
@@ -303,7 +301,7 @@ class Trainer:
             input_ids = padded["input_ids"].to(model.device)
 
             L = input_ids.size(1)
-            rng = torch.arange(L, device=self.ma.device).unsqueeze(0)
+            rng = torch.arange(L, device=model.device).unsqueeze(0)
             att_mask = (rng < torch.tensor(lengths, device=model.device).unsqueeze(1)).long()
 
             with torch.no_grad():
@@ -340,6 +338,7 @@ class Trainer:
         if self.use_wandb and is_wandb_active() and self.main_accel.is_main_process:
             import wandb
 
+
         # unique folder for this training run
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_checkpoint_path = os.path.join(checkpoint_path, f"run_{timestamp}")
@@ -354,6 +353,12 @@ class Trainer:
         total_expected_steps = (
             max_steps if max_steps is not None else epochs * steps_per_epoch
         )
+
+        # create schedulers now that we know total steps
+        for name, ta in self.actors.items():
+            sched = ta.actor.training_config.scheduler_factory(ta.optim, total_expected_steps)
+            sched = ta.accel.prepare(sched)
+            self.actors[name].sched = sched
 
         # fast-forward dataloader if we resumed mid-epoch
         dataloader = self._dataloader
@@ -445,9 +450,14 @@ class Trainer:
                                 for m, v in actor_metrics.items():
                                     if iteration_idx and m in static:
                                         continue
-                                    self.logger.quiet(
-                                        colorize(f"{indent}• {m}: {v:.3f}", Palette.CYAN)
-                                    )
+                                    if m == "learning_rate":
+                                        self.logger.quiet(
+                                            colorize(f"{indent}• {m}: {v:.2e}", Palette.CYAN)
+                                        )
+                                    else:
+                                        self.logger.quiet(
+                                            colorize(f"{indent}• {m}: {v:.3f}", Palette.CYAN)
+                                        )
                         self.logger.quiet("")
 
                 if self.use_wandb and is_wandb_active() and self.main_accel.is_main_process:
@@ -472,6 +482,9 @@ class Trainer:
                                 if iteration_idx and m in static:
                                     continue
                                 wandb.log({f"{actor_name}/{m}": v}, step=self._step)
+                            # We also log the learning rate for each actor
+                            learning_rate = self.actors[actor_name].sched.get_last_lr()[0]
+                            wandb.log({f"{actor_name}/learning_rate": learning_rate}, step=self._step)
 
             # ─── epoch boundary ───────────────────────────────────────────
             self._data_state.update(
@@ -552,19 +565,29 @@ class Trainer:
                 logger_method(colorize(f"env produced data for unknown actor '{k}'",
                                              Palette.WARNING))
 
-        # collect metrics - include reward component means
-        base_metrics = dict(loss=[], kl=[], grad_norm=[], completion_len=[], 
-                          reward_mean=[], reward_std=[])
-        
-        # Add reward component metrics for all actors
-        for name in self.actors:
-            if name in env_out.actors and env_out.actors[name].reward_components:
-                for comp_name in env_out.actors[name].reward_components.keys():
-                    base_metrics[f"{comp_name}_mean"] = []
-                    base_metrics[f"{comp_name}_std"] = []
-        
-        metrics = {name: [base_metrics.copy() for _ in range(self.num_iterations)]
-                  for name in self.actors}
+        base_metrics: Dict[str, List[float]] = {
+            "loss":           [],
+            "kl":             [],
+            "grad_norm":      [],
+            "completion_len": [],
+            "reward_mean":    [],
+            "reward_std":     [],
+            "learning_rate":  [],
+        }
+
+        def make_template(actor_name: str) -> Dict[str, List[float]]:
+            tpl = dict(base_metrics)
+            actor_out = env_out.actors.get(actor_name)
+            if actor_out and actor_out.reward_components:
+                for comp in actor_out.reward_components:
+                    tpl[f"{comp}_mean"] = []
+                    tpl[f"{comp}_std"]  = []
+            return tpl
+
+        metrics: Dict[str, List[Dict[str, List[float]]]] = {
+            name: [deepcopy(make_template(name)) for _ in range(self.num_iterations)]
+            for name in self.actors
+        }
 
         for name, ta in self.actors.items():
             if name not in env_out.actors:
@@ -572,9 +595,16 @@ class Trainer:
             self._process_actor_step(name, ta, env_out.actors[name], metrics[name])
 
         # aggregate over grad-steps and (internally) over ranks
-        out: Dict[str, Dict[str, List[float]]] = {}
-        for name, arr in metrics.items():
-            out[name] = [{k: (sum(v) / len(v)) for k, v in d.items() if v} for d in arr]
+        out: Dict[str, List[Dict[str, float]]] = {}
+        for name, bucket_list in metrics.items():
+            iter_stats: List[Dict[str, float]] = []
+            for bucket in bucket_list:
+                iter_stats.append({
+                    k: (sum(v) / len(v) if v else float("nan"))
+                    for k, v in bucket.items()
+                })
+            out[name] = iter_stats
+
         return out
 
     # ------------------------------------------------------------------ #
@@ -583,7 +613,7 @@ class Trainer:
     def _process_actor_step(
         self,
         name: str,
-        ta: TrainableLLMActor,
+        ta: InitializedTrainableLLMActor,
         actor_output: ActorOutput,
         buckets: List[Dict[str, List[float]]]) -> None:
         
@@ -595,8 +625,8 @@ class Trainer:
 
         # compute reference log-ps once (if any)
         old_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, 
-                                 temperature=self.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
-        ref_lp = (self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=self.temperature, batch_size=self.reference_batch_size)
+                                 temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
+        ref_lp = (self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
                 if ta.reference_model is not None else None)
 
         # iterate over grad-accumulation micro-batches
@@ -634,8 +664,10 @@ class Trainer:
                         if mean_key in b:
                             b[mean_key].append(sum(comp_rewards) / len(comp_rewards))
                             b[std_key].append(torch.tensor(comp_rewards).float().std(unbiased=False).item())
+            b["learning_rate"].append(ta.sched.get_last_lr()[0])
+
         self._update_actor_weights(ta)
-        ta.actor.sleep(1)
+        ta.actor.sleep()
 
     # ------------------------------------------------------------------ #
     @gpu_profiler(name='backward_one_slice')
@@ -787,7 +819,7 @@ class Trainer:
         for ta in self.actors.values():
             self._update_actor_weights(ta)
             if self.main_accel.is_local_main_process:
-                ta.actor.sleep(1)
+                ta.actor.sleep()
                 if self.main_accel.is_main_process:
                     self.logger.normal(
                         colorize(f"😴 Actor '{ta.name}' put to sleep after resume", Palette.INFO)

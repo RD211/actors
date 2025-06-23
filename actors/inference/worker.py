@@ -78,7 +78,7 @@ class ModelWorker:
 
     def generate(self, shard: list, sampling_params: SamplingParams) -> list:
         if self.is_sleeping:
-            raise RuntimeError(f"asleep level {self.sleep_level}")
+            raise RuntimeError(f"Model {self.model_name} is sleeping. Cannot generate.")
         if not shard:
             return []
 
@@ -88,7 +88,7 @@ class ModelWorker:
 
     def chat(self, shard: list, sampling_params: SamplingParams) -> list:
         if self.is_sleeping:
-            raise RuntimeError(f"asleep level {self.sleep_level}")
+            raise RuntimeError(f"ModelWorker is asleep at level {self.sleep_level}")
         if not shard:
             return []
 

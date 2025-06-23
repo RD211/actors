@@ -1,4 +1,5 @@
 from __future__ import annotations
+import atexit
 from typing import Dict, List, Sequence
 import torch
 from vllm import SamplingParams, RequestOutput
@@ -17,8 +18,9 @@ class vLLMActor(TrainableLLMActor):
         gpu_groups: List[List[int]] | int | None = None,
         use_v1_engine: bool = True,
         engine_kwargs: Dict[str, any] | None = None,
+        insomnia: bool = False, # If true all sleep calls will be ignored
     ):
-        super().__init__(name)
+        super().__init__(name, model_path)
         self.pool = ModelPool()
         if name not in self.pool.list_models():
             self.pool.load_model(
@@ -28,16 +30,55 @@ class vLLMActor(TrainableLLMActor):
                 use_v1_engine=use_v1_engine,
                 engine_kwargs=engine_kwargs,
             )
+        # Register cleanup function for this actor
+        atexit.register(self._cleanup)
+        self.name = name
+        self.insomnia = insomnia
+
+        self._sleep_level = 0
+
+        self.sleep(level=1)
+
+    def _cleanup(self):
+        """Clean up resources when the program exits."""
+        try:
+            if hasattr(self, 'pool') and self.pool is not None:
+                # Try to unload this model if it exists
+                if self.name in self.pool.list_models():
+                    self.pool.unload_model(self.name)
+        except Exception:
+            # Silently ignore cleanup errors to avoid segfaults
+            pass
+
+    def __del__(self):
+        """Destructor for additional cleanup safety."""
+        self._cleanup()
+
+    def sleep(self, level: int = 1):
+        if self.insomnia:
+            return
+        self.pool.sleep(self.name, level)
+        self._sleep_level = level
+
+    def wake(self):
+        self.pool.wake(self.name)
+        self._sleep_level = 0
+
+    def finalize_weight_update(self):
+        self.pool.finalize_update(self.name)
+        self._sleep_level = 0
 
     def generate(
         self, prompts: Sequence[str], sampling_params: SamplingParams | None = None
     ) -> List[RequestOutput]:
+        self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
         return self.pool.generate(self.name, list(prompts), sampling)
 
     def chat(
         self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None
     ) -> List[RequestOutput]:
+        self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
         return self.pool.chat(self.name, list(dialogs), sampling)
 
@@ -71,11 +112,10 @@ class vLLMActor(TrainableLLMActor):
 
         self.pool.update_weights_batch(self.name, all_ipc_handles)
 
-    def finalize_weight_update(self):
-        self.pool.finalize_update(self.name)
-
-    def sleep(self, level: int = 1):
-        self.pool.sleep(self.name, level)
-        
-    def wake(self):
-        self.pool.wake(self.name)
+    def _handle_sleep_state(self):
+        if self._sleep_level == 1:
+            self.wake()
+        elif self._sleep_level == 2:
+            raise RuntimeError(
+                f"Model {self.name} is sleeping at level 2. While attempting to generate or chat."
+            )
