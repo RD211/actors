@@ -57,6 +57,14 @@ class SaveStrategy(Enum):
     FINAL  = auto()  # one model save at the very end
     ALL    = auto()  # both periodic + final
 
+
+class EvalStrategy(Enum):
+    """Allowed evaluation modes."""
+    NONE   = auto()  # never evaluate
+    STEPS  = auto()  # evaluate every eval_every_n steps
+    FINAL  = auto()  # evaluate only at the end
+    ALL    = auto()  # evaluate both periodically and at the end
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Stateless helper functions
 # ═════════════════════════════════════════════════════════════════════════════
@@ -129,6 +137,16 @@ class Trainer:
         use_wandb: bool = True,
         log_every_n: int = 1,
         use_dashboard: bool = True,
+        # evaluation
+        eval_data: Optional[Union[
+            List[Dict[str, Any]], 
+            Dataset, 
+            HFDataset, 
+            DatasetDict,
+            Dict[str, Union[List[Dict[str, Any]], Dataset, HFDataset, DatasetDict]]
+        ]] = None,
+        eval_every_n: Optional[int] = None,
+        eval_strategy: EvalStrategy = EvalStrategy.NONE,
     ):
         # ─── trainer-level bookkeeping ────────────────────────────────
         self.env   = env
@@ -159,6 +177,23 @@ class Trainer:
         self.grad_accumulation_steps = grad_accumulation_steps
         self.reference_batch_size    = reference_batch_size
         self._build_dataloader()
+        
+        # ─── evaluation setup ──────────────────────────────
+        if eval_data is not None:
+            if isinstance(eval_data, dict):
+                # Multiple named eval datasets
+                self.eval_datasets = {
+                    name: self._normalise_hf_splits(data) 
+                    for name, data in eval_data.items()
+                }
+            else:
+                # Single eval dataset - give it a default name
+                self.eval_datasets = {"eval": self._normalise_hf_splits(eval_data)}
+        else:
+            self.eval_datasets = {}
+        
+        self.eval_every_n = eval_every_n
+        self.eval_strategy = eval_strategy
 
         # ═══════════════════════════════════════════════════════════════
         # 1.  one DeepSpeedPlugin per actor – default config first
@@ -398,6 +433,123 @@ class Trainer:
         gathered = self.main_accel.gather_for_metrics(local_logps)
         return gathered
 
+    def evaluate(self, is_final: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Run evaluation on all eval datasets if available.
+        Returns evaluation metrics or None if no eval data.
+        """
+        if not self.eval_datasets:
+            return None
+            
+        if self.main_accel.is_main_process:
+            self.logger.normal(colorize("🔍 Starting evaluation...", Palette.INFO))
+        
+        all_eval_metrics = {}
+        
+        # Iterate through each eval dataset
+        for eval_name, eval_data in self.eval_datasets.items():
+            if self.main_accel.is_main_process:
+                self.logger.normal(colorize(f"📋 Evaluating on '{eval_name}' dataset...", Palette.INFO))
+            
+            # Create eval batch with all eval data (no sampling, use entire dataset)
+            eval_batch = {}
+            for key in eval_data[0].keys():
+                eval_batch[key] = [item[key] for item in eval_data]
+            
+            # Run environment on eval data (no gradient accumulation needed for eval)
+            env_out = self.env(eval_batch)
+            
+            # Collect metrics for each actor
+            eval_metrics = {}
+            
+            for actor_name, actor_output in env_out.actors.items():
+                if actor_name not in self.actors:
+                    continue
+                    
+                ta = self.actors[actor_name]
+                
+                # Basic reward statistics
+                rewards = actor_output.rewards
+                reward_mean = sum(rewards) / len(rewards) if rewards else 0.0
+                reward_std = (sum((r - reward_mean) ** 2 for r in rewards) / len(rewards)) ** 0.5 if len(rewards) > 1 else 0.0
+                
+                # Completion length statistics
+                completion_lens = [len(ta.tokenizer.decode(ids, skip_special_tokens=False)) for ids in actor_output.input_ids]
+                completion_len_mean = sum(completion_lens) / len(completion_lens) if completion_lens else 0.0
+                
+                actor_metrics = {
+                    "reward_mean": reward_mean,
+                    "reward_std": reward_std,
+                    "completion_len_mean": completion_len_mean,
+                }
+                
+                # Add reward component statistics
+                if actor_output.reward_components:
+                    for comp_name, comp_rewards in actor_output.reward_components.items():
+                        comp_mean = sum(comp_rewards) / len(comp_rewards) if comp_rewards else 0.0
+                        comp_std = (sum((r - comp_mean) ** 2 for r in comp_rewards) / len(comp_rewards)) ** 0.5 if len(comp_rewards) > 1 else 0.0
+                        actor_metrics[f"{comp_name}_mean"] = comp_mean
+                        actor_metrics[f"{comp_name}_std"] = comp_std
+                
+                eval_metrics[actor_name] = actor_metrics
+                
+            # Log to console
+            if self.main_accel.is_main_process:
+                self.logger.quiet(colorize(f"📊 Evaluation Results for '{eval_name}':", Palette.BOLD))
+                for actor_name, metrics in eval_metrics.items():
+                    self.logger.quiet(colorize(f"   🎭 {actor_name}:", Palette.CYAN))
+                    for metric_name, value in metrics.items():
+                        self.logger.quiet(colorize(f"      • {metric_name}: {value:.3f}", Palette.CYAN))
+                self.logger.quiet("")
+                
+            # Log to wandb
+            if self.use_wandb and is_wandb_active() and self.main_accel.is_main_process:
+                import wandb
+                
+                # Log eval metrics with section-based naming
+                for actor_name, metrics in eval_metrics.items():
+                    for metric_name, value in metrics.items():
+                        wandb.log({f"eval_{eval_name}_{actor_name}/{metric_name}": value}, step=self._step)
+                
+                # Log eval completions table for each actor
+                for actor_name, actor_output in env_out.actors.items():
+                    if actor_name not in self.actors:
+                        continue
+                        
+                    ta = self.actors[actor_name]
+                    
+                    # Prepare table columns
+                    columns = list(eval_batch.keys()) + ["completion", "total_reward"]
+                    if actor_output.reward_components:
+                        columns.extend(actor_output.reward_components.keys())
+                    
+                    table = wandb.Table(columns=columns)
+                    
+                    # Add each completion as a row
+                    for i in range(len(actor_output.input_ids)):
+                        row = [eval_batch[k][i] for k in eval_batch.keys()]
+                        completion = ta.tokenizer.decode(actor_output.input_ids[i], skip_special_tokens=False)
+                        row.append(completion)
+                        row.append(actor_output.rewards[i])
+                        
+                        if actor_output.reward_components:
+                            for comp_name in actor_output.reward_components.keys():
+                                row.append(actor_output.reward_components[comp_name][i])
+                        
+                        table.add_data(*row)
+                    
+                    # Add _final suffix for final evaluation table names
+                    table_suffix = "_final" if is_final else f"_step_{self._logical_step}"
+                    wandb.log({f"eval_{eval_name}_completions_{actor_name}/eval{table_suffix}": table}, step=self._step)
+            
+            # Store metrics for this eval dataset
+            all_eval_metrics[eval_name] = eval_metrics
+        
+        if self.main_accel.is_main_process:
+            self.logger.normal(colorize("✅ Evaluation completed", Palette.INFO))
+            
+        return all_eval_metrics
+
     # ═════════════════════════════════════════════════════════════════════
     # public API
     # ═════════════════════════════════════════════════════════════════════
@@ -567,6 +719,15 @@ class Trainer:
                             learning_rate = self.actors[actor_name].sched.get_last_lr()[0]
                             wandb.log({f"{actor_name}/learning_rate": learning_rate}, step=self._step)
 
+                # ─── evaluation ───────────────────────────────────────────
+                if (
+                    self.eval_datasets
+                    and self.eval_strategy in {EvalStrategy.STEPS, EvalStrategy.ALL}
+                    and self.eval_every_n is not None 
+                    and self._logical_step % self.eval_every_n == 0
+                ):
+                    self.evaluate(is_final=False)
+
             # ─── epoch boundary ───────────────────────────────────────────
             self._data_state.update(
                 epoch=self._data_state["epoch"] + 1,
@@ -575,6 +736,16 @@ class Trainer:
             )
             self._build_dataloader()
             dataloader = self._dataloader   # fresh iterator for next epoch
+            
+        # ─── final evaluation ─────────────────────────────────────────
+        if (
+            self.eval_datasets
+            and self.eval_strategy in {EvalStrategy.FINAL, EvalStrategy.ALL}
+        ):
+            if self.main_accel.is_main_process:
+                self.logger.normal(colorize("🎯 Running final evaluation...", Palette.INFO))
+            self.evaluate(is_final=True)
+            
         # ─── final model save ───────────────────────────────────────────
         if save_strategy in {SaveStrategy.FINAL, SaveStrategy.ALL}:
             final_path = os.path.join(run_checkpoint_path, "final_models")
