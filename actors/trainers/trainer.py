@@ -433,6 +433,94 @@ class Trainer:
         gathered = self.main_accel.gather_for_metrics(local_logps)
         return gathered
 
+    def _log_configuration_to_wandb(self, wandb) -> None:
+        """Log important configuration parameters to WandB using nested dictionaries."""
+        if not is_wandb_active():
+            return
+            
+        config = {}
+        
+        # ═══ Trainer Configuration ═══
+        config["trainer"] = {
+            "batch_size": self.batch_size,
+            "group_size": self.group_size,
+            "grad_accumulation_steps": self.grad_accumulation_steps,
+            "num_iterations": self.num_iterations,
+            "reference_batch_size": self.reference_batch_size,
+            "max_grad_norm": self.max_grad_norm,
+            "gradient_checkpointing": self.gradient_checkpointing
+        }
+        
+        # ═══ Evaluation Configuration ═══
+        config["eval"] = {
+            "num_datasets": len(self.eval_datasets),
+            "size_per_dataset": {name: len(data) for name, data in self.eval_datasets.items()},
+            "dataset_names": list(self.eval_datasets.keys()) if self.eval_datasets else [],
+            "eval_every_n": self.eval_every_n
+        }
+
+        # ═══ Data Configuration ═══
+        config["data"] = {
+            "train_size": len(self._data)
+        }
+        
+        # ═══ System Configuration ═══
+        config["system"] = {
+            "num_devices": self.number_of_devices,
+            "num_nodes": self.main_accel.num_processes // torch.cuda.device_count(),
+        }
+        
+        # ═══ Per-Actor Configuration ═══
+        config["actors"] = {}
+        for name, ta in self.actors.items():
+            actor_config = {
+                "name": name,
+                "actor_type": type(ta.actor).__name__,
+                "has_reference_model": ta.reference_model is not None
+            }
+            
+            # Model path from actor (accessible via ta.actor.model_path)
+            if hasattr(ta.actor, 'model_path'):
+                actor_config["model_path"] = ta.actor.model_path
+            
+            # Loss function configuration
+            loss_config = {"type": type(ta.loss_fn).__name__}
+            if hasattr(ta.loss_fn, 'beta'):
+                loss_config["beta"] = ta.loss_fn.beta
+            if hasattr(ta.loss_fn, 'temperature'):
+                loss_config["temperature"] = ta.loss_fn.temperature
+            actor_config["loss"] = loss_config
+            
+            # Optimizer configuration
+            optimizer_config = {"type": type(ta.optim).__name__}
+            if hasattr(ta.optim, 'param_groups') and ta.optim.param_groups:
+                param_group = ta.optim.param_groups[0]
+                if 'lr' in param_group:
+                    optimizer_config["lr"] = param_group['lr']
+            actor_config["optimizer"] = optimizer_config
+
+            # Scheduler info (if exists)
+            if ta.sched:
+                actor_config["scheduler"] = {"type": type(ta.sched).__name__}
+            
+            config["actors"][name] = actor_config
+        
+        # ═══ Environment Configuration ═══
+        config["environment"] = {
+            "type": type(self.env).__name__
+        }
+        
+        # Recursively filter out None values to keep config clean
+        def filter_none_values(d):
+            if isinstance(d, dict):
+                return {k: filter_none_values(v) for k, v in d.items() if v is not None}
+            return d
+        
+        config = filter_none_values(config)
+        
+        # Log to WandB
+        wandb.config.update(config)
+
     def evaluate(self, is_final: bool = False) -> Optional[Dict[str, Any]]:
         """
         Run evaluation on all eval datasets if available.
@@ -570,6 +658,7 @@ class Trainer:
         """
         if self.use_wandb and is_wandb_active() and self.main_accel.is_main_process:
             import wandb
+            self._log_configuration_to_wandb(wandb)
 
 
         # unique folder for this training run
