@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta

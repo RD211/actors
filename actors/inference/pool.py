@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import atexit
 import math, time, threading, uuid
 from dataclasses import dataclass, field
@@ -277,6 +278,45 @@ class ModelPool:
         )
         return merged
 
+    async def _ainfer(
+        self,
+        name: str,
+        payload: List[Any],
+        sampling_params: SamplingParams,
+        msg_type: str,
+    ) -> List[RequestOutput]:
+        rec = self.models[name]
+        shards = self._scatter(payload, rec.workers)
+
+        start = time.monotonic()
+
+        futures = []
+        infer_fn_name = "generate" if msg_type == "GENERATE" else "chat"
+        for worker, shard in zip(rec.workers, shards):
+            if shard:
+                futures.append(getattr(worker, infer_fn_name).remote(shard, sampling_params))
+
+        # Use asyncio.to_thread to run ray.get in a thread pool
+        collected: List[list] = await asyncio.to_thread(ray.get, futures)
+
+        duration = time.monotonic() - start
+        merged = self._gather(collected)
+        if not merged:
+            return []
+        produced_tokens = sum(len(o.outputs[0].token_ids) for o in merged)
+
+        rec.stats.request_count += len(payload)
+        rec.stats.token_count += produced_tokens
+        rec.stats.elapsed += duration
+
+        logger.normal(
+            colorize(
+                f"📝 async {msg_type} {len(payload)} requests {produced_tokens} tokens generated in {duration:.2f}s",
+                Palette.INFO,
+            )
+        )
+        return merged
+
     # ---------- RPC methods for clients ----------------------------
     def generate(
         self, name: str, prompts: List[str], sampling_params: SamplingParams
@@ -287,3 +327,13 @@ class ModelPool:
         self, name: str, dialogs: List[list], sampling_params: SamplingParams
     ) -> List[RequestOutput]:
         return self._infer(name, dialogs, sampling_params, "CHAT")
+
+    async def agenerate(
+        self, name: str, prompts: List[str], sampling_params: SamplingParams
+    ) -> List[RequestOutput]:
+        return await self._ainfer(name, prompts, sampling_params, "GENERATE")
+
+    async def achat(
+        self, name: str, dialogs: List[list], sampling_params: SamplingParams
+    ) -> List[RequestOutput]:
+        return await self._ainfer(name, dialogs, sampling_params, "CHAT")

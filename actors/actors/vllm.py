@@ -82,6 +82,20 @@ class vLLMActor(TrainableLLMActor):
         sampling = sampling_params or SamplingParams()
         return self.pool.chat(self.name, list(dialogs), sampling)
 
+    async def agenerate(
+        self, prompts: Sequence[str], sampling_params: SamplingParams | None = None
+    ) -> List[RequestOutput]:
+        self._handle_sleep_state()
+        sampling = sampling_params or SamplingParams()
+        return await self.pool.agenerate(self.name, list(prompts), sampling)
+
+    async def achat(
+        self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None
+    ) -> List[RequestOutput]:
+        self._handle_sleep_state()
+        sampling = sampling_params or SamplingParams()
+        return await self.pool.achat(self.name, list(dialogs), sampling)
+
     def start_weight_update(self):
         self.pool.start_update(self.name)
 

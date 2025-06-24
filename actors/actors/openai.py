@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging, random, time
 from typing import Sequence
 import openai
@@ -39,6 +40,18 @@ class OpenAIActor(LLMActor):
                 time.sleep(backoff + random.uniform(0, 1))
                 backoff = min(backoff * 2, self.backoff_cap)
 
+    async def _aretry(self, afn, *args, **kwargs):
+        backoff = self.backoff_start
+        for attempt in range(1, self.retries + 1):
+            try:
+                return await afn(*args, **kwargs)
+            except Exception as e:
+                logger.verbose(f"[async retry {attempt}] OpenAI error: {e}")
+                if attempt == self.retries:
+                    raise
+                await asyncio.sleep(backoff + random.uniform(0, 1))
+                backoff = min(backoff * 2, self.backoff_cap)
+
     def generate(self, prompts: Sequence[str], **params):
         return [
             self._retry(openai.Completion.create, model=self.name, prompt=p, **params)
@@ -52,3 +65,19 @@ class OpenAIActor(LLMActor):
             )
             for d in dialogs
         ]
+
+    async def agenerate(self, prompts: Sequence[str], **params):
+        tasks = [
+            self._aretry(openai.Completion.acreate, model=self.name, prompt=p, **params)
+            for p in prompts
+        ]
+        return await asyncio.gather(*tasks)
+
+    async def achat(self, dialogs: Sequence[list], **params):
+        tasks = [
+            self._aretry(
+                openai.ChatCompletion.acreate, model=self.name, messages=d, **params
+            )
+            for d in dialogs
+        ]
+        return await asyncio.gather(*tasks)

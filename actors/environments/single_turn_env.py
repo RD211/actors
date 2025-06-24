@@ -58,12 +58,12 @@ class SimpleSingleTurnEnvironment(Environment):
         if len(names) != len(set(names)):
             raise ValueError(f"Reward function names must be unique, got: {names}")
     
-    def __call__(self, batch: Dict[str, Any]) -> EnvironmentOutput:
+    async def generate(self, batch: Dict[str, Any]) -> EnvironmentOutput:
         
         # We awake the actor.
         self.actor.wake()
         prompts = batch[self.prompt_column]        
-        generations = self.actor.generate(prompts, sampling_params=self.sampling_params)
+        generations = await self.actor.agenerate(prompts, sampling_params=self.sampling_params)
         
         completions = [gen.outputs[0].text for gen in generations]
         
