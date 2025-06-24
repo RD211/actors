@@ -30,7 +30,7 @@ from actors.environments.env_base import Environment
 from actors.environments.types import EnvironmentOutput, ActorOutput
 from actors.losses.base_loss import BaseRLLoss
 from actors.utils.softmax import _selective_softmax
-from actors.utils.tracker import gpu_profiler
+from actors.utils.tracker import start_step_profiling, log_step_profiling, _step_profiler
 from actors.utils.wandb import is_wandb_active
 from actors.utils.train_utils import disable_dropout_in_model
 
@@ -399,7 +399,6 @@ class Trainer:
     # log-probabilities 
     # --------------------------------------------------------------------- #
 
-    @gpu_profiler(name='get_logps')
     def _get_logps(
         self,
         model: torch.nn.Module,
@@ -854,12 +853,18 @@ class Trainer:
         self._logical_step += 1
         self._step += 1  # Increment WandB step counter
         
+        # Start profiling for this step
+        start_step_profiling()
+        
         # Log sampling stage in normal mode
         if self.main_accel.is_main_process and self.logger.isEnabledFor(NORMAL):
             self.logger.normal(colorize("🎲 Sampling...", Palette.INFO))
         
         batch = expand_batch(raw_batch, self.group_size)
-        env_out = self.env(batch)
+        
+        # Track environment execution time
+        with _step_profiler.track("environment"):
+            env_out = self.env(batch)
 
         for actor_name, act_out in env_out.actors.items():
             for i, ended_in_eos in enumerate(act_out.ended_in_eos):
@@ -954,6 +959,9 @@ class Trainer:
                 })
             out[name] = iter_stats
 
+        # Log all profiling metrics for this step
+        log_step_profiling(self._step, self.main_accel, self.use_wandb)
+
         return out
 
     # ------------------------------------------------------------------ #
@@ -987,10 +995,11 @@ class Trainer:
         ref_lp: Optional[Sequence[Sequence[float]]] = None
 
         with torch.no_grad():
-            old_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, 
-                                    temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
-            ref_lp = (self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
-                    if ta.reference_model is not None else None)
+            with _step_profiler.track("get_logps", actor_name=name):
+                old_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, 
+                                        temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
+                ref_lp = (self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
+                        if ta.reference_model is not None else None)
         
         # iterate over grad-accumulation micro-batches
         for it in range(self.num_iterations):
@@ -1000,22 +1009,28 @@ class Trainer:
                     self.logger.normal(colorize(f"🔄 Backwards iter {it+1}/{self.num_iterations} for actor '{name}'", Palette.INFO))
                 else:
                     self.logger.normal(colorize(f"🔄 Backwards for actor '{name}'", Palette.INFO))
-            for adv_slice, id_slice, m_slice, old_slice, ref_slice in zip(
-                split_for_grad_accum(advantages, self.grad_accumulation_steps),
-                split_for_grad_accum(ids_list,   self.grad_accumulation_steps),
-                split_for_grad_accum(mask_list,  self.grad_accumulation_steps),
-                split_for_grad_accum(old_lp or [None]*len(ids_list), self.grad_accumulation_steps),
-                split_for_grad_accum(ref_lp or [None]*len(ids_list), self.grad_accumulation_steps),
-            ):
-                self._backward_one_slice(
-                    ta, id_slice, m_slice, adv_slice, ref_slice, old_slice, buckets[it]
+            
+            # Track backward pass
+            with _step_profiler.track("backward", actor_name=name):
+                for adv_slice, id_slice, m_slice, old_slice, ref_slice in zip(
+                    split_for_grad_accum(advantages, self.grad_accumulation_steps),
+                    split_for_grad_accum(ids_list,   self.grad_accumulation_steps),
+                    split_for_grad_accum(mask_list,  self.grad_accumulation_steps),
+                    split_for_grad_accum(old_lp or [None]*len(ids_list), self.grad_accumulation_steps),
+                    split_for_grad_accum(ref_lp or [None]*len(ids_list), self.grad_accumulation_steps),
+                ):
+                    self._backward_one_slice(
+                        ta, id_slice, m_slice, adv_slice, ref_slice, old_slice, buckets[it]
+                    )
+                grad_norm = self._clip_gradients(
+                    ta,
+                    clip_to=self.max_grad_norm
                 )
-            grad_norm = self._clip_gradients(
-                ta,
-                clip_to=self.max_grad_norm
-            )
-            buckets[it]["grad_norm"].append(grad_norm)
-            self._optim_step(ta)
+                buckets[it]["grad_norm"].append(grad_norm)
+            
+            # Track optimizer step
+            with _step_profiler.track("step", no_memory_measurement=True, actor_name=name):
+                self._optim_step(ta)
 
             # total rewards / completion stats identical across iterations
             b = buckets[it]
@@ -1033,11 +1048,12 @@ class Trainer:
                             b[std_key].append(torch.tensor(comp_rewards).float().std(unbiased=False).item())
             b["learning_rate"].append(ta.sched.get_last_lr()[0])
 
-        self._update_actor_weights(ta)
+        # Track actor weight update
+        with _step_profiler.track("update_actor_weights", actor_name=name):
+            self._update_actor_weights(ta)
         ta.actor.sleep()
 
     # ------------------------------------------------------------------ #
-    @gpu_profiler(name='backward_one_slice')
     def _backward_one_slice(
         self,
         ta: InitializedTrainableLLMActor,
@@ -1084,7 +1100,6 @@ class Trainer:
 
 
     # ------------------------------------------------------------------ #
-    @gpu_profiler(name='optim_step', no_memory_measurement=True)
     def _optim_step(self, ta: TrainableLLMActor) -> None:
         ta.optim.step()
         ta.sched.step()
@@ -1092,7 +1107,6 @@ class Trainer:
         ta.accel.wait_for_everyone()
 
     # ------------------------------------------------------------------ #
-    @gpu_profiler(name='update_actor_weights')
     def _update_actor_weights(self, ta: TrainableLLMActor) -> None:
         # On each node, the local main process will orchestrate the update.
         if self.main_accel.is_local_main_process:
