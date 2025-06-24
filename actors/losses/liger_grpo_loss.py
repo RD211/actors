@@ -49,16 +49,17 @@ class LigerLoss(BaseRLLoss):
     def forward(
         self,
         policy: nn.Module,
-        input_ids: Tensor,
-        attention_mask: Tensor,
-        advantages: Tensor,
-        ref_logps: Optional[Tensor] = None,
-        old_logps: Optional[Tensor] = None,
+        input_ids: Tensor, # (B, L)
+        attention_mask: Tensor, # (B, L)
+        loss_attention_mask: Tensor, # (B, L-1)
+        advantages: Tensor, # (B,)
+        ref_logps: Optional[Tensor] = None, # (B, L-1)
+        old_logps: Optional[Tensor] = None, # (B, L-1)
         **_: Dict,
     ) -> Tuple[Tensor, Dict[str, float]]:
-
+        
         hidden: Tensor = policy.model(
-            input_ids, attention_mask=attention_mask
+            input_ids
         ).last_hidden_state[:, :-1, :]
 
         tgt_ids: Tensor = input_ids[:, 1:]
@@ -69,7 +70,7 @@ class LigerLoss(BaseRLLoss):
             lin_weight=policy.lm_head.weight,
             bias=policy.lm_head.bias,
             selected_token_ids=tgt_ids,
-            attention_mask=mask,
+            attention_mask=mask * loss_attention_mask,
             advantages=advantages,
             ref_per_token_logps=ref_logps,
             old_per_token_logps=old_logps,

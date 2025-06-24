@@ -13,21 +13,25 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import warnings
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from accelerate import Accelerator, InitProcessGroupKwargs
 from transformers import PreTrainedTokenizerBase
 from datasets import Dataset as HFDataset, DatasetDict
-from accelerate.utils import DeepSpeedPlugin
+from accelerate.utils import DeepSpeedPlugin, DistributedType
 
 # ----- project-local helpers -------------------------------------------------
 from actors.actors.base import TrainableLLMActor
+from actors.utils.deepspeed import prepare_deepspeed
 from actors.utils.logger import init_logger, colorize, Palette, VERBOSE, NORMAL, QUIET
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.environments.env_base import Environment
 from actors.environments.types import EnvironmentOutput, ActorOutput
 from actors.losses.base_loss import BaseRLLoss
+from actors.utils.softmax import _selective_softmax
 from actors.utils.tracker import gpu_profiler
 from actors.utils.wandb import is_wandb_active
+from actors.utils.train_utils import disable_dropout_in_model
 
 # ═════════════════════════════════════════════════════════════════════════════
 @dataclass(frozen=False)
@@ -184,7 +188,7 @@ class Trainer:
 
         for name, actor_obj in env.get_trainable_actors().items():
             accel = self.accelerators[name]
-            accel.state.select_deepspeed_plugin(name)   # activate this engine
+            # accel.state.select_deepspeed_plugin(name)   # activate this engine
 
             # ── create & optionally checkpoint-enable model ────────────
             model = actor_obj.training_config.model_factory()
@@ -194,7 +198,7 @@ class Trainer:
                 if hasattr(model, "enable_input_require_grads"):
                     model.enable_input_require_grads()
                     model.config.gradient_checkpointing = True
-            model = model.train()
+            disable_dropout_in_model(model)
 
             # ── loss / reference model (if any) ────────────────────────
             loss_fn = actor_obj.training_config.loss_factory()
@@ -204,17 +208,18 @@ class Trainer:
                 if actor_obj.training_config.reference_model_factory and beta != 0.0
                 else None
             )
+            ref_model.requires_grad_(False)  # no gradients for reference model
+            ref_model.config.use_cache = False  # disable cache for reference model
 
             # ── optimiser / scheduler ─────────────────────────────────
             optim = actor_obj.training_config.optim_factory(model.parameters())
             # ── wrap with this actor’s accelerator ────────────────────
             model, optim = accel.prepare(model, optim)
             if ref_model is not None:
-                accel.state.select_deepspeed_plugin(name)
-                if self.ds_plugins[name].deepspeed_config["zero_optimization"]["stage"] == 3:
-                    ref_model = accel.prepare(ref_model)
-                else:
-                    ref_model = ref_model.to(accel.device)
+                # accel.state.select_deepspeed_plugin(name)
+                ref_model = ref_model.to(dtype=model.dtype)
+                ref_model = prepare_deepspeed(ref_model, accel)
+                disable_dropout_in_model(ref_model)
 
             # ── register ──────────────────────────────────────────────
             self.actors[name] = InitializedTrainableLLMActor(
@@ -257,6 +262,7 @@ class Trainer:
             batch_size=self.batch_size // self.group_size,
             sampler=sampler,
             collate_fn=collate_fn,
+            drop_last=True,
         )
         
     # --------------------------------------------------------------------- #
@@ -266,17 +272,38 @@ class Trainer:
     def _pad(tok: PreTrainedTokenizerBase, seqs: List[List[int]]) -> Dict[str, torch.Tensor]:
         return tok.pad({"input_ids": seqs}, padding="longest", return_tensors="pt")
 
-    @staticmethod
-    def _grad_global_norm(model: torch.nn.Module) -> float:
-        norms = [p.grad.detach().norm(2) for p in model.parameters() if p.grad is not None]
-        if not norms:
-            return 0.0
-        return torch.linalg.vector_norm(torch.stack(norms), 2).item()
+    def _clip_gradients(
+        self,
+        ta: InitializedTrainableLLMActor,
+        clip_to: float | None = None,
+    ) -> float:
+        ta.accel.gradient_state._set_sync_gradients(True)
+        max_norm = clip_to if clip_to is not None else torch.finfo(torch.float32).max
+
+        # Gradient clipping
+        _grad_norm = ta.accel.clip_grad_norm_(
+            ta.model.parameters(),
+            max_norm,
+        )
+
+        if (
+            ta.accel.distributed_type == DistributedType.DEEPSPEED
+        ):
+            grad_norm = ta.model.get_global_grad_norm()
+            # In some cases the grad norm may not return a float
+            if hasattr(grad_norm, "item"):
+                grad_norm = grad_norm.item()
+        else:
+            grad_norm = _grad_norm
+
+        return grad_norm
+
 
 
     # --------------------------------------------------------------------- #
     # log-probabilities 
     # --------------------------------------------------------------------- #
+
     @gpu_profiler(name='get_logps')
     def _get_logps(
         self,
@@ -291,7 +318,6 @@ class Trainer:
         per_rank = (total + world - 1) // world
         start, end = self.rank * per_rank, min((self.rank + 1) * per_rank, total)
         ids_local = ids[start:end]
-
         local_logps: List[List[float]] = []
         for i in range(0, len(ids_local), batch_size):
             batch_ids = ids_local[i : i + batch_size]
@@ -301,21 +327,16 @@ class Trainer:
             input_ids = padded["input_ids"].to(model.device)
 
             L = input_ids.size(1)
-            rng = torch.arange(L, device=model.device).unsqueeze(0)
-            att_mask = (rng < torch.tensor(lengths, device=model.device).unsqueeze(1)).long()
+            attn_mask = padded["attention_mask"]
 
-            with torch.no_grad():
-                logits = model(input_ids=input_ids, attention_mask=att_mask).logits / temperature
-
-            lp = torch.log_softmax(logits, -1)[:, :-1]                       # (B,L-1,V)
-            tgt = input_ids[:, 1:].unsqueeze(-1)                             # (B,L-1,1)
-            lp = lp.gather(-1, tgt).squeeze(-1) * att_mask[:, 1:]            # (B,L-1)
+            logits = model(input_ids=input_ids, attention_mask=attn_mask).logits / temperature # (B,L,V)
+            logits = logits[:, :-1, :]  # remove last token logits
+            lp = _selective_softmax(logits, input_ids[:, 1:])  # (B,L-1)
 
             for row, ln in zip(lp, lengths):
                 local_logps.append(row[: ln - 1].cpu().tolist())
-
         gathered = self.main_accel.gather_for_metrics(local_logps)
-        return gathered[:total]
+        return gathered
 
     # ═════════════════════════════════════════════════════════════════════
     # public API
@@ -351,7 +372,7 @@ class Trainer:
         # total steps for ETA
         steps_per_epoch = len(self._dataloader)
         total_expected_steps = (
-            max_steps if max_steps is not None else epochs * steps_per_epoch
+            max_steps * self.num_iterations if max_steps is not None else epochs * steps_per_epoch * self.num_iterations
         )
 
         # create schedulers now that we know total steps
@@ -519,6 +540,17 @@ class Trainer:
         
         batch = expand_batch(raw_batch, self.group_size)
         env_out = self.env(batch)
+
+        for actor_name, act_out in env_out.actors.items():
+            for i, ended_in_eos in enumerate(act_out.ended_in_eos):
+                if ended_in_eos:
+                    # We get eos and check if the txt at this position has an EOS token
+                    eos_token_id = self.actors[actor_name].tokenizer.eos_token_id
+                    if act_out.input_ids[i][-1] != eos_token_id:
+                        # If not, we append the EOS token to the input_ids
+                        act_out.input_ids[i].append(eos_token_id)
+                        act_out.attention_mask[i].append(1)
+                    
         
         # Ensure we have the new EnvironmentOutput format
         if not isinstance(env_out, EnvironmentOutput):
@@ -623,12 +655,26 @@ class Trainer:
         ids_list = actor_output.input_ids
         mask_list = actor_output.attention_mask
 
-        # compute reference log-ps once (if any)
-        old_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, 
-                                 temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
-        ref_lp = (self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
-                if ta.reference_model is not None else None)
+        # We assert they are the same exact lengths.
+        assert len(ids_list) == len(mask_list) == len(total_rewards) == len(advantages), \
+            f"Actor '{name}' output lengths mismatch: " \
+            f"ids={len(ids_list)}, mask={len(mask_list)}, rewards={len(total_rewards)}, " \
+            f"advantages={len(advantages)}"
+        # All ids_list entries must have same length as mask_list entries
+        assert all(len(ids) == len(mask) for ids, mask in zip(ids_list, mask_list)), \
+            f"Actor '{name}' input_ids and attention_mask lengths mismatch: " \
+            f"ids={len(ids_list)}, mask={len(mask_list)}"
 
+        # compute reference log-ps once (if any)
+        old_lp: Optional[Sequence[Sequence[float]]] = None
+        ref_lp: Optional[Sequence[Sequence[float]]] = None
+
+        with torch.no_grad():
+            old_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, 
+                                    temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
+            ref_lp = (self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
+                    if ta.reference_model is not None else None)
+        
         # iterate over grad-accumulation micro-batches
         for it in range(self.num_iterations):
             # Log backprop iteration in normal mode
@@ -647,7 +693,11 @@ class Trainer:
                 self._backward_one_slice(
                     ta, id_slice, m_slice, adv_slice, ref_slice, old_slice, buckets[it]
                 )
-
+            grad_norm = self._clip_gradients(
+                ta,
+                clip_to=self.max_grad_norm
+            )
+            buckets[it]["grad_norm"].append(grad_norm)
             self._optim_step(ta)
 
             # total rewards / completion stats identical across iterations
@@ -673,20 +723,18 @@ class Trainer:
     @gpu_profiler(name='backward_one_slice')
     def _backward_one_slice(
         self,
-        ta: TrainableLLMActor,
+        ta: InitializedTrainableLLMActor,
         ids: List[List[int]],
         masks: List[List[int]],
         advantages: List[float],
-        ref_lp_slice: Optional[Sequence[Sequence[float]]],
-        old_lp_slice: Sequence[Sequence[float]],
+        ref_lp_slice: Optional[List[List[float]]],
+        old_lp_slice: List[List[float]],
         bucket: Dict[str, List[float]],
     ) -> None:
         tok, dev = ta.tokenizer, ta.model.device
-        ids_pt = self._pad(tok, ids)["input_ids"].to(dev)
-        msk_pt = torch.tensor(
-            [m + [0]*(ids_pt.size(1)-len(m)) for m in masks],
-            dtype=torch.long, device=dev
-        )
+        padded = self._pad(tok, ids)
+        ids_pt, attention_mask = padded["input_ids"].to(dev), padded["attention_mask"].to(dev)
+
 
         max_len = ids_pt.size(1) - 1
         def to_tensor(slice_):
@@ -697,13 +745,15 @@ class Trainer:
             return t
         ref_lp = to_tensor(ref_lp_slice) if any(ref_lp_slice) else None
         old_lp = to_tensor(old_lp_slice) if any(old_lp_slice) else None
+        loss_attention_mask = to_tensor([x[1:] for x in masks]) if masks else None
 
         adv_pt  = torch.tensor(advantages, dtype=torch.float32, device=dev)
 
         loss, stats = ta.loss_fn(
-            policy       = ta.model,
+            policy       = ta.accel.unwrap_model(ta.model),
             input_ids    = ids_pt,
-            attention_mask=msk_pt,
+            attention_mask=attention_mask,
+            loss_attention_mask=loss_attention_mask,
             advantages   = adv_pt,
             ref_logps    = ref_lp,
             old_logps    = old_lp,
@@ -713,7 +763,7 @@ class Trainer:
         bucket["loss"].append(loss.item())
         if "kl" in stats:
             bucket["kl"].append(stats["kl"])
-        bucket["completion_len"].append(msk_pt[:,1:].sum(-1).float().mean().item())
+        bucket["completion_len"].append(attention_mask[:,1:].sum(-1).float().mean().item())
 
 
     # ------------------------------------------------------------------ #
@@ -942,3 +992,10 @@ class Trainer:
                 commit_message=commit_message,
                 **push_kwargs,
             )
+
+
+    # ------------------------------------------------------------------ #
+    # After exit delete.
+    # ------------------------------------------------------------------ #
+    def __del__(self):
+        pass

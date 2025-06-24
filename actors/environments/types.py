@@ -17,12 +17,14 @@ class ActorOutput:
         attention_mask: Attention masks corresponding to input_ids
         rewards: Primary reward values (for backward compatibility)
         reward_components: Optional dictionary of named reward components
+        ended_in_eos: Optional list indicating if each sequence ended with an EOS token. If not provided, it is assumed all sequences ended in EOS.
         metadata: Optional metadata about the generation
     """
     input_ids: List[List[int]]
     attention_mask: List[List[int]]
     rewards: List[float]
     reward_components: Optional[Dict[str, List[float]]] = None
+    ended_in_eos: List[bool] = None
     metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
     
     def __post_init__(self):
@@ -40,6 +42,19 @@ class ActorOutput:
                 + (f", reward_components={[(name, len(values)) for name, values in self.reward_components.items()]}" 
                    if self.reward_components else "")
             )
+        # verify that if ended_in_eos is provided, it matches the length of input_ids
+        if self.ended_in_eos is not None and len(self.ended_in_eos) != len(self.input_ids):
+            raise ValueError(
+                f"ended_in_eos length {len(self.ended_in_eos)} does not match input_ids length {len(self.input_ids)}"
+            )
+        if self.ended_in_eos is None:
+            self.ended_in_eos = [True] * len(self.input_ids)
+
+        # We must also make sure that there is no empty sequence in input_ids or attention_mask
+        if any(len(seq) == 0 for seq in self.input_ids):
+            raise ValueError("input_ids contains an empty sequence")
+        if any(len(seq) == 0 for seq in self.attention_mask):
+            raise ValueError("attention_mask contains an empty sequence")
     
     def get_total_reward(self, weights: Optional[Dict[str, float]] = None) -> List[float]:
         """
@@ -104,6 +119,31 @@ class EnvironmentOutput:
     """
     actors: Dict[str, ActorOutput]
     global_metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """Validate that all actor outputs have consistent structure."""
+        
+        # We need to check that all actors have the same lengths for input_ids, attention_mask, and rewards
+        if not self.actors:
+            raise ValueError("EnvironmentOutput must contain at least one actor output")
+        lengths = None
+        for actor_name, actor_output in self.actors.items():
+            if lengths is None:
+                lengths = {
+                    "input_ids": len(actor_output.input_ids),
+                    "attention_mask": len(actor_output.attention_mask),
+                    "rewards": len(actor_output.rewards),
+                }
+            else:
+                if (len(actor_output.input_ids) != lengths["input_ids"] or
+                    len(actor_output.attention_mask) != lengths["attention_mask"] or
+                    len(actor_output.rewards) != lengths["rewards"]):
+                    raise ValueError(
+                        f"Inconsistent lengths in actor '{actor_name}': "
+                        f"input_ids={len(actor_output.input_ids)}, "
+                        f"attention_mask={len(actor_output.attention_mask)}, "
+                        f"rewards={len(actor_output.rewards)}"
+                    )
     
     def to_dict(self) -> Dict[str, Dict[str, Any]]:
         """

@@ -1,5 +1,7 @@
 from typing import Any, Dict, Optional
 import torch
+
+from actors.utils.softmax import _selective_softmax
 from .base_loss import BaseRLLoss
 
 class GRPOLoss(BaseRLLoss):
@@ -9,7 +11,7 @@ class GRPOLoss(BaseRLLoss):
         eps_high: float = 0.2,
         beta: float = 0.04,
         temperature: float = 1.0,
-        loss_type: str = "bnpo",
+        loss_type: str = "grpo",
         delta: Optional[float] = None,
         max_completion_length: Optional[int] = None,
     ):
@@ -25,16 +27,17 @@ class GRPOLoss(BaseRLLoss):
     def forward(
         self,
         policy,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        advantages: torch.Tensor,
-        ref_logps: Optional[torch.Tensor] = None,
-        old_logps: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor, # shape (B, L)
+        attention_mask: torch.Tensor, # shape (B, L)
+        loss_attention_mask: torch.Tensor, # shape (B, L-1)
+        advantages: torch.Tensor, # shape (B,)
+        ref_logps: Optional[torch.Tensor] = None, # shape (B, L-1)
+        old_logps: Optional[torch.Tensor] = None, # shape (B, L-1)
+        **kwargs: Dict[str, Any],
     ) -> tuple[torch.Tensor, Dict[str, Any]]:
-        logits = policy(input_ids, attention_mask=attention_mask).logits / self.temp
-        logps = torch.log_softmax(logits, -1)
-        new_lp = logps[:, :-1].gather(-1, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
-
+        L = input_ids.size(1)
+        logits = policy(input_ids, attention_mask=attention_mask).logits / self.temp # shape (B, L, V)
+        new_lp = _selective_softmax(logits[:,:-1,:], input_ids[:, 1:]) # shape (B, L-1)
         if old_logps is None:
             old_logps = new_lp.detach()
 
@@ -44,18 +47,19 @@ class GRPOLoss(BaseRLLoss):
         ratio_clipped = torch.clamp(ratio, 1 - self.eps_l, 1 + self.eps_h)
 
         if advantages.dim() == 1:
-            adv = advantages[:, None].expand_as(new_lp)
+            adv = advantages[:, None].expand_as(new_lp) # shape (B, L-1)
         else:                             # already (B, L-1)
             adv = advantages
         adv = adv.to(new_lp.dtype)
-        per_tok = -torch.min(ratio * adv, ratio_clipped * adv)
 
+        per_tok = -torch.min(ratio * adv, ratio_clipped * adv)
         kl = None
         if self.beta and ref_logps is not None:
             kl = torch.exp(ref_logps - new_lp) - (ref_logps - new_lp) - 1
             per_tok = per_tok + self.beta * kl
 
-        mask = attention_mask[:, 1:].to(per_tok.dtype)
+        mask = attention_mask[:, 1:].to(per_tok.dtype) * loss_attention_mask
+
 
         if self.loss_type == "grpo":
             loss = ((per_tok * mask).sum(-1) / mask.sum(-1).clamp(min=1)).mean()

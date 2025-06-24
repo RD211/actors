@@ -27,9 +27,9 @@ def main():
     )
     tokenizer = actor.training_config.tokenizer_factory()
     actor.training_config.learning_rate(2e-6).loss(
-        GRPOLoss(beta=0.04, temperature=1.0)
+        LigerLoss(beta=0.04, temperature=1.0)
     ).optimizer(
-       bnb.optim.PagedAdam8bit
+       bnb.optim.PagedAdam32bit
     ).scheduler(
         lambda o, t_max: CosineAnnealingLR(o, T_max=t_max)
     )
@@ -43,6 +43,7 @@ def main():
             max_tokens=256,
         ),
         prompt_column='conversation',
+        mask_prompt_for_loss=True,
     )
 
     data = [
@@ -55,15 +56,15 @@ def main():
         {"text": "Who wrote 'To Kill a Mockingbird'?"},
         {"text": "What is the speed of light?"},
         {"text": "How do you make a cake?"},
-    ] * 120
+    ] * 5
 
-    data = [{'conversation':tokenizer.apply_chat_template([{'role': 'user', 'content': item['text']}], tokenize=False)} for item in data]
+    data = [{'conversation':tokenizer.apply_chat_template([{'role': 'user', 'content': item['text']}], tokenize=False, add_generation_prompt=True)} for item in data]
     trainer = Trainer(
         env,
-        group_size=4,
-        batch_size=16,
-        grad_accumulation_steps=1,
-        num_iterations=1,
+        group_size=16,
+        batch_size=64,
+        grad_accumulation_steps=4,
+        num_iterations=4,
         reference_batch_size=2,
         log_every_n=1,
         data=data,
