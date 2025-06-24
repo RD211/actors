@@ -4,12 +4,13 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum, auto
+import inspect
 import itertools
 import json
 import os
 import shutil
 import time
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import warnings
 
 import torch
@@ -83,6 +84,25 @@ def norm_advantages(rewards: List[float], group_size: int) -> List[float]:
     return out
 
 
+def default_advantage_calculator(
+    rewards: List[float], 
+    group_size: int, 
+    ended_in_eos: Optional[List[bool]] = None,
+    std_normalization: bool = True
+) -> List[float]:
+    out: List[float] = []
+    for i in range(0, len(rewards), group_size):
+        grp = rewards[i : i + group_size]
+        µ = sum(grp) / len(grp)
+        
+        if std_normalization:
+            σ = (sum((x - µ) ** 2 for x in grp) / len(grp)) ** 0.5 + 1e-8
+            out.extend([(r - µ) / σ for r in grp])
+        else:
+            out.extend([r - µ for r in grp])
+    return out
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Main trainer
 # ═════════════════════════════════════════════════════════════════════════════
@@ -102,6 +122,9 @@ class Trainer:
         num_iterations: int = 1,
         max_grad_norm: float = 1.0,
         gradient_checkpointing: bool = True,
+        # advantage calculation
+        advantage_calculator: Optional[Callable[..., List[float]]] = None,
+        std_normalization: bool = True,
         # logging
         use_wandb: bool = True,
         log_every_n: int = 1,
@@ -117,6 +140,15 @@ class Trainer:
         self.use_dashboard = use_dashboard
         self._step = 0
         self._logical_step = 0
+
+        # ─── advantage calculation setup ──────────────────────────────
+        if advantage_calculator is not None:
+            self.advantage_calculator = advantage_calculator
+        else:
+            # Use default calculator with configurable std normalization
+            self.advantage_calculator = lambda rewards, group_size, ended_in_eos=None: default_advantage_calculator(
+                rewards, group_size, ended_in_eos, std_normalization
+            )
 
         # ─── data / RNG setup ──────────────────────────────
         self._data = self._normalise_hf_splits(data)
@@ -297,6 +329,34 @@ class Trainer:
             grad_norm = _grad_norm
 
         return grad_norm
+
+    def _calculate_advantages(
+        self, 
+        rewards: List[float], 
+        group_size: int, 
+        ended_in_eos: Optional[List[bool]] = None
+    ) -> List[float]:
+        try:
+            sig = inspect.signature(self.advantage_calculator)
+            params = list(sig.parameters.keys())
+            
+            kwargs = {'rewards': rewards}
+            
+            if 'group_size' in params:
+                kwargs['group_size'] = group_size
+            if 'ended_in_eos' in params and ended_in_eos is not None:
+                kwargs['ended_in_eos'] = ended_in_eos
+                
+            return self.advantage_calculator(**kwargs)
+            
+        except Exception as e:
+            try:
+                return self.advantage_calculator(rewards)
+            except:
+                try:
+                    return self.advantage_calculator(rewards, group_size)
+                except:
+                    return default_advantage_calculator(rewards, group_size, ended_in_eos, True)
 
 
 
@@ -561,15 +621,13 @@ class Trainer:
             for name, ta in self.actors.items():
                 if name in env_out.actors:
                     actor_output = env_out.actors[name]
-                    # Raw batch keys
                     batch_keys = list(batch.keys())
                     completions_ids = actor_output.input_ids
                     total_rewards = actor_output.rewards
+                    advantages = self._calculate_advantages(total_rewards, self.group_size, actor_output.ended_in_eos)
 
-                    # Create table columns for batch keys, completion, total reward, and reward components
-                    columns = batch_keys + ["completion", "total_reward"]
+                    columns = batch_keys + ["completion", "total_reward", "advantage"]
                     if actor_output.reward_components:
-                        # Add columns for each reward component
                         component_names = list(actor_output.reward_components.keys())
                         columns.extend(component_names)
                     
@@ -579,15 +637,14 @@ class Trainer:
                         row = [batch[k][i] for k in batch_keys]
                         row.append(ta.tokenizer.decode(completions_ids[i], skip_special_tokens=False))
                         row.append(total_rewards[i])
+                        row.append(advantages[i])
                         
-                        # Add reward component values
                         if actor_output.reward_components:
                             for comp_name in component_names:
                                 row.append(actor_output.reward_components[comp_name][i])
                         
                         table.add_data(*row)
                     
-                    # Use the current step for completions table
                     wandb.log({f"completions_{name}/completions_{self._logical_step}": table}, step=self._step)
 
         # warn about unexpected actor keys (once per step, rank==0 only)
@@ -650,7 +707,7 @@ class Trainer:
         buckets: List[Dict[str, List[float]]]) -> None:
         
         total_rewards = actor_output.rewards
-        advantages = norm_advantages(total_rewards, self.group_size)
+        advantages = self._calculate_advantages(total_rewards, self.group_size, actor_output.ended_in_eos)
 
         ids_list = actor_output.input_ids
         mask_list = actor_output.attention_mask
@@ -992,10 +1049,3 @@ class Trainer:
                 commit_message=commit_message,
                 **push_kwargs,
             )
-
-
-    # ------------------------------------------------------------------ #
-    # After exit delete.
-    # ------------------------------------------------------------------ #
-    def __del__(self):
-        pass
