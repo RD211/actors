@@ -15,7 +15,7 @@ def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model: tor
         name, param = name_param
         return name, param.detach()
     
-    params = list(model.named_parameters())
+    params = list(model.state_dict().items())
     total = len(params)
 
     for start in range(0, total, batch_size):
@@ -25,7 +25,7 @@ def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model: tor
         batch_params = [p for _, p in batch]
         
         # Gathers the full parameters on all processes, but we only process it on the local main process.
-        with deepspeed.zero.GatheredParameters(batch_params, modifier_rank=None):
+        with deepspeed.zero.GatheredParameters(batch_params, modifier_rank=None): # TODO: Check if we gather on all devices by accident.
             if accelerator.is_local_main_process:
                 batch_state_dict = {}
                 with ThreadPoolExecutor() as executor:

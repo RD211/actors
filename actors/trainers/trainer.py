@@ -227,7 +227,7 @@ class Trainer:
         self.accelerators: Dict[str, Accelerator] = {
             first_actor: Accelerator(
                 mixed_precision="bf16",
-                deepspeed_plugins=self.ds_plugins,
+                deepspeed_plugin=self.ds_plugins[first_actor],
                 kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=10))],
             )
         }
@@ -735,7 +735,7 @@ class Trainer:
 
                 # ─── console / WandB logging (unchanged) ─────────────────
                 if self.main_accel.is_main_process and self._logical_step % self.log_every_n == 0:
-                    progress = (total_steps / total_expected_steps) * 100
+                    progress = (total_steps * self.num_iterations / total_expected_steps) * 100
                     eta_str = "N/A"
                     if total_steps:
                         elapsed = time.time() - start_time

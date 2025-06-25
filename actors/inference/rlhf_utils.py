@@ -1,17 +1,7 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
-
+from actors.utils.vllm import fp8_quantize_state_dict, to_vllm_state_dict
 
 class ColocateWorkerExtension:
-    """
-    The class for vLLM's worker to inherit from, in the colocate setting.
-    By defining an extension class, the code can work no matter what is
-    the underlying worker class. This way, the code can be compatible
-    with both vLLM V0 and V1.
-    NOTE: we define this class in a separate module, and the main module
-    should pass the full qualified name as `worker_extension_cls` argument.
-    """
 
     def report_device_id(self) -> str:
         from vllm.platforms import current_platform
@@ -72,10 +62,16 @@ class ColocateWorkerExtension:
             )
             return
 
-        # The model_runner's load_weights method handles moving the tensors
-        # from CPU to the correct GPU device.
-        weights = list(self.cpu_cache.items())
-        self.model_runner.model.load_weights(weights=weights)
+        # If vllm has any fp8 weights, we do something special.
+        if any("weight_scale" in k for k in self.model_runner.model.state_dict().keys()):
+            self.cpu_cache = to_vllm_state_dict(self.cpu_cache)
+            self.cpu_cache = fp8_quantize_state_dict(self.cpu_cache)
+            self.model_runner.model.load_state_dict(
+                self.cpu_cache
+            )
+        else:
+            weights = list(self.cpu_cache.items())
+            self.model_runner.model.load_weights(weights=weights)
         torch.cuda.synchronize()
 
         # Clean up the cache to free memory

@@ -50,11 +50,11 @@ def main():
         learning_rate=2e-6,
         optimizer="paged_adamw_8bit",  # Using string for convenience
         loss="liger_grpo",  # Using string for liger loss
-        loss_kwargs={"beta": 0.0, "temperature": 1.0},
+        loss_kwargs={"beta": 0.04, "temperature": 1.0},
         scheduler="cosine",  # Using string for cosine scheduler
         model_factory=custom_model_factory,  # Use custom model factory
     )
-    
+    # Kl appears even if 0.0 beta.
     # Get tokenizer directly from actor property
     tokenizer = actor.tokenizer
 
@@ -104,7 +104,7 @@ def main():
         {"text": "Who wrote 'To Kill a Mockingbird'?"},
         {"text": "What is the speed of light?"},
         {"text": "How do you make a cake?"},
-    ] * 10
+    ] * 120
 
     data = [{'conversation':tokenizer.apply_chat_template([{'role': 'user', 'content': item['text']}], tokenize=False, add_generation_prompt=True)} for item in data]
     
