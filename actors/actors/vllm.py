@@ -1,7 +1,8 @@
 from __future__ import annotations
 import atexit
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Callable
 import torch
+from torch import nn
 from vllm import SamplingParams, RequestOutput
 from actors.inference.pool import ModelPool
 from torch.multiprocessing.reductions import reduce_tensor
@@ -19,8 +20,29 @@ class vLLMActor(TrainableLLMActor):
         use_v1_engine: bool = True,
         engine_kwargs: Dict[str, any] | None = None,
         insomnia: bool = False, # If true all sleep calls will be ignored
+        learning_rate: float = 5e-6,
+        optimizer: str | type | callable = "paged_adamw_8bit",
+        optimizer_kwargs: Dict | None = None,
+        loss: str | type | callable = "grpo",
+        loss_kwargs: Dict | None = None,
+        scheduler: str | type | callable = "cosine",
+        scheduler_kwargs: Dict | None = None,
+        model_factory: Callable[[], nn.Module] | None = None,
+        reference_model_factory: Callable[[], nn.Module] | None = None,
     ):
-        super().__init__(name, model_path)
+        super().__init__(
+            name, 
+            model_path,
+            learning_rate=learning_rate,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            loss=loss,
+            loss_kwargs=loss_kwargs,
+            scheduler=scheduler,
+            scheduler_kwargs=scheduler_kwargs,
+            model_factory=model_factory,
+            reference_model_factory=reference_model_factory,
+        )
         self.pool = ModelPool()
         if name not in self.pool.list_models():
             self.pool.load_model(

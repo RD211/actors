@@ -256,10 +256,9 @@ class Trainer:
 
         for name, actor_obj in env.get_trainable_actors().items():
             accel = self.accelerators[name]
-            # accel.state.select_deepspeed_plugin(name)   # activate this engine
 
             # ── create & optionally checkpoint-enable model ────────────
-            model = actor_obj.training_config.model_factory()
+            model = actor_obj.model_factory()  # Use the convenient property
             if gradient_checkpointing:
                 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
                 model.config.use_cache = False
@@ -276,15 +275,15 @@ class Trainer:
                 if actor_obj.training_config.reference_model_factory and beta != 0.0
                 else None
             )
-            ref_model.requires_grad_(False)  # no gradients for reference model
-            ref_model.config.use_cache = False  # disable cache for reference model
 
             # ── optimiser / scheduler ─────────────────────────────────
             optim = actor_obj.training_config.optim_factory(model.parameters())
             # ── wrap with this actor’s accelerator ────────────────────
             model, optim = accel.prepare(model, optim)
             if ref_model is not None:
-                # accel.state.select_deepspeed_plugin(name)
+                ref_model.requires_grad_(False)  # no gradients for reference model
+                ref_model.config.use_cache = False  # disable cache for reference model
+
                 ref_model = ref_model.to(dtype=model.dtype)
                 ref_model = prepare_deepspeed(ref_model, accel)
                 disable_dropout_in_model(ref_model)
@@ -294,7 +293,7 @@ class Trainer:
                 name           = name,
                 actor          = actor_obj,
                 model          = model,
-                tokenizer      = actor_obj.training_config.tokenizer_factory(),
+                tokenizer      = actor_obj.tokenizer,  # Use the convenient property
                 loss_fn        = loss_fn,
                 optim          = optim,
                 sched          = None,
@@ -497,6 +496,9 @@ class Trainer:
                 param_group = ta.optim.param_groups[0]
                 if 'lr' in param_group:
                     optimizer_config["lr"] = param_group['lr']
+            # Also include learning rate from actor if available
+            if hasattr(ta.actor, 'current_learning_rate'):
+                optimizer_config["configured_lr"] = ta.actor.current_learning_rate
             actor_config["optimizer"] = optimizer_config
 
             # Scheduler info (if exists)

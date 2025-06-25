@@ -186,6 +186,247 @@ class TrainableLLMActor(LLMActor):
     @abc.abstractmethod
     def wake(self) -> None: ...
 
-    def __init__(self, name: str, model_path: str | None = None):
+    def __init__(
+        self, 
+        name: str, 
+        model_path: str | None = None,
+        *,
+        learning_rate: float = 5e-6,
+        optimizer: str | type | Callable = "adamw",
+        optimizer_kwargs: Dict | None = None,
+        loss: str | type | Callable = "grpo",
+        loss_kwargs: Dict | None = None,
+        scheduler: str | type | Callable = "cosine",
+        scheduler_kwargs: Dict | None = None,
+        model_factory: Callable[[], nn.Module] | None = None,
+        reference_model_factory: Callable[[], nn.Module] | None = None,
+    ):
+        """
+        Initialize a trainable LLM actor with configuration options.
+        
+        Args:
+            name: Actor name
+            model_path: Path to the model
+            learning_rate: Learning rate for training (default: 5e-6)
+            optimizer: Optimizer class, string name, or factory. Options: 'adamw', 'adam', 'sgd', 'rmsprop', 'paged_adamw', 'paged_adamw_8bit', 'adamw_8bit', 'adam_8bit'
+            optimizer_kwargs: Additional arguments for optimizer
+            loss: Loss class, string name, or factory. Options: 'grpo', 'liger_grpo'
+            loss_kwargs: Additional arguments for loss
+            scheduler: Scheduler class, string name, or factory. Options: 'cosine', 'linear', 'constant', 'exponential', 'step'
+            scheduler_kwargs: Additional arguments for scheduler
+            model_factory: Factory function to create the main model (default: AutoModelForCausalLM.from_pretrained)
+            reference_model_factory: Factory function to create reference model (default: same as main model)
+        """
         super().__init__(name, model_path)
         self.training_config: TrainingConfig = TrainingConfig(model_path=model_path)
+        
+        # Configure training with provided parameters
+        self.configure_training(
+            learning_rate=learning_rate,
+            optimizer=optimizer,
+            optimizer_kwargs=optimizer_kwargs,
+            loss=loss,
+            loss_kwargs=loss_kwargs,
+            scheduler=scheduler,
+            scheduler_kwargs=scheduler_kwargs,
+        )
+        
+        # Set model factory if provided
+        if model_factory is not None:
+            self.training_config.model(model_factory)
+        
+        # Set reference model factory if provided
+        if reference_model_factory is not None:
+            self.training_config.reference(reference_model_factory)
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Fluent Configuration API
+    # ═══════════════════════════════════════════════════════════════
+    
+    def configure_training(
+        self,
+        *,
+        learning_rate: float | None = None,
+        optimizer: str | type | Callable | None = None,
+        optimizer_kwargs: Dict | None = None,
+        loss: str | type | Callable | None = None,
+        loss_kwargs: Dict | None = None,
+        scheduler: str | type | Callable | None = None,
+        scheduler_kwargs: Dict | None = None,
+    ) -> "TrainableLLMActor":
+        """
+        Configure training parameters with a single method call.
+        
+        Args:
+            learning_rate: Learning rate for training
+            optimizer: Optimizer class, string name, or factory function
+            optimizer_kwargs: Additional arguments for optimizer
+            loss: Loss class, string name, or factory function  
+            loss_kwargs: Additional arguments for loss
+            scheduler: Scheduler class, string name, or factory function
+            scheduler_kwargs: Additional arguments for scheduler
+            
+        Returns:
+            Self for method chaining
+        """
+        if learning_rate is not None:
+            self.training_config.learning_rate(learning_rate)
+            
+        if optimizer is not None:
+            kwargs = optimizer_kwargs or {}
+            if isinstance(optimizer, str):
+                optimizer = self._get_optimizer_by_name(optimizer)
+            self.training_config.optimizer(optimizer, **kwargs)
+            
+        if loss is not None:
+            kwargs = loss_kwargs or {}
+            if isinstance(loss, str):
+                loss = self._get_loss_by_name(loss)
+            self.training_config.loss(loss, **kwargs)
+            
+        if scheduler is not None:
+            kwargs = scheduler_kwargs or {}
+            if isinstance(scheduler, str):
+                scheduler = self._get_scheduler_by_name(scheduler, **kwargs)
+            self.training_config.scheduler(scheduler)
+            
+        return self
+    
+    def set_learning_rate(self, lr: float) -> "TrainableLLMActor":
+        """Set the learning rate."""
+        self.training_config.learning_rate(lr)
+        return self
+        
+    def set_optimizer(self, optimizer, **kwargs) -> "TrainableLLMActor":
+        """Set the optimizer."""
+        if isinstance(optimizer, str):
+            optimizer = self._get_optimizer_by_name(optimizer)
+        self.training_config.optimizer(optimizer, **kwargs)
+        return self
+        
+    def set_loss(self, loss, **kwargs) -> "TrainableLLMActor":
+        """Set the loss function."""
+        if isinstance(loss, str):
+            loss = self._get_loss_by_name(loss)
+        self.training_config.loss(loss, **kwargs)
+        return self
+        
+    def set_scheduler(self, scheduler, **kwargs) -> "TrainableLLMActor":
+        """Set the learning rate scheduler."""
+        if isinstance(scheduler, str):
+            scheduler = self._get_scheduler_by_name(scheduler, **kwargs)
+        self.training_config.scheduler(scheduler)
+        return self
+    
+    def set_reference_model(self, factory: Callable[[], nn.Module]) -> "TrainableLLMActor":
+        """Set the reference model factory."""
+        self.training_config.reference(factory)
+        return self
+    
+    def set_model(self, factory: Callable[[], nn.Module]) -> "TrainableLLMActor":
+        """Set the main model factory."""
+        self.training_config.model(factory)
+        return self
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Convenience Properties and Methods
+    # ═══════════════════════════════════════════════════════════════
+    
+    @property
+    def tokenizer(self) -> PreTrainedTokenizer:
+        """Get the tokenizer instance."""
+        return self.training_config.tokenizer_factory()
+    
+    @property
+    def model_factory(self) -> Callable[[], nn.Module]:
+        """Get the model factory function."""
+        return self.training_config.model_factory
+        
+    @property
+    def current_learning_rate(self) -> float:
+        """Get the current learning rate."""
+        return self.training_config.lr
+        
+    def get_training_summary(self) -> Dict:
+        """Get a summary of current training configuration."""
+        return {
+            'learning_rate': self.training_config.lr,
+            'model_path': self.training_config.model_path,
+            'loss_type': type(self.training_config.loss_factory()).__name__,
+            'optimizer_type': type(self.training_config.optim_factory([])).__name__,
+        }
+    
+    # ═══════════════════════════════════════════════════════════════
+    # Helper Methods
+    # ═══════════════════════════════════════════════════════════════
+    
+    def _get_optimizer_by_name(self, name: str):
+        """Get optimizer class by string name."""
+        optimizers = {
+            'adamw': optim.AdamW,
+            'adam': optim.Adam,
+            'sgd': optim.SGD,
+            'rmsprop': optim.RMSprop,
+        }
+        
+        # Try to import and add bitsandbytes optimizers if available
+        try:
+            import bitsandbytes as bnb
+            optimizers.update({
+                'paged_adamw': bnb.optim.PagedAdamW32bit,
+                'paged_adamw_8bit': bnb.optim.PagedAdamW8bit,
+                'paged_adam': bnb.optim.PagedAdam32bit,
+                'adamw_8bit': bnb.optim.AdamW8bit,
+                'adam_8bit': bnb.optim.Adam8bit,
+            })
+        except ImportError:
+            pass
+            
+        if name.lower() not in optimizers:
+            available = ', '.join(optimizers.keys())
+            raise ValueError(f"Unknown optimizer '{name}'. Available: {available}")
+            
+        return optimizers[name.lower()]
+    
+    def _get_loss_by_name(self, name: str):
+        """Get loss class by string name."""
+        from actors.losses import GRPOLoss
+        
+        losses = {
+            'grpo': GRPOLoss,
+        }
+        
+        # Try to import LigerLoss if available
+        try:
+            from actors.losses.liger_grpo_loss import LigerLoss
+            losses['liger_grpo'] = LigerLoss
+        except ImportError:
+            pass
+            
+        if name.lower() not in losses:
+            available = ', '.join(losses.keys())
+            raise ValueError(f"Unknown loss '{name}'. Available: {available}")
+            
+        return losses[name.lower()]
+    
+    def _get_scheduler_by_name(self, name: str, **kwargs):
+        """Get scheduler factory by string name."""
+        if name.lower() == 'cosine':
+            return self.training_config.cosine_scheduler(**kwargs)
+        elif name.lower() == 'linear':
+            return self.training_config.linear_scheduler(**kwargs)
+        elif name.lower() == 'constant':
+            from torch.optim.lr_scheduler import ConstantLR
+            return lambda opt, steps: ConstantLR(opt, **kwargs)
+        elif name.lower() == 'exponential':
+            from torch.optim.lr_scheduler import ExponentialLR
+            gamma = kwargs.get('gamma', 0.95)
+            return lambda opt, steps: ExponentialLR(opt, gamma=gamma)
+        elif name.lower() == 'step':
+            from torch.optim.lr_scheduler import StepLR
+            step_size = kwargs.get('step_size', 30)
+            gamma = kwargs.get('gamma', 0.1)
+            return lambda opt, steps: StepLR(opt, step_size=step_size, gamma=gamma)
+        else:
+            available = 'cosine, linear, constant, exponential, step'
+            raise ValueError(f"Unknown scheduler '{name}'. Available: {available}")
