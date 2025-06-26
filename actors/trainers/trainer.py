@@ -21,7 +21,7 @@ from accelerate.utils import DeepSpeedPlugin, DistributedType
 
 # ----- project-local helpers -------------------------------------------------
 from actors.actors.base import TrainableLLMActor
-from actors.utils.deepspeed import _OptimizerProxy, prepare_deepspeed, offload_model_and_optimizer, reload_model_and_optimizer
+from actors.utils.deepspeed import _OptimizerProxy, prepare_deepspeed, prepare_deepspeed_reference, offload_model_and_optimizer, reload_model_and_optimizer, log_memory_usage
 from actors.utils.logger import init_logger, colorize, Palette, VERBOSE, NORMAL, QUIET
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.environments.env_base import Environment
@@ -146,9 +146,6 @@ class Trainer:
         ]] = None,
         eval_every_n: Optional[int] = None,
         eval_strategy: EvalStrategy = EvalStrategy.NONE,
-        # offloading
-        offload_optimizer: bool = False,
-        offload_model: bool = False,
     ):
         # ─── trainer-level bookkeeping ────────────────────────────────
         self.env   = env
@@ -197,9 +194,7 @@ class Trainer:
         self.eval_every_n = eval_every_n
         self.eval_strategy = eval_strategy
         
-        # ─── offloading configuration ─────────────────────────────────
-        self.offload_optimizer = offload_optimizer
-        self.offload_model = offload_model
+
 
         # ═══════════════════════════════════════════════════════════════
         # 1.  one DeepSpeedPlugin per actor – default config first
@@ -209,7 +204,7 @@ class Trainer:
         }
 
         # tweak each plugin’s config **after** creation (no base template)
-        for plug in self.ds_plugins.values():
+        for name, plug in self.ds_plugins.items():
             cfg = plug.deepspeed_config                             # default “auto” dict
             cfg["max_grad_norm"] = max_grad_norm
             cfg["train_batch_size"] = batch_size
@@ -218,32 +213,50 @@ class Trainer:
                 batch_size // grad_accumulation_steps // torch.cuda.device_count()
             )
             if gradient_checkpointing:
-                cfg.setdefault("activation_checkpointing", {
+                activation_config = {
                     "partition_activations": True,
                     "contiguous_memory_optimization": True,
                     "number_checkpoints": 1,
                     "synchronize_checkpoint_boundary": False,
-                })
+                }
+                
+                # Add CPU offloading for activations if enabled for this actor
+                actor = env.get_trainable_actors().get(name)
+                if actor.offload_activations_to_cpu:
+                    activation_config.update({
+                        "cpu_checkpointing": True,
+                        "contiguous_memory_optimization": False,  # Disable when using CPU checkpointing
+                        "synchronize_checkpoint_boundary": True,  # Better for CPU offloading
+                    })
+                
+                cfg.setdefault("activation_checkpointing", activation_config)
 
         # ─── validate offloading compatibility ────────────────────────
-        if offload_optimizer or offload_model:
+        # Check if any actors have offloading enabled
+        actors_with_offloading = {
+            name: actor for name, actor in env.get_trainable_actors().items()
+            if actor.offload_optimizer or actor.offload_model
+        }
+        
+        if actors_with_offloading:
             # Check ZeRO stage from the first plugin (all should be the same)
             first_plugin = next(iter(self.ds_plugins.values()))
             zero_config = first_plugin.deepspeed_config.get("zero_optimization", {})
             zero_stage = zero_config.get("stage", 2)  # Default is usually stage 2
             
             if zero_stage != 3:
+                actor_names = ", ".join(actors_with_offloading.keys())
                 warning_msg = (
                     f"⚠️  Offloading is only supported with DeepSpeed ZeRO Stage 3, "
                     f"but current stage is {zero_stage}. "
-                    f"offload_optimizer={offload_optimizer} and offload_model={offload_model} "
-                    f"will be disabled and have no effect."
+                    f"Offloading for actors [{actor_names}] will be disabled and have no effect."
                 )
                 print(colorize(warning_msg, Palette.WARNING))
                 
                 # Disable offloading since it won't work
-                self.offload_optimizer = False
-                self.offload_model = False
+                for actor in actors_with_offloading.values():
+                    actor.offload_optimizer = False
+                    actor.offload_model = False
 
         # ═══════════════════════════════════════════════════════════════
         # 2.  one Accelerator per actor
@@ -305,16 +318,27 @@ class Trainer:
 
             # ── optimiser / scheduler ─────────────────────────────────
             optim = actor_obj.training_config.optim_factory(model.parameters())
-            if self.offload_optimizer or self.offload_model:
+            if actor_obj.offload_optimizer or actor_obj.offload_model:
                 optim = _OptimizerProxy(optim)
             # ── wrap with this actor’s accelerator ────────────────────
             model, optim = accel.prepare(model, optim)
+            
+            # Log activation offloading status
+            if actor_obj.offload_activations_to_cpu and self.main_accel.is_main_process:
+                self.logger.info(colorize(f"💾 Enabled CPU activation offloading for training model '{name}'", Palette.INFO))
+            
             if ref_model is not None:
                 ref_model.requires_grad_(False)  # no gradients for reference model
                 ref_model.config.use_cache = False  # disable cache for reference model
 
                 ref_model = ref_model.to(dtype=model.dtype)
-                ref_model = prepare_deepspeed(ref_model, accel)
+                # Use specialized DeepSpeed config for reference model with CPU offloading
+                if actor_obj.offload_reference_to_cpu:
+                    if self.main_accel.is_main_process:
+                        self.logger.info(colorize(f"🔄 Using CPU-offloaded DeepSpeed config for reference model '{name}'", Palette.INFO))
+                    ref_model = prepare_deepspeed_reference(ref_model, accel, use_cpu_offload=True)
+                else:
+                    ref_model = prepare_deepspeed(ref_model, accel)
                 disable_dropout_in_model(ref_model)
 
             # ── register ──────────────────────────────────────────────
@@ -330,7 +354,13 @@ class Trainer:
                 accel          = accel,
                 model_config   = model_cfg,
             )
-
+            # We offload the model and optimizer if requested
+            if actor_obj.offload_optimizer or actor_obj.offload_model:
+                if self.main_accel.is_main_process:
+                    self.logger.info(colorize(f"🔄 Offloading model and optimizer for actor '{name}'", Palette.INFO))
+                offload_model_and_optimizer(self.actors[name].model, self.actors[name].optim, 
+                                           offload_optimizer=actor_obj.offload_optimizer, 
+                                           offload_model=actor_obj.offload_model)
     # ------------------------------------------------------------------ #
     # data helpers
     # ------------------------------------------------------------------ #
@@ -480,8 +510,6 @@ class Trainer:
             "reference_batch_size": self.reference_batch_size,
             "max_grad_norm": self.max_grad_norm,
             "gradient_checkpointing": self.gradient_checkpointing,
-            "offload_optimizer": self.offload_optimizer,
-            "offload_model": self.offload_model
         }
         
         # ═══ Evaluation Configuration ═══
@@ -1019,12 +1047,12 @@ class Trainer:
         buckets: List[Dict[str, List[float]]]) -> None:
         
         # Reload states before training if offloading is enabled
-        if self.offload_optimizer or self.offload_model:
+        if ta.actor.offload_optimizer or ta.actor.offload_model:
             with _step_profiler.track("reload_states", actor_name=name):
                 reload_model_and_optimizer(
                     ta.model, ta.optim,
-                    reload_optimizer=self.offload_optimizer,
-                    reload_model=self.offload_model
+                    reload_optimizer=ta.actor.offload_optimizer,
+                    reload_model=ta.actor.offload_model
                 )
         total_rewards = actor_output.rewards
         advantages = self._calculate_advantages(total_rewards, self.group_size, actor_output.ended_in_eos)
@@ -1052,7 +1080,7 @@ class Trainer:
                                         temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
                 ref_lp = (self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
                         if ta.reference_model is not None else None)
-        
+                
         # iterate over grad-accumulation micro-batches
         for it in range(self.num_iterations):
             # Log backprop iteration in normal mode
@@ -1080,7 +1108,7 @@ class Trainer:
                 clip_to=self.max_grad_norm
             )
             buckets[it]["grad_norm"].append(grad_norm)
-            
+            free_memory()
             # Track optimizer step
             with _step_profiler.track("optim_step", no_memory_measurement=True, actor_name=name):
                 self._optim_step(ta)
@@ -1105,7 +1133,7 @@ class Trainer:
 
         
         # Offload states after training is complete for this actor
-        if self.offload_optimizer:
+        if ta.actor.offload_optimizer:
             with _step_profiler.track("offload_optimizer", actor_name=name):
                 offload_model_and_optimizer(
                     ta.model, ta.optim, 
@@ -1188,7 +1216,7 @@ class Trainer:
             )
 
         # We offload the model before finalizing the weight update.
-        if self.offload_model:
+        if ta.actor.offload_model:
             with _step_profiler.track("offload_model", actor_name=ta.name):
                 offload_info = offload_model_and_optimizer(
                     ta.model, ta.optim,

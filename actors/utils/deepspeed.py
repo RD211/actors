@@ -1,30 +1,3 @@
-"""
-DeepSpeed model and optimizer offloading utilities with performance optimizations.
-
-Performance Improvements:
-1. Non-blocking transfers: Use asynchronous GPU-CPU transfers for faster offloading
-2. Batch tensor movement: Collect and move tensors in batches rather than one-by-one
-3. Context manager: Automatic offload/reload with optimized patterns
-
-Usage Examples:
-
-# Manual offloading/reloading
-offload_model_and_optimizer(model, optimizer)
-# ... do other work ...
-reload_model_and_optimizer(model, optimizer)
-
-# Simple manual functions
-offload_model(model, optimizer)  # Offload to CPU
-onload_model(model, optimizer)   # Reload to GPU
-
-# Context manager for automatic handling
-with FastOffloadContext(model, optimizer) as ctx:
-    # Model automatically offloaded here
-    # Do inference with another model
-    pass
-# Model automatically reloaded here
-"""
-
 from copy import deepcopy
 import accelerate
 import gc
@@ -259,6 +232,93 @@ def reload_model_and_optimizer(
     return info
 
 
+def prepare_deepspeed_reference(model, accelerator: "accelerate", use_cpu_offload=True):
+    """
+    Prepares the reference model for DeepSpeed inference with aggressive CPU offloading.
+    
+    This configuration is optimized for reference models that:
+    1. Are only used for inference (no gradients)
+    2. Are called infrequently (once per training step)
+    3. Process large batches at once
+    4. Can benefit from full CPU offloading to save GPU memory
+    
+    Args:
+        model: The reference model to prepare
+        accelerator: The accelerator instance
+        use_cpu_offload: Whether to use aggressive CPU offloading (default: True)
+    """
+    import deepspeed
+    
+    deepspeed_plugin = accelerator.state.deepspeed_plugin
+    config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
+    
+    if use_cpu_offload:
+        # Configure for aggressive CPU offloading - reference model specific
+        config_kwargs.update({
+            "zero_optimization": {
+                "stage": 3,
+                "offload_param": {
+                    "device": "cpu",
+                    "pin_memory": True,
+                    "buffer_count": 1,  # Minimal buffer for reference model
+                    "buffer_size": 1e8,  # 100MB buffer
+                    "max_in_cpu": 1e9,  # 1GB max in CPU
+                },
+                "offload_optimizer": {
+                    "device": "cpu",  # Not needed for inference but just in case
+                    "pin_memory": True,
+                },
+                "stage3_param_persistence_threshold": 0,  # Offload everything
+                "stage3_prefetch_bucket_size": 1e6,  # Small prefetch for layer-by-layer
+                "stage3_max_live_parameters": 1e6,  # Keep minimal params on GPU
+                "stage3_max_reuse_distance": 0,  # Don't keep params around
+                "reduce_bucket_size": 1e6,  # Smaller buckets for reference model
+                "contiguous_gradients": False,  # Not needed for inference
+                "overlap_comm": False,  # Simpler for inference-only
+                "sub_group_size": 1e6,  # Small sub-groups
+            },
+            # "activation_checkpointing": {
+            #     "partition_activations": False,  # Not needed for inference
+            #     "cpu_checkpointing": True,  # Offload activations to CPU
+            #     "contiguous_memory_optimization": False,
+            #     "number_checkpoints": 1,
+            #     "synchronize_checkpoint_boundary": True,
+            # },
+            # "memory_efficient_linear": True,  # Use memory efficient linear layers
+            # "aio": {
+            #     "block_size": 262144,  # 256KB blocks for CPU offloading
+            #     "queue_depth": 8,
+            #     "thread_count": 1,
+            #     "single_submit": False,
+            #     "overlap_events": False,
+            # }
+        })
+        
+        # Set model-specific parameters for better CPU offloading
+        if model is not None:
+            hidden_size = (
+                max(model.config.hidden_sizes)
+                if getattr(model.config, "hidden_sizes", None)
+                else getattr(model.config, "hidden_size", None)
+            )
+            if hidden_size is not None:
+                # Conservative settings for reference model
+                config_kwargs["zero_optimization"].update({
+                    "stage3_param_persistence_threshold": 0,  # Always offload
+                    "stage3_prefetch_bucket_size": min(hidden_size * 10, 1e6),  # Conservative prefetch
+                    "stage3_max_live_parameters": min(hidden_size * 100, 1e6),  # Minimal live params
+                })
+    else:
+        # Use the standard preparation without CPU offloading
+        stage = config_kwargs["zero_optimization"]["stage"]
+        if stage != 3:
+            config_kwargs["zero_optimization"]["stage"] = 0
+
+    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
+    model.eval()
+    return model
+
+
 # Hack to allow offloading other optimizers too.
 import deepspeed.ops.adam.fused_adam as _fused
 
@@ -315,3 +375,11 @@ class FastOffloadContext:
             reload_model=self.offload_info.get("model_offloaded", False),
             non_blocking=True
         )
+
+
+def log_memory_usage(logger, prefix=""):
+    """Log current GPU memory usage for debugging offloading behavior."""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+        logger.info(f"{prefix}GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")

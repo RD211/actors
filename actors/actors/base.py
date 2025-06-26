@@ -11,7 +11,7 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import PreTrainedTokenizer, AutoTokenizer, AutoModelForCausalLM
 from actors.losses import GRPOLoss, BaseRLLoss
-
+from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
 
 
@@ -42,7 +42,7 @@ class TrainingConfig:
 
     def __post_init__(self):
         if self._model_factory is None:
-            self._model_factory = lambda: AutoModelForCausalLM.from_pretrained(self.model_path, trust_remote_code=True)
+            self._model_factory = lambda: AutoLigerKernelForCausalLM.from_pretrained(self.model_path, trust_remote_code=True)
         if self._optim_factory is None:
             self._optim_factory = lambda p: optim.AdamW(p)
         if self._reference_model_factory is None:
@@ -200,6 +200,11 @@ class TrainableLLMActor(LLMActor):
         scheduler_kwargs: Dict | None = None,
         model_factory: Callable[[], nn.Module] | None = None,
         reference_model_factory: Callable[[], nn.Module] | None = None,
+        # Offloading parameters
+        offload_optimizer: bool = False,
+        offload_model: bool = False,
+        offload_reference_to_cpu: bool = False,
+        offload_activations_to_cpu: bool = False,
     ):
         """
         Initialize a trainable LLM actor with configuration options.
@@ -216,9 +221,19 @@ class TrainableLLMActor(LLMActor):
             scheduler_kwargs: Additional arguments for scheduler
             model_factory: Factory function to create the main model (default: AutoModelForCausalLM.from_pretrained)
             reference_model_factory: Factory function to create reference model (default: same as main model)
+            offload_optimizer: Whether to offload optimizer states to CPU (default: False)
+            offload_model: Whether to offload model parameters to CPU (default: False)
+            offload_reference_to_cpu: Whether to use aggressive CPU offloading for reference model (default: False)
+            offload_activations_to_cpu: Whether to offload activations to CPU during training (default: False)
         """
         super().__init__(name, model_path)
         self.training_config: TrainingConfig = TrainingConfig(model_path=model_path)
+        
+        # Store offloading configuration
+        self.offload_optimizer = offload_optimizer
+        self.offload_model = offload_model
+        self.offload_reference_to_cpu = offload_reference_to_cpu
+        self.offload_activations_to_cpu = offload_activations_to_cpu
         
         # Configure training with provided parameters
         self.configure_training(

@@ -29,6 +29,11 @@ class vLLMActor(TrainableLLMActor):
         scheduler_kwargs: Dict | None = None,
         model_factory: Callable[[], nn.Module] | None = None,
         reference_model_factory: Callable[[], nn.Module] | None = None,
+        # Offloading parameters
+        offload_optimizer: bool = False,
+        offload_model: bool = False,
+        offload_reference_to_cpu: bool = False,
+        offload_activations_to_cpu: bool = False,
     ):
         super().__init__(
             name, 
@@ -42,6 +47,10 @@ class vLLMActor(TrainableLLMActor):
             scheduler_kwargs=scheduler_kwargs,
             model_factory=model_factory,
             reference_model_factory=reference_model_factory,
+            offload_optimizer=offload_optimizer,
+            offload_model=offload_model,
+            offload_reference_to_cpu=offload_reference_to_cpu,
+            offload_activations_to_cpu=offload_activations_to_cpu,
         )
         self.pool = ModelPool()
         if name not in self.pool.list_models():
