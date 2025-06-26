@@ -38,13 +38,20 @@ class StepProfiler:
     def track(self, operation_name: str, no_memory_measurement: bool = False, actor_name: str = None):
         """
         Track timing and memory for a specific operation within the current step.
-        Memory tracking accumulates peak usage across all operations in the step.
+        Memory tracking shows actual GPU memory usage like nvidia-smi.
         """
         start_time = time.perf_counter()
         operation_start_mem = None
         
         if not no_memory_measurement and self.device is not None:
+            # Clear cache before measuring to get accurate baseline
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            
             operation_start_mem = torch.cuda.memory_allocated(self.device)
+            # Reset peak stats just for this operation
+            torch.cuda.reset_peak_memory_stats(self.device)
         
         yield
         
@@ -59,13 +66,15 @@ class StepProfiler:
         self.metrics[metric_key]["time_s"] = elapsed
         
         if not no_memory_measurement and self.device is not None and operation_start_mem is not None:
-            current_peak = torch.cuda.max_memory_allocated(self.device)
             current_mem = torch.cuda.memory_allocated(self.device)
-            self.step_peak_mem = max(self.step_peak_mem, current_peak)
+            peak_mem = torch.cuda.max_memory_allocated(self.device)
             
-            # Memory difference from start of this operation to peak during operation
-            mem_diff = (current_peak - operation_start_mem) / 1e6  # MB
-            self.metrics[metric_key]["mem_diff_mb"] = mem_diff
+            # Only the two metrics you want
+            mem_change_mb = (current_mem - operation_start_mem) / 1e6  # MB
+            peak_usage_mb = peak_mem / 1e6  # MB
+            
+            self.metrics[metric_key]["mem_change_mb"] = mem_change_mb
+            self.metrics[metric_key]["peak_memory_mb"] = peak_usage_mb
         
         self.has_measurements = True
         
@@ -75,7 +84,10 @@ class StepProfiler:
             mem_info = ""
             if not no_memory_measurement and self.device is not None:
                 current_mem = torch.cuda.memory_allocated(self.device)
-                mem_info = f" | Mem: {current_mem/1e6:.1f}MB"
+                mem_info = f" | GPU: {current_mem/1e6:.1f}MB"
+                if metric_key in self.metrics and "mem_change_mb" in self.metrics[metric_key]:
+                    mem_change = self.metrics[metric_key]["mem_change_mb"]
+                    mem_info += f" | Change: {mem_change:+.1f}MB"
             logger.verbose(f"⏱️  {metric_key}: {elapsed:.3f}s{mem_info}")
     
     def log_step_metrics(self, step: int, accel=None, use_wandb: bool = True):
@@ -92,13 +104,20 @@ class StepProfiler:
             and is_wandb_active()
         ):
             import wandb
+            from .logger import get_logging_level
             
             wandb_log = {}
             
-            # Add per-operation metrics
+            # Always log timing metrics
             for operation, metrics in self.metrics.items():
-                for metric_name, value in metrics.items():
-                    wandb_log[f"Profile/{operation}/{metric_name}"] = value
+                if "time_s" in metrics:
+                    wandb_log[f"Profile/{operation}/time_s"] = metrics["time_s"]
+                
+                # Only log memory metrics in verbose mode
+                if get_logging_level() == "verbose":
+                    for metric_name, value in metrics.items():
+                        if metric_name != "time_s":  # Don't double-log timing
+                            wandb_log[f"Profile/{operation}/{metric_name}"] = value
             
             if wandb_log:
                 wandb.log(wandb_log, step=step)

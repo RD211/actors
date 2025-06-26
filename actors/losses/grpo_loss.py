@@ -54,7 +54,7 @@ class GRPOLoss(BaseRLLoss):
 
         per_tok = -torch.min(ratio * adv, ratio_clipped * adv)
         kl = None
-        if self.beta and ref_logps is not None:
+        if self.beta != 0.0 and ref_logps is not None:
             kl = torch.exp(ref_logps - new_lp) - (ref_logps - new_lp) - 1
             per_tok = per_tok + self.beta * kl
 

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum, auto
 import inspect
 import itertools
-import json
 import os
 import shutil
 import time
@@ -15,7 +13,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import warnings
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from accelerate import Accelerator, InitProcessGroupKwargs
 from transformers import PreTrainedTokenizerBase
@@ -24,16 +21,16 @@ from accelerate.utils import DeepSpeedPlugin, DistributedType
 
 # ----- project-local helpers -------------------------------------------------
 from actors.actors.base import TrainableLLMActor
-from actors.utils.deepspeed import prepare_deepspeed
+from actors.utils.deepspeed import _OptimizerProxy, prepare_deepspeed, offload_model_and_optimizer, reload_model_and_optimizer
 from actors.utils.logger import init_logger, colorize, Palette, VERBOSE, NORMAL, QUIET
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.environments.env_base import Environment
 from actors.environments.types import EnvironmentOutput, ActorOutput
 from actors.losses.base_loss import BaseRLLoss
 from actors.utils.softmax import _selective_softmax
-from actors.utils.tracker import start_step_profiling, log_step_profiling, _step_profiler
+from actors.utils.tracker import start_step_profiling, log_step_profiling, _step_profiler, gpu_profiler
 from actors.utils.wandb import is_wandb_active
-from actors.utils.train_utils import disable_dropout_in_model
+from actors.utils.train_utils import disable_dropout_in_model, free_memory
 
 # ═════════════════════════════════════════════════════════════════════════════
 @dataclass(frozen=False)
@@ -47,6 +44,7 @@ class InitializedTrainableLLMActor:
     optim: torch.optim.Optimizer
     sched: Optional[torch.optim.lr_scheduler.LRScheduler]
     accel: Accelerator 
+    model_config: Dict[str, Any]
     reference_model: Optional[torch.nn.Module] = None
 
 
@@ -148,6 +146,9 @@ class Trainer:
         ]] = None,
         eval_every_n: Optional[int] = None,
         eval_strategy: EvalStrategy = EvalStrategy.NONE,
+        # offloading
+        offload_optimizer: bool = False,
+        offload_model: bool = False,
     ):
         # ─── trainer-level bookkeeping ────────────────────────────────
         self.env   = env
@@ -195,6 +196,10 @@ class Trainer:
         
         self.eval_every_n = eval_every_n
         self.eval_strategy = eval_strategy
+        
+        # ─── offloading configuration ─────────────────────────────────
+        self.offload_optimizer = offload_optimizer
+        self.offload_model = offload_model
 
         # ═══════════════════════════════════════════════════════════════
         # 1.  one DeepSpeedPlugin per actor – default config first
@@ -219,6 +224,26 @@ class Trainer:
                     "number_checkpoints": 1,
                     "synchronize_checkpoint_boundary": False,
                 })
+
+        # ─── validate offloading compatibility ────────────────────────
+        if offload_optimizer or offload_model:
+            # Check ZeRO stage from the first plugin (all should be the same)
+            first_plugin = next(iter(self.ds_plugins.values()))
+            zero_config = first_plugin.deepspeed_config.get("zero_optimization", {})
+            zero_stage = zero_config.get("stage", 2)  # Default is usually stage 2
+            
+            if zero_stage != 3:
+                warning_msg = (
+                    f"⚠️  Offloading is only supported with DeepSpeed ZeRO Stage 3, "
+                    f"but current stage is {zero_stage}. "
+                    f"offload_optimizer={offload_optimizer} and offload_model={offload_model} "
+                    f"will be disabled and have no effect."
+                )
+                print(colorize(warning_msg, Palette.WARNING))
+                
+                # Disable offloading since it won't work
+                self.offload_optimizer = False
+                self.offload_model = False
 
         # ═══════════════════════════════════════════════════════════════
         # 2.  one Accelerator per actor
@@ -267,6 +292,8 @@ class Trainer:
                     model.config.gradient_checkpointing = True
             disable_dropout_in_model(model)
 
+            model_cfg = model.config.to_dict() if hasattr(model, "config") else {}
+
             # ── loss / reference model (if any) ────────────────────────
             loss_fn = actor_obj.training_config.loss_factory()
             beta    = getattr(loss_fn, "beta", 0.0)
@@ -278,6 +305,8 @@ class Trainer:
 
             # ── optimiser / scheduler ─────────────────────────────────
             optim = actor_obj.training_config.optim_factory(model.parameters())
+            if self.offload_optimizer or self.offload_model:
+                optim = _OptimizerProxy(optim)
             # ── wrap with this actor’s accelerator ────────────────────
             model, optim = accel.prepare(model, optim)
             if ref_model is not None:
@@ -299,6 +328,7 @@ class Trainer:
                 sched          = None,
                 reference_model= ref_model,
                 accel          = accel,
+                model_config   = model_cfg,
             )
 
     # ------------------------------------------------------------------ #
@@ -429,7 +459,9 @@ class Trainer:
 
             for row, ln in zip(lp, lengths):
                 local_logps.append(row[: ln - 1].cpu().tolist())
+            del padded, input_ids, attn_mask, logits, lp  # free memory
         gathered = self.main_accel.gather_for_metrics(local_logps)
+        free_memory()
         return gathered
 
     def _log_configuration_to_wandb(self, wandb) -> None:
@@ -447,7 +479,9 @@ class Trainer:
             "num_iterations": self.num_iterations,
             "reference_batch_size": self.reference_batch_size,
             "max_grad_norm": self.max_grad_norm,
-            "gradient_checkpointing": self.gradient_checkpointing
+            "gradient_checkpointing": self.gradient_checkpointing,
+            "offload_optimizer": self.offload_optimizer,
+            "offload_model": self.offload_model
         }
         
         # ═══ Evaluation Configuration ═══
@@ -596,12 +630,12 @@ class Trainer:
             if self.use_wandb and is_wandb_active() and self.main_accel.is_main_process:
                 import wandb
                 
-                # Log eval metrics with section-based naming
+                # Log eval metrics under eval/ section
                 for actor_name, metrics in eval_metrics.items():
                     for metric_name, value in metrics.items():
-                        wandb.log({f"eval_{eval_name}_{actor_name}/{metric_name}": value}, step=self._step)
+                        wandb.log({f"eval/{eval_name}_{actor_name}_{metric_name}": value}, step=self._step)
                 
-                # Log eval completions table for each actor
+                # Log eval completions table for each actor under eval/ section
                 for actor_name, actor_output in env_out.actors.items():
                     if actor_name not in self.actors:
                         continue
@@ -628,9 +662,9 @@ class Trainer:
                         
                         table.add_data(*row)
                     
-                    # Add _final suffix for final evaluation table names
+                    # Add _final suffix for final evaluation table names, put under eval/ section
                     table_suffix = "_final" if is_final else f"_step_{self._logical_step}"
-                    wandb.log({f"eval_{eval_name}_completions_{actor_name}/eval{table_suffix}": table}, step=self._step)
+                    wandb.log({f"eval_completions/{eval_name}_{actor_name}_{table_suffix}": table}, step=self._step)
             
             # Store metrics for this eval dataset
             all_eval_metrics[eval_name] = eval_metrics
@@ -846,6 +880,7 @@ class Trainer:
 
 
 
+    @gpu_profiler(name="train_step", use_wandb=True)
     def train_step(self, raw_batch: Dict[str, List[Any]]) -> Dict[str, Dict[str, float]]:
         """
         One environment interaction + optimisation step.
@@ -860,8 +895,7 @@ class Trainer:
         start_step_profiling()
         
         # Log sampling stage in normal mode
-        if self.main_accel.is_main_process and self.logger.isEnabledFor(NORMAL):
-            self.logger.normal(colorize("🎲 Sampling...", Palette.INFO))
+        self.logger.normal(colorize("🎲 Sampling...", Palette.INFO))
         
         batch = expand_batch(raw_batch, self.group_size)
         
@@ -913,7 +947,7 @@ class Trainer:
                         
                         table.add_data(*row)
                     
-                    wandb.log({f"completions_{name}/completions_{self._logical_step}": table}, step=self._step)
+                    wandb.log({f"completions/{name}_step_{self._logical_step}": table}, step=self._step)
 
         # warn about unexpected actor keys (once per step, rank==0 only)
         if self.rank == 0:
@@ -954,16 +988,23 @@ class Trainer:
         # aggregate over grad-steps and (internally) over ranks
         out: Dict[str, List[Dict[str, float]]] = {}
         for name, bucket_list in metrics.items():
+            ta = self.actors[name]
+            beta = getattr(ta.loss_fn, "beta", 0.0)
+            
             iter_stats: List[Dict[str, float]] = []
             for bucket in bucket_list:
-                iter_stats.append({
-                    k: (sum(v) / len(v) if v else float("nan"))
-                    for k, v in bucket.items()
-                })
+                stats = {}
+                for k, v in bucket.items():
+                    if k == "kl" and beta == 0.0:
+                        # Skip KL metric when beta is 0.0
+                        continue
+                    stats[k] = (sum(v) / len(v) if v else float("nan"))
+                iter_stats.append(stats)
             out[name] = iter_stats
 
-        # Log all profiling metrics for this step
-        log_step_profiling(self._step, self.main_accel, self.use_wandb)
+        # Log all profiling metrics - tracker handles everything automatically
+        if self.main_accel.is_main_process:
+            log_step_profiling(self._step, self.main_accel, use_wandb=self.use_wandb)
 
         return out
 
@@ -977,6 +1018,14 @@ class Trainer:
         actor_output: ActorOutput,
         buckets: List[Dict[str, List[float]]]) -> None:
         
+        # Reload states before training if offloading is enabled
+        if self.offload_optimizer or self.offload_model:
+            with _step_profiler.track("reload_states", actor_name=name):
+                reload_model_and_optimizer(
+                    ta.model, ta.optim,
+                    reload_optimizer=self.offload_optimizer,
+                    reload_model=self.offload_model
+                )
         total_rewards = actor_output.rewards
         advantages = self._calculate_advantages(total_rewards, self.group_size, actor_output.ended_in_eos)
 
@@ -1025,15 +1074,18 @@ class Trainer:
                     self._backward_one_slice(
                         ta, id_slice, m_slice, adv_slice, ref_slice, old_slice, buckets[it]
                     )
-                grad_norm = self._clip_gradients(
-                    ta,
-                    clip_to=self.max_grad_norm
-                )
-                buckets[it]["grad_norm"].append(grad_norm)
+                    free_memory()
+            grad_norm = self._clip_gradients(
+                ta,
+                clip_to=self.max_grad_norm
+            )
+            buckets[it]["grad_norm"].append(grad_norm)
             
             # Track optimizer step
-            with _step_profiler.track("step", no_memory_measurement=True, actor_name=name):
+            with _step_profiler.track("optim_step", no_memory_measurement=True, actor_name=name):
                 self._optim_step(ta)
+
+            free_memory()
 
             # total rewards / completion stats identical across iterations
             b = buckets[it]
@@ -1051,9 +1103,18 @@ class Trainer:
                             b[std_key].append(torch.tensor(comp_rewards).float().std(unbiased=False).item())
             b["learning_rate"].append(ta.sched.get_last_lr()[0])
 
+        
+        # Offload states after training is complete for this actor
+        if self.offload_optimizer:
+            with _step_profiler.track("offload_optimizer", actor_name=name):
+                offload_model_and_optimizer(
+                    ta.model, ta.optim, 
+                    offload_optimizer=True,
+                    offload_model=False
+                )
+
         # Track actor weight update
-        with _step_profiler.track("update_actor_weights", actor_name=name):
-            self._update_actor_weights(ta)
+        self._update_actor_weights(ta)
         ta.actor.sleep()
 
     # ------------------------------------------------------------------ #
@@ -1097,36 +1158,49 @@ class Trainer:
         ta.accel.backward(loss)
 
         bucket["loss"].append(loss.item())
-        if "kl" in stats:
+        if "kl" in stats and getattr(ta.loss_fn, "beta", 0.0) != 0.0:
             bucket["kl"].append(stats["kl"])
         bucket["completion_len"].append(attention_mask[:,1:].sum(-1).float().mean().item())
 
 
     # ------------------------------------------------------------------ #
-    def _optim_step(self, ta: TrainableLLMActor) -> None:
+    def _optim_step(self, ta: InitializedTrainableLLMActor) -> None:
         ta.optim.step()
         ta.sched.step()
         ta.optim.zero_grad()
         ta.accel.wait_for_everyone()
 
     # ------------------------------------------------------------------ #
-    def _update_actor_weights(self, ta: TrainableLLMActor) -> None:
-        # On each node, the local main process will orchestrate the update.
-        if self.main_accel.is_local_main_process:
-            ta.actor.start_weight_update()
+    def _update_actor_weights(self, ta: InitializedTrainableLLMActor) -> None:
+        with _step_profiler.track("update_weights", actor_name=ta.name):
 
-        # This callback will be executed on the local main process of each node for each batch.
-        def stream_batch_callback(batch_state_dict):
+            # On each node, the local main process will orchestrate the update.
             if self.main_accel.is_local_main_process:
-                ta.actor.update_weights_batch(batch_state_dict)
+                ta.actor.start_weight_update()
 
-        gather_and_stream_state_dict(
-            ta.accel, self.logger, ta.model, stream_batch_callback
-        )
+            # This callback will be executed on the local main process of each node for each batch.
+            def stream_batch_callback(batch_state_dict):
+                if self.main_accel.is_local_main_process:
+                    ta.actor.update_weights_batch(batch_state_dict)
+
+            gather_and_stream_state_dict(
+                ta.accel, self.logger, ta.model, stream_batch_callback, tie_word_embeddings=ta.model_config['tie_word_embeddings'],
+            )
+
+        # We offload the model before finalizing the weight update.
+        if self.offload_model:
+            with _step_profiler.track("offload_model", actor_name=ta.name):
+                offload_info = offload_model_and_optimizer(
+                    ta.model, ta.optim,
+                    offload_optimizer=False,
+                    offload_model=True
+                )
+                if self.main_accel.is_main_process and self.logger.isEnabledFor(NORMAL):
+                    if offload_info["model_offloaded"]:
+                        self.logger.normal(colorize(f"💤 Offloaded model", Palette.INFO))
 
         if self.main_accel.is_local_main_process:
             ta.actor.finalize_weight_update()
-
 
     # ------------------------------------------------------------------ #
     # checkpointing

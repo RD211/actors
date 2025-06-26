@@ -48,40 +48,13 @@ def main():
         },
         # Training configuration now directly in constructor
         learning_rate=2e-6,
-        optimizer="paged_adamw_8bit",  # Using string for convenience
+        optimizer="adamw_8bit",  # Using string for convenience
         loss="liger_grpo",  # Using string for liger loss
-        loss_kwargs={"beta": 0.04, "temperature": 1.0},
+        loss_kwargs={"beta": 0.0, "temperature": 1.0},
         scheduler="cosine",  # Using string for cosine scheduler
         model_factory=custom_model_factory,  # Use custom model factory
     )
-    # Kl appears even if 0.0 beta.
-    # Get tokenizer directly from actor property
     tokenizer = actor.tokenizer
-
-    # Alternative: You can still use fluent configuration if needed
-    # actor.set_learning_rate(1e-5).set_optimizer("adamw").set_scheduler("linear")
-    
-    # Or configure multiple things at once
-    # actor.configure_training(
-    #     learning_rate=1e-5,
-    #     optimizer="adamw_8bit", 
-    #     scheduler="linear",
-    #     scheduler_kwargs={"start_factor": 1.0, "end_factor": 0.1}
-    # )
-    
-    # You can also set a custom reference model factory if needed
-    # from transformers import AutoModelForCausalLM
-    # actor.set_reference_model(lambda: AutoModelForCausalLM.from_pretrained("some/other/model"))
-    
-    # Or set a custom model factory for the main model after initialization
-    # def another_model_factory():
-    #     from transformers import AutoModelForCausalLM
-    #     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", trust_remote_code=True)
-    #     # Apply different modifications here
-    #     # model.config.some_parameter = some_value
-    #     # model.some_layer.requires_grad_(False)  # Freeze specific layers
-    #     return model
-    # actor.set_model(another_model_factory)
 
     env = SimpleSingleTurnEnvironment(
         actor=actor,
@@ -140,18 +113,20 @@ def main():
         batch_size=64,
         grad_accumulation_steps=4,
         num_iterations=2,
-        reference_batch_size=2,
+        reference_batch_size=64,
         log_every_n=1,
         data=data,
-        std_normalization=False,
+        std_normalization=True,
         eval_data=eval_data,
         eval_every_n=2,  # Run evaluation every 2 steps
         eval_strategy=EvalStrategy.ALL,  # Run evaluation both periodically and at the end
+        offload_model=True,
+        offload_optimizer=True,
     )
 
     import wandb
 
-    wandb.init(project="test_actors", entity="rd211", name="test")
+    wandb.init(project="test_actors", entity="rd211", name="test-no-ref")
     trainer.train(checkpoint_every_n=30)
     trainer.push_to_hub(
         "rd211/test_actors_main",

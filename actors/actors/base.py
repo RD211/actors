@@ -373,11 +373,10 @@ class TrainableLLMActor(LLMActor):
         try:
             import bitsandbytes as bnb
             optimizers.update({
-                'paged_adamw': bnb.optim.PagedAdamW32bit,
+                'paged_adamw_32bit': bnb.optim.PagedAdamW32bit,
                 'paged_adamw_8bit': bnb.optim.PagedAdamW8bit,
-                'paged_adam': bnb.optim.PagedAdam32bit,
+                'adamw_32bit': bnb.optim.AdamW32bit,
                 'adamw_8bit': bnb.optim.AdamW8bit,
-                'adam_8bit': bnb.optim.Adam8bit,
             })
         except ImportError:
             pass

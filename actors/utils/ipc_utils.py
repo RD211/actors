@@ -3,7 +3,7 @@ import torch
 from concurrent.futures import ThreadPoolExecutor
 import logging
 
-def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model: torch.nn.Module, callback, batch_size: int=300):
+def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model, callback, batch_size: int=300, tie_word_embeddings: bool=False):
     """
     Gathers the state dictionary from a model distributed with DeepSpeed ZeRO in batches,
     and calls a callback with each batch on the local main process.
@@ -15,9 +15,13 @@ def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model: tor
         name, param = name_param
         return name, param.detach()
     
-    params = list(model.state_dict().items())
-    total = len(params)
+    params = list(model.named_parameters())
 
+    #TODO: Test this for non-qwen models too.
+    if tie_word_embeddings:
+        params.append(("lm_head.weight", [p[1] for p in model.named_parameters() if "embed" in p[0]][0]))
+        
+    total = len(params)
     for start in range(0, total, batch_size):
         end = min(total, start + batch_size)
         batch = params[start:end]

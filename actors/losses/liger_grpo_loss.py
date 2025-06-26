@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, Literal, Optional, Tuple
 
+import deepspeed
 import torch
 from torch import Tensor, nn
 from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
@@ -57,14 +58,18 @@ class LigerLoss(BaseRLLoss):
         old_logps: Optional[Tensor] = None, # (B, L-1)
         **_: Dict,
     ) -> Tuple[Tensor, Dict[str, float]]:
-        
+        #TODO: Fix for zero3
         hidden: Tensor = policy.model(
             input_ids
         ).last_hidden_state[:, :-1, :]
 
         tgt_ids: Tensor = input_ids[:, 1:]
         mask: Tensor = attention_mask[:, 1:]
-
+        gp = deepspeed.zero.GatheredParameters(
+            [policy.lm_head.weight, policy.lm_head.bias],
+            modifier_rank=None,
+        )
+        gp.__enter__()
         loss, metrics = self.core(
             _input=hidden,
             lin_weight=policy.lm_head.weight,
@@ -75,6 +80,7 @@ class LigerLoss(BaseRLLoss):
             ref_per_token_logps=ref_logps,
             old_per_token_logps=old_logps,
         )
+        gp.__exit__(None, None, None)
 
         if self.beta > 0.0:
             kl = metrics[0]
