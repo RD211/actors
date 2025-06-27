@@ -5,6 +5,14 @@ import ray
 from vllm import LLM, SamplingParams
 from actors.utils.logger import should_use_tqdm
 
+# Sentinel value for default LoRA behavior (use LoRA if enabled, otherwise None)
+class DefaultLoRA:
+    """Sentinel class representing default LoRA behavior based on model configuration."""
+    def __repr__(self):
+        return "DefaultLoRA"
+
+DEFAULT_LORA = DefaultLoRA()
+
 
 @ray.remote
 class ModelWorker:
@@ -38,6 +46,7 @@ class ModelWorker:
         self.is_sleeping: bool = False
         self.sleep_level: int = 0
         self.model_name = model_name
+        self.lora_enabled = engine_kwargs.get("enable_lora", False)
 
     def ready(self):
         return True
@@ -68,6 +77,24 @@ class ModelWorker:
         except Exception:
             return "ERROR", traceback.format_exc()
 
+    def update_lora_weights(self) -> tuple[str, str | None]:
+        try:
+            self.engine.collective_rpc("update_lora_weights")
+            torch.cuda.empty_cache()
+            return "OK", None
+        except Exception:
+            return "ERROR", traceback.format_exc()
+
+    def create_lora_if_not_present(self, lora_path: str) -> tuple[str, str | None]:
+        """Create and initialize LoRA adapter if not already present."""
+        try:
+            self.engine.collective_rpc(
+                "_create_lora_if_not_present", args=(lora_path,)
+            )
+            return "OK", None
+        except Exception:
+            return "ERROR", traceback.format_exc()
+
     def finalize_update(self) -> tuple[str, str | None]:
         try:
             self.engine.collective_rpc("load_weights_from_cache")
@@ -76,22 +103,26 @@ class ModelWorker:
         except Exception:
             return "ERROR", traceback.format_exc()
 
-    def generate(self, shard: list, sampling_params: SamplingParams) -> list:
+    def generate(self, shard: list, sampling_params: SamplingParams, lora_request=None) -> list:
         if self.is_sleeping:
             raise RuntimeError(f"Model {self.model_name} is sleeping. Cannot generate.")
         if not shard:
             return []
 
         indices, inputs = zip(*shard)
-        outputs = self.engine.generate(list(inputs), sampling_params, use_tqdm=should_use_tqdm())
+        
+        # Pool has already handled DEFAULT_LORA conversion, so we just use what we received
+        outputs = self.engine.generate(list(inputs), sampling_params, lora_request=lora_request, use_tqdm=should_use_tqdm())
         return list(zip(indices, outputs))
 
-    def chat(self, shard: list, sampling_params: SamplingParams) -> list:
+    def chat(self, shard: list, sampling_params: SamplingParams, lora_request=None) -> list:
         if self.is_sleeping:
             raise RuntimeError(f"ModelWorker is asleep at level {self.sleep_level}")
         if not shard:
             return []
 
         indices, inputs = zip(*shard)
-        outputs = self.engine.chat(list(inputs), sampling_params, use_tqdm=should_use_tqdm())
+        
+        # Pool has already handled DEFAULT_LORA conversion, so we just use what we received
+        outputs = self.engine.chat(list(inputs), sampling_params, lora_request=lora_request, use_tqdm=should_use_tqdm())
         return list(zip(indices, outputs))

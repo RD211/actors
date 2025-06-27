@@ -13,6 +13,9 @@ from transformers import PreTrainedTokenizer, AutoTokenizer, AutoModelForCausalL
 from actors.losses import GRPOLoss, BaseRLLoss
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
+# Import PEFT 
+from peft import PeftConfig, get_peft_model
+
 
 
 class LLMActor(abc.ABC):
@@ -39,13 +42,16 @@ class TrainingConfig:
     _optim_factory: Optional[Callable[[Iterable[nn.Parameter]], Optimizer]] = field(default=None, repr=False, init=False)
     _scheduler_factory: Union[Callable[[Optimizer], LRScheduler], Callable[[Optimizer, Optional[int]], LRScheduler]] = field(default=lambda opt, steps: opt, repr=False, init=False)
     _reference_model_factory: Optional[Callable[[], nn.Module]] = field(default=None, repr=False, init=False)
+    # PEFT/LoRA configuration
+    _peft_config: Optional[PeftConfig] = field(default=None, repr=False, init=False)
 
     def __post_init__(self):
         if self._model_factory is None:
             self._model_factory = lambda: AutoLigerKernelForCausalLM.from_pretrained(self.model_path, trust_remote_code=True)
         if self._optim_factory is None:
             self._optim_factory = lambda p: optim.AdamW(p)
-        if self._reference_model_factory is None:
+        # When using PEFT, reference model factory should be None since we'll use adapter disabling
+        if self._reference_model_factory is None and self._peft_config is None:
             self._reference_model_factory = self._model_factory
         if self._tokenizer_factory is None:
             self._tokenizer_factory = lambda: AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
@@ -129,6 +135,21 @@ class TrainingConfig:
             return LinearLR(optimizer, start_factor=start_factor, end_factor=end_factor, total_iters=effective_total_iters)
         return factory
 
+    def peft(self, peft_config):
+        """
+        Set the PEFT configuration for LoRA/QLoRA training.
+        
+        Args:
+            peft_config: PEFT configuration object
+        """
+        self._peft_config = peft_config
+        return self
+
+    @property
+    def peft_config(self):
+        """Get the PEFT configuration."""
+        return self._peft_config
+
     def reference(self, factory: Callable[[], nn.Module]):
         self._reference_model_factory = factory
         return self
@@ -185,6 +206,18 @@ class TrainableLLMActor(LLMActor):
     def sleep(self, level: int = 1) -> None: ...
     @abc.abstractmethod
     def wake(self) -> None: ...
+    
+    def update_lora_weights(self):
+        """Update LoRA weights. Default implementation calls finalize_weight_update for non-LoRA models."""
+        self.finalize_weight_update()
+    
+    def initialize_lora(self, lora_path: str):
+        """Initialize LoRA adapter. This method should be overridden by subclasses that support LoRA."""
+        pass
+    
+    def create_lora_if_not_present(self, lora_path: str):
+        """Create and initialize LoRA adapter if not already present. This method should be overridden by subclasses."""
+        pass
 
     def __init__(
         self, 
@@ -200,6 +233,8 @@ class TrainableLLMActor(LLMActor):
         scheduler_kwargs: Dict | None = None,
         model_factory: Callable[[], nn.Module] | None = None,
         reference_model_factory: Callable[[], nn.Module] | None = None,
+        # PEFT/LoRA configuration
+        peft_config = None,
         # Offloading parameters
         offload_optimizer: bool = False,
         offload_model: bool = False,
@@ -221,6 +256,7 @@ class TrainableLLMActor(LLMActor):
             scheduler_kwargs: Additional arguments for scheduler
             model_factory: Factory function to create the main model (default: AutoModelForCausalLM.from_pretrained)
             reference_model_factory: Factory function to create reference model (default: same as main model)
+            peft_config: PEFT configuration for LoRA/QLoRA training (default: None)
             offload_optimizer: Whether to offload optimizer states to CPU (default: False)
             offload_model: Whether to offload model parameters to CPU (default: False)
             offload_reference_to_cpu: Whether to use aggressive CPU offloading for reference model (default: False)
@@ -228,6 +264,10 @@ class TrainableLLMActor(LLMActor):
         """
         super().__init__(name, model_path)
         self.training_config: TrainingConfig = TrainingConfig(model_path=model_path)
+        
+        # Configure PEFT if provided
+        if peft_config is not None:
+            self.training_config.peft(peft_config)
         
         # Store offloading configuration
         self.offload_optimizer = offload_optimizer
@@ -333,6 +373,11 @@ class TrainableLLMActor(LLMActor):
         self.training_config.scheduler(scheduler)
         return self
     
+    def set_peft_config(self, peft_config) -> "TrainableLLMActor":
+        """Set the PEFT configuration for LoRA/QLoRA training."""
+        self.training_config.peft(peft_config)
+        return self
+    
     def set_reference_model(self, factory: Callable[[], nn.Module]) -> "TrainableLLMActor":
         """Set the reference model factory."""
         self.training_config.reference(factory)
@@ -347,6 +392,11 @@ class TrainableLLMActor(LLMActor):
     # Convenience Properties and Methods
     # ═══════════════════════════════════════════════════════════════
     
+    @property
+    def has_peft_config(self) -> bool:
+        """Check if PEFT configuration is set."""
+        return self.training_config.peft_config is not None
+        
     @property
     def tokenizer(self) -> PreTrainedTokenizer:
         """Get the tokenizer instance."""

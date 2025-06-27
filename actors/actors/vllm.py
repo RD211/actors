@@ -5,6 +5,7 @@ import torch
 from torch import nn
 from vllm import SamplingParams, RequestOutput
 from actors.inference.pool import ModelPool
+from actors.inference.worker import DEFAULT_LORA
 from torch.multiprocessing.reductions import reduce_tensor
 from vllm.platforms import current_platform
 from .base import TrainableLLMActor
@@ -29,6 +30,8 @@ class vLLMActor(TrainableLLMActor):
         scheduler_kwargs: Dict | None = None,
         model_factory: Callable[[], nn.Module] | None = None,
         reference_model_factory: Callable[[], nn.Module] | None = None,
+        # PEFT/LoRA configuration
+        peft_config = None,
         # Offloading parameters
         offload_optimizer: bool = False,
         offload_model: bool = False,
@@ -47,6 +50,7 @@ class vLLMActor(TrainableLLMActor):
             scheduler_kwargs=scheduler_kwargs,
             model_factory=model_factory,
             reference_model_factory=reference_model_factory,
+            peft_config=peft_config,
             offload_optimizer=offload_optimizer,
             offload_model=offload_model,
             offload_reference_to_cpu=offload_reference_to_cpu,
@@ -54,12 +58,25 @@ class vLLMActor(TrainableLLMActor):
         )
         self.pool = ModelPool()
         if name not in self.pool.list_models():
+            # Prepare engine kwargs with LoRA support if PEFT config is present
+            final_engine_kwargs = engine_kwargs.copy() if engine_kwargs else {}
+            
+            # Enable LoRA in vLLM if PEFT config is provided
+            if self.training_config.peft_config is not None:
+                final_engine_kwargs["enable_lora"] = True
+                # Set reasonable defaults for LoRA if not already specified
+                if "max_lora_rank" not in final_engine_kwargs:
+                    lora_rank = getattr(self.training_config.peft_config, 'r', 16)  # Default to rank 16
+                    final_engine_kwargs["max_lora_rank"] = lora_rank
+                if "max_loras" not in final_engine_kwargs:
+                    final_engine_kwargs["max_loras"] = 1  # Default to 1 LoRA adapter
+            
             self.pool.load_model(
                 name=name,
                 model_path=model_path,
                 gpu_groups=gpu_groups,
                 use_v1_engine=use_v1_engine,
-                engine_kwargs=engine_kwargs,
+                engine_kwargs=final_engine_kwargs,
             )
         # Register cleanup function for this actor
         atexit.register(self._cleanup)
@@ -98,34 +115,50 @@ class vLLMActor(TrainableLLMActor):
     def finalize_weight_update(self):
         self.pool.finalize_update(self.name)
         self._sleep_level = 0
+    
+    # ═══════════════════════════════════════════════════════════════
+    # LoRA/PEFT Support Methods
+    # ═══════════════════════════════════════════════════════════════
+    
+    def update_lora_weights(self):
+        """Update LoRA weights in the vLLM worker."""
+        self.pool.update_lora_weights(self.name)
+    
+    def initialize_lora(self, lora_path: str):
+        """Initialize LoRA adapter in the vLLM worker."""
+        self.pool.initialize_lora(self.name, lora_path)
+    
+    def create_lora_if_not_present(self, lora_path: str):
+        """Create and initialize LoRA adapter if not already present in the vLLM worker."""
+        self.pool.create_lora_if_not_present(self.name, lora_path)
 
     def generate(
-        self, prompts: Sequence[str], sampling_params: SamplingParams | None = None
+        self, prompts: Sequence[str], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
         self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
-        return self.pool.generate(self.name, list(prompts), sampling)
+        return self.pool.generate(self.name, list(prompts), sampling, lora_request)
 
     def chat(
-        self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None
+        self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
         self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
-        return self.pool.chat(self.name, list(dialogs), sampling)
+        return self.pool.chat(self.name, list(dialogs), sampling, lora_request)
 
     async def agenerate(
-        self, prompts: Sequence[str], sampling_params: SamplingParams | None = None
+        self, prompts: Sequence[str], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
         self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
-        return await self.pool.agenerate(self.name, list(prompts), sampling)
+        return await self.pool.agenerate(self.name, list(prompts), sampling, lora_request)
 
     async def achat(
-        self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None
+        self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
         self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
-        return await self.pool.achat(self.name, list(dialogs), sampling)
+        return await self.pool.achat(self.name, list(dialogs), sampling, lora_request)
 
     def start_weight_update(self):
         self.pool.start_update(self.name)

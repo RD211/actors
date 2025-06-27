@@ -1,5 +1,5 @@
 import torch
-from actors.utils.vllm import fp8_quantize_state_dict, to_vllm_state_dict
+from actors.utils.vllm import fp8_quantize_state_dict, to_vllm_state_dict, to_vllm_lora_state_dict
 
 class ColocateWorkerExtension:
 
@@ -74,5 +74,56 @@ class ColocateWorkerExtension:
             self.model_runner.model.load_weights(weights=weights)
         torch.cuda.synchronize()
 
+        # Clean up the cache to free memory
+        self.cpu_cache = {}
+
+
+    def _create_lora_if_not_present(self, lora_path: str):
+        from vllm.lora.request import LoRARequest
+        self.model_runner.add_lora(
+            lora_request=LoRARequest(
+                lora_name='lora',
+                lora_int_id=1,
+                lora_local_path=lora_path,
+            )
+        )
+        self.initialized_lora = True
+
+    def update_lora_weights(self):
+        """
+        Updates the LoRA weights in the model.
+        This method assumes that the LoRA weights are already cached in `self.cpu_cache`.
+        """
+        if not hasattr(self, "cpu_cache") or not self.cpu_cache:
+            print("No LoRA weights in CPU cache to update.")
+            return
+        if not hasattr(self, "initialized_lora") or not self.initialized_lora:
+            print("LoRA is not initialized. Call `_create_lora_if_not_present` first.")
+            return
+        
+        self.cpu_cache = to_vllm_lora_state_dict(self.cpu_cache)
+        
+        # The hackiest shit possible :)
+        adapter_manager = self.model_runner.lora_manager._adapter_manager
+        lora_A_keys = [k for k in self.cpu_cache.keys() if 'lora_A' in k]
+        lora_B_keys = [k for k in self.cpu_cache.keys() if 'lora_B' in k]
+        loras = adapter_manager.modules
+        for lora_key in loras.keys():
+            lora_a_key = next(k for k in lora_A_keys if lora_key.split('model.layers')[1] in k)
+            lora_b_key = next(k for k in lora_B_keys if lora_key.split('model.layers')[1] in k)
+            if type(self.cpu_cache[lora_a_key]) != list:
+                self.cpu_cache[lora_a_key] = [self.cpu_cache[lora_a_key]]
+            if type(self.cpu_cache[lora_b_key]) != list:
+                self.cpu_cache[lora_b_key] = [self.cpu_cache[lora_b_key]]
+
+            for i, _ in enumerate(loras[lora_key].lora_a_stacked):
+                if lora_a_key:
+                    self.cpu_cache[lora_a_key][i] = self.cpu_cache[lora_a_key][i].unsqueeze(0).unsqueeze(0)
+                    loras[lora_key].lora_a_stacked[i].data.copy_(self.cpu_cache[lora_a_key][i])
+                    # loras[lora_key].lora_b_stacked[i].data+= 500
+                if lora_b_key:
+                    self.cpu_cache[lora_b_key][i] = self.cpu_cache[lora_b_key][i].unsqueeze(0).unsqueeze(0)
+                    loras[lora_key].lora_b_stacked[i].data.copy_(self.cpu_cache[lora_b_key][i])
+                    # loras[lora_key].lora_b_stacked[i].data+= 1000
         # Clean up the cache to free memory
         self.cpu_cache = {}

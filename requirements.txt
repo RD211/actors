@@ -8,3 +8,4 @@ datasets
 pynvml
 psutil
 bitsandbytes
+peft==0.15.2

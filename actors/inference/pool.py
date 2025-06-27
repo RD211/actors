@@ -10,7 +10,7 @@ from vllm import RequestOutput, SamplingParams
 import ray
 
 from actors.utils.logger import Palette, colorize, logger
-from actors.inference.worker import ModelWorker
+from actors.inference.worker import ModelWorker, DEFAULT_LORA
 
 
 @dataclass
@@ -226,6 +226,39 @@ class ModelPool:
                 raise RuntimeError(msg)
         logger.normal(colorize(f"✅  Updated {name} weights", Palette.SUCCESS))
 
+    # ------------- LoRA methods -----------------------------------
+    def initialize_lora(self, name: str, lora_path: str) -> None:
+        rec = self.models[name]
+        results = ray.get(
+            [w.initialize_lora.remote(lora_path) for w in rec.workers]
+        )
+        for status, msg in results:
+            if status == "ERROR":
+                raise RuntimeError(msg)
+        logger.normal(colorize(f"🔧 Initialized LoRA for {name}", Palette.SUCCESS))
+
+    def update_lora_weights(self, name: str) -> None:
+        rec = self.models[name]
+        self.wake(name)
+        results = ray.get([w.update_lora_weights.remote() for w in rec.workers])
+        for status, msg in results:
+            if status == "ERROR":
+                raise RuntimeError(msg)
+        logger.normal(colorize(f"✅ Updated LoRA weights for {name}", Palette.SUCCESS))
+
+    def create_lora_if_not_present(self, name: str, lora_path: str) -> None:
+        """Create and initialize LoRA adapter if not already present."""
+        rec = self.models[name]
+        self.wake(name)
+        results = ray.get(
+            [w.create_lora_if_not_present.remote(lora_path) for w in rec.workers]
+        )
+        self.sleep(name)
+        for status, msg in results:
+            if status == "ERROR":
+                raise RuntimeError(msg)
+        logger.normal(colorize(f"🔧 Created/initialized LoRA for {name}", Palette.SUCCESS))
+
     # ------------- inference internal -----------------------------
     @staticmethod
     def _scatter(batch: List[Any], workers: List[Any]) -> List[list]:
@@ -246,8 +279,20 @@ class ModelPool:
         payload: List[Any],
         sampling_params: SamplingParams,
         msg_type: str,
+        lora_request=DEFAULT_LORA,
     ) -> List[RequestOutput]:
         rec = self.models[name]
+        
+        # Handle LoRA request logic at pool level
+        # Convert DEFAULT_LORA to actual LoRARequest if model has LoRA enabled
+        if lora_request is DEFAULT_LORA and rec.kwargs.get("enable_lora", False):
+            from vllm.lora.request import LoRARequest
+            lora_request = LoRARequest(
+                lora_name='lora',
+                lora_int_id=1,
+                lora_local_path='placeholder'
+            )
+        
         shards = self._scatter(payload, rec.workers)
 
         start = time.monotonic()
@@ -256,7 +301,7 @@ class ModelPool:
         infer_fn_name = "generate" if msg_type == "GENERATE" else "chat"
         for worker, shard in zip(rec.workers, shards):
             if shard:
-                futures.append(getattr(worker, infer_fn_name).remote(shard, sampling_params))
+                futures.append(getattr(worker, infer_fn_name).remote(shard, sampling_params, lora_request))
 
         collected: List[list] = ray.get(futures)
 
@@ -284,8 +329,20 @@ class ModelPool:
         payload: List[Any],
         sampling_params: SamplingParams,
         msg_type: str,
+        lora_request=DEFAULT_LORA,
     ) -> List[RequestOutput]:
         rec = self.models[name]
+        
+        # Handle LoRA request logic at pool level
+        # Convert DEFAULT_LORA to actual LoRARequest if model has LoRA enabled
+        if lora_request is DEFAULT_LORA and rec.kwargs.get("enable_lora", False):
+            from vllm.lora.request import LoRARequest
+            lora_request = LoRARequest(
+                lora_name='lora',
+                lora_int_id=1,
+                lora_local_path='placeholder'
+            )
+        
         shards = self._scatter(payload, rec.workers)
 
         start = time.monotonic()
@@ -294,7 +351,7 @@ class ModelPool:
         infer_fn_name = "generate" if msg_type == "GENERATE" else "chat"
         for worker, shard in zip(rec.workers, shards):
             if shard:
-                futures.append(getattr(worker, infer_fn_name).remote(shard, sampling_params))
+                futures.append(getattr(worker, infer_fn_name).remote(shard, sampling_params, lora_request))
 
         # Use asyncio.to_thread to run ray.get in a thread pool
         collected: List[list] = await asyncio.to_thread(ray.get, futures)
@@ -319,21 +376,21 @@ class ModelPool:
 
     # ---------- RPC methods for clients ----------------------------
     def generate(
-        self, name: str, prompts: List[str], sampling_params: SamplingParams
+        self, name: str, prompts: List[str], sampling_params: SamplingParams, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
-        return self._infer(name, prompts, sampling_params, "GENERATE")
+        return self._infer(name, prompts, sampling_params, "GENERATE", lora_request)
 
     def chat(
-        self, name: str, dialogs: List[list], sampling_params: SamplingParams
+        self, name: str, dialogs: List[list], sampling_params: SamplingParams, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
-        return self._infer(name, dialogs, sampling_params, "CHAT")
+        return self._infer(name, dialogs, sampling_params, "CHAT", lora_request)
 
     async def agenerate(
-        self, name: str, prompts: List[str], sampling_params: SamplingParams
+        self, name: str, prompts: List[str], sampling_params: SamplingParams, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
-        return await self._ainfer(name, prompts, sampling_params, "GENERATE")
+        return await self._ainfer(name, prompts, sampling_params, "GENERATE", lora_request)
 
     async def achat(
-        self, name: str, dialogs: List[list], sampling_params: SamplingParams
+        self, name: str, dialogs: List[list], sampling_params: SamplingParams, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
-        return await self._ainfer(name, dialogs, sampling_params, "CHAT")
+        return await self._ainfer(name, dialogs, sampling_params, "CHAT", lora_request)

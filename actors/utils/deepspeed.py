@@ -170,9 +170,8 @@ def offload_model_and_optimizer(
 ):
     info = {"optimizer_bytes": 0, "model_offloaded": False}
 
-    # Check if model has DeepSpeed optimizer (ZeRO stage 3)
-    if not hasattr(model, "optimizer"):
-        # No DeepSpeed optimizer available, skip offloading
+    # Validate that offloading is possible with this configuration
+    if not _validate_offloading_config(model):
         return info
 
     # Start with optimizer offloading (typically larger and benefits more from async)
@@ -383,3 +382,23 @@ def log_memory_usage(logger, prefix=""):
         allocated = torch.cuda.memory_allocated() / 1024**3  # GB
         reserved = torch.cuda.memory_reserved() / 1024**3   # GB
         logger.info(f"{prefix}GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+
+def _validate_offloading_config(model):
+    """
+    Validate that the DeepSpeed model is properly configured for offloading.
+    Returns True if offloading should be attempted, False otherwise.
+    """
+    if not hasattr(model, "optimizer"):
+        return False
+    
+    # Check if the model has ZeRO stage 3 with proper offloading config
+    if not hasattr(model.optimizer, "offload_states"):
+        return False
+    
+    # Check if this is a PEFT model - PEFT models don't work well with DeepSpeed offloading
+    # due to their parameter structure and adapter layers
+    if hasattr(model, 'peft_config') and hasattr(model, 'base_model'):
+        return False
+    
+    return True

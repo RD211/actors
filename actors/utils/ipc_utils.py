@@ -3,11 +3,17 @@ import torch
 from concurrent.futures import ThreadPoolExecutor
 import logging
 
-def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model, callback, batch_size: int=300, tie_word_embeddings: bool=False):
+def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model, callback, batch_size: int=300, tie_word_embeddings: bool=False, lora_only: bool=False):
     """
     Gathers the state dictionary from a model distributed with DeepSpeed ZeRO in batches,
     and calls a callback with each batch on the local main process.
     Tensors in the batch are on the GPU of the local main process.
+    
+    Parameters:
+    -----------
+    lora_only : bool
+        If True, only gather LoRA adapter parameters (containing 'lora_A' or 'lora_B').
+        If False, gather all model parameters.
     """
     
     # This will keep the tensor on its current device (GPU)
@@ -15,11 +21,28 @@ def gather_and_stream_state_dict(accelerator, logger: logging.Logger, model, cal
         name, param = name_param
         return name, param.detach()
     
-    params = list(model.named_parameters())
-
-    #TODO: Test this for non-qwen models too.
-    if tie_word_embeddings:
-        params.append(("lm_head.weight", [p[1] for p in model.named_parameters() if "embed" in p[0]][0]))
+    # Get all parameters first
+    all_params = list(model.named_parameters())
+    
+    if lora_only:
+        # Filter to only LoRA parameters
+        params = [
+            (name, param) for name, param in all_params 
+            if 'lora_A' in name or 'lora_B' in name
+        ]
+        
+        if not params:
+            logger.warning("No LoRA parameters found in model. Make sure this is a PEFT model with LoRA adapters.")
+            return
+        
+        logger.info(f"Found {len(params)} LoRA parameters to sync (out of {len(all_params)} total parameters)")
+    else:
+        # Use all parameters
+        params = all_params
+        
+        #TODO: Test this for non-qwen models too.
+        if tie_word_embeddings:
+            params.append(("lm_head.weight", [p[1] for p in model.named_parameters() if "embed" in p[0]][0]))
         
     total = len(params)
     for start in range(0, total, batch_size):

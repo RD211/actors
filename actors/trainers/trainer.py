@@ -9,6 +9,7 @@ import itertools
 import os
 import shutil
 import time
+import tempfile
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import warnings
 
@@ -31,6 +32,15 @@ from actors.utils.softmax import _selective_softmax
 from actors.utils.tracker import start_step_profiling, log_step_profiling, _step_profiler, gpu_profiler
 from actors.utils.wandb import is_wandb_active
 from actors.utils.train_utils import disable_dropout_in_model, free_memory
+
+# Import PEFT
+from peft import PeftConfig, get_peft_model
+import shutil
+import tempfile
+
+def is_peft_model(model):
+    """Check if a model is a PEFT model."""
+    return hasattr(model, 'peft_config') and hasattr(model, 'base_model')
 
 # ═════════════════════════════════════════════════════════════════════════════
 @dataclass(frozen=False)
@@ -167,6 +177,9 @@ class Trainer:
                 rewards, group_size, ended_in_eos, std_normalization
             )
 
+        # ─── LoRA tracking for first updates ──────────────────────────
+        self._first_lora_update = {}  # Track which actors need first LoRA update
+
         # ─── data / RNG setup ──────────────────────────────
         self._data = self._normalise_hf_splits(data)
         self._data_state = {"epoch": 0, "step_in_epoch": 0, "current_generator_seed": 0}
@@ -251,7 +264,7 @@ class Trainer:
                     f"but current stage is {zero_stage}. "
                     f"Offloading for actors [{actor_names}] will be disabled and have no effect."
                 )
-                print(colorize(warning_msg, Palette.WARNING))
+                self.logger.warning(colorize(warning_msg, Palette.WARNING))
                 
                 # Disable offloading since it won't work
                 for actor in actors_with_offloading.values():
@@ -281,7 +294,7 @@ class Trainer:
 
         # ─── basic sanity checks ───────────────────────────
         if batch_size % group_size:
-            raise ValueError("batch_size must be divisible by group_size")
+            raise ValueError("batch_size must be a divisible by group_size")
         if (batch_size // grad_accumulation_steps) % self.number_of_devices:
             raise ValueError("batch_size/grad_accumulation_steps must be divisible by world size")
         if batch_size % (reference_batch_size * self.number_of_devices):
@@ -297,24 +310,64 @@ class Trainer:
 
             # ── create & optionally checkpoint-enable model ────────────
             model = actor_obj.model_factory()  # Use the convenient property
+            
+            # Apply PEFT configuration if available
+            if actor_obj.training_config.peft_config is not None:
+                if self.main_accel.is_main_process:
+                    self.logger.info(colorize(f"🔧 Applying PEFT configuration to actor '{name}'", Palette.INFO))
+                model = get_peft_model(model, actor_obj.training_config.peft_config)
+                
+                # Track this actor for first LoRA update
+                self._first_lora_update[name] = True
+                
+                # Warn about PEFT + offloading incompatibility
+                if (actor_obj.offload_optimizer or actor_obj.offload_model) and self.main_accel.is_main_process:
+                    self.logger.warning(colorize(
+                        f"⚠️  Actor '{name}' has both PEFT and offloading enabled. "
+                        f"PEFT models don't work well with DeepSpeed offloading due to parameter structure differences. "
+                        f"Offloading will be automatically disabled for this actor.",
+                        Palette.WARNING
+                    ))
+
             if gradient_checkpointing:
-                model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-                model.config.use_cache = False
-                if hasattr(model, "enable_input_require_grads"):
+                # Enable gradient checkpointing
+                if is_peft_model(model):
+                    # For PEFT models, apply to base model
+                    model.base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                    model.base_model.config.use_cache = False
+                    model.base_model.enable_input_require_grads()
+                else:
+                    # For regular models
+                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                    model.config.use_cache = False
                     model.enable_input_require_grads()
-                    model.config.gradient_checkpointing = True
             disable_dropout_in_model(model)
 
-            model_cfg = model.config.to_dict() if hasattr(model, "config") else {}
+            model_cfg = model.config.to_dict()
 
             # ── loss / reference model (if any) ────────────────────────
             loss_fn = actor_obj.training_config.loss_factory()
             beta    = getattr(loss_fn, "beta", 0.0)
-            ref_model = (
-                actor_obj.training_config.reference_model_factory().eval()
-                if actor_obj.training_config.reference_model_factory and beta != 0.0
-                else None
-            )
+            
+            # Handle reference model based on PEFT configuration
+            if beta == 0.0:
+                # If beta is 0.0, the reference model is not needed
+                ref_model = None
+            elif is_peft_model(model):
+                # If PEFT is used, the reference model is not needed since the adapter can be disabled
+                # to revert to the initial model.
+                ref_model = None
+                if self.main_accel.is_main_process:
+                    self.logger.info(colorize(f"📚 Using adapter disabling for reference model with actor '{name}'", Palette.INFO))
+            else:
+                # For deepspeed, fsdp or non-distributed models, create a reference model from scratch
+                ref_model = (
+                    actor_obj.training_config.reference_model_factory().eval()
+                    if actor_obj.training_config.reference_model_factory and beta != 0.0
+                    else None
+                )
+                if ref_model is not None and self.main_accel.is_main_process:
+                    self.logger.info(colorize(f"📚 Created separate reference model for actor '{name}'", Palette.INFO))
 
             # ── optimiser / scheduler ─────────────────────────────────
             optim = actor_obj.training_config.optim_factory(model.parameters())
@@ -361,6 +414,10 @@ class Trainer:
                 offload_model_and_optimizer(self.actors[name].model, self.actors[name].optim, 
                                            offload_optimizer=actor_obj.offload_optimizer, 
                                            offload_model=actor_obj.offload_model)
+
+
+        # Initialize the lora adapters for all actors
+        self._setup_loras()
     # ------------------------------------------------------------------ #
     # data helpers
     # ------------------------------------------------------------------ #
@@ -537,8 +594,25 @@ class Trainer:
             actor_config = {
                 "name": name,
                 "actor_type": type(ta.actor).__name__,
-                "has_reference_model": ta.reference_model is not None
+                "has_reference_model": ta.reference_model is not None,
+                "is_peft_model": is_peft_model(ta.model),
+                "uses_adapter_for_ref": (ta.reference_model is None and is_peft_model(ta.model))
             }
+            
+            # PEFT configuration
+            if ta.actor.training_config.peft_config is not None:
+                peft_config = ta.actor.training_config.peft_config
+                actor_config["peft"] = {
+                    "peft_type": peft_config.peft_type.value if hasattr(peft_config, 'peft_type') else str(type(peft_config).__name__),
+                    "task_type": peft_config.task_type.value if hasattr(peft_config, 'task_type') else None,
+                }
+                # Add LoRA-specific parameters if available
+                if hasattr(peft_config, 'r'):
+                    actor_config["peft"]["rank"] = peft_config.r
+                if hasattr(peft_config, 'lora_alpha'):
+                    actor_config["peft"]["alpha"] = peft_config.lora_alpha
+                if hasattr(peft_config, 'lora_dropout'):
+                    actor_config["peft"]["dropout"] = peft_config.lora_dropout
             
             # Model path from actor (accessible via ta.actor.model_path)
             if hasattr(ta.actor, 'model_path'):
@@ -1078,8 +1152,18 @@ class Trainer:
             with _step_profiler.track("get_logps", actor_name=name):
                 old_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, 
                                         temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
-                ref_lp = (self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
-                        if ta.reference_model is not None else None)
+                
+                # Handle reference logits based on model type
+                if ta.reference_model is not None:
+                    # Traditional separate reference model
+                    ref_lp = self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
+                elif is_peft_model(ta.model):
+                    # PEFT model - disable adapter to get reference logits
+                    with ta.model.disable_adapter():
+                        ref_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
+                else:
+                    # No reference model needed
+                    ref_lp = None
                 
         # iterate over grad-accumulation micro-batches
         for it in range(self.num_iterations):
@@ -1200,6 +1284,7 @@ class Trainer:
 
     # ------------------------------------------------------------------ #
     def _update_actor_weights(self, ta: InitializedTrainableLLMActor) -> None:
+        
         with _step_profiler.track("update_weights", actor_name=ta.name):
 
             # On each node, the local main process will orchestrate the update.
@@ -1212,7 +1297,10 @@ class Trainer:
                     ta.actor.update_weights_batch(batch_state_dict)
 
             gather_and_stream_state_dict(
-                ta.accel, self.logger, ta.model, stream_batch_callback, tie_word_embeddings=ta.model_config['tie_word_embeddings'],
+                ta.accel, self.logger, 
+                ta.model, stream_batch_callback, 
+                tie_word_embeddings=ta.model_config['tie_word_embeddings'], 
+                lora_only=is_peft_model(ta.model)
             )
 
         # We offload the model before finalizing the weight update.
@@ -1228,7 +1316,36 @@ class Trainer:
                         self.logger.normal(colorize(f"💤 Offloaded model", Palette.INFO))
 
         if self.main_accel.is_local_main_process:
-            ta.actor.finalize_weight_update()
+            # For LoRA models, use update_lora_weights instead of finalize_weight_update
+            if is_peft_model(ta.model):
+                ta.actor.update_lora_weights()
+            else:
+                ta.actor.finalize_weight_update()
+
+    def _setup_loras(self) -> str:
+        import tempfile
+        
+        # Create a temporary directory for the LoRA adapter
+        if self.main_accel.is_local_main_process:
+            temp_dir = tempfile.mkdtemp(prefix="lora_adapter_")
+        
+        # Sync the path.
+        temp_dir = self.main_accel.gather_for_metrics([(self.rank,temp_dir)] if self.main_accel.is_local_main_process else [(self.rank,None)])
+        # Get the largest rank's temp_dir that is is not None and less than our rank
+        temp_dir = max((d for d in temp_dir if d is not None and d[0] <= self.rank), key=lambda x: x[0])[1]
+        self.save_pretrained(temp_dir)
+
+        multiple_actors = len(self.actors) > 1
+        # Initialize LoRA in the vLLM actor if it's a vLLMActor
+        if self.main_accel.is_local_main_process:
+            for name, ta in self.actors.items():
+                if ta.actor.has_peft_config:
+                    print(os.listdir(os.path.join(temp_dir, name)) if multiple_actors else os.listdir(temp_dir))
+                    ta.actor.create_lora_if_not_present(os.path.join(temp_dir, name) if multiple_actors else temp_dir)
+            
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return temp_dir
 
     # ------------------------------------------------------------------ #
     # checkpointing
@@ -1293,7 +1410,7 @@ class Trainer:
             subdir = os.path.join(path, name)
 
             # make sure the right plugin is active for *this* accelerator
-            ta.accel.state.select_deepspeed_plugin(name)
+            # ta.accel.state.select_deepspeed_plugin(name)
             ta.accel.load_state(subdir)
 
         self.main_accel.wait_for_everyone()
@@ -1328,20 +1445,31 @@ class Trainer:
         multi = len(self.actors) > 1
 
         for name, ta in self.actors.items():
+            # reload if offloaded
+            if ta.actor.offload_model:
+                reload_model_and_optimizer(ta.model, ta.optim, reload_model=True, reload_optimizer=False)
             tgt = os.path.join(output_dir, name) if multi else output_dir
             os.makedirs(tgt, exist_ok=True)
+            
+            state_dict = ta.accel.get_state_dict(ta.model)
 
-            # 1️⃣ model
-            if hasattr(ta.model, "save_pretrained"):
-                ta.model.save_pretrained(tgt)
-            else:
-                raise AttributeError(f"Actor '{name}' model lacks save_pretrained()")
 
-            # 2️⃣ tokenizer (some setups deliberately omit a tokenizer)
+            ta.accel.unwrap_model(ta.model, keep_torch_compile=False).save_pretrained(
+                tgt, state_dict=state_dict, safe_serialization=True,
+            )
+
             if ta.tokenizer is not None:
                 ta.tokenizer.save_pretrained(tgt)
             else:
                 warnings.warn(f"Actor '{name}' has no tokenizer - skipped.")
+            
+            # offload.
+            if ta.actor.offload_model:
+                offload_model_and_optimizer(
+                    ta.model, ta.optim,
+                    offload_optimizer=False,
+                    offload_model=True
+                )
     # ------------------------------------------------------------------ #
     # Hugging Face Hub upload
     # ------------------------------------------------------------------ #
@@ -1414,7 +1542,8 @@ class Trainer:
         **push_kwargs,
     ):
         # 1️⃣ model
-        ta.model.push_to_hub(
+        unwrapped_model = ta.accel.unwrap_model(ta.model)
+        unwrapped_model.push_to_hub(
             repo_id,
             private=private,
             commit_message=commit_message,
@@ -1428,3 +1557,9 @@ class Trainer:
                 commit_message=commit_message,
                 **push_kwargs,
             )
+
+def is_peft_model(model):
+    """Check if a model is a PEFT model."""
+    return hasattr(model, 'peft_config') and hasattr(model, 'base_model')
+
+# ═════════════════════════════════════════════════════════════════════════════
