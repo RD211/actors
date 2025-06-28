@@ -113,8 +113,9 @@ class vLLMActor(TrainableLLMActor):
         self._sleep_level = 0
 
     def finalize_weight_update(self):
-        self.pool.finalize_update(self.name)
-        self._sleep_level = 0
+        with self._with_wake():
+            self.pool.finalize_update(self.name)
+            self._sleep_level = 0  # This method specifically sets sleep level to 0
     
     # ═══════════════════════════════════════════════════════════════
     # LoRA/PEFT Support Methods
@@ -122,43 +123,41 @@ class vLLMActor(TrainableLLMActor):
     
     def update_lora_weights(self):
         """Update LoRA weights in the vLLM worker."""
-        self.pool.update_lora_weights(self.name)
-    
-    def initialize_lora(self, lora_path: str):
-        """Initialize LoRA adapter in the vLLM worker."""
-        self.pool.initialize_lora(self.name, lora_path)
-    
+        with self._with_wake():
+            self.pool.update_lora_weights(self.name)
+
     def create_lora_if_not_present(self, lora_path: str):
         """Create and initialize LoRA adapter if not already present in the vLLM worker."""
-        self.pool.create_lora_if_not_present(self.name, lora_path)
+        with self._with_wake():
+            self.pool.create_lora_if_not_present(self.name, lora_path)
 
     def generate(
         self, prompts: Sequence[str], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
-        self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
-        return self.pool.generate(self.name, list(prompts), sampling, lora_request)
+        with self._with_wake():
+            return self.pool.generate(self.name, list(prompts), sampling, lora_request)
 
     def chat(
         self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
-        self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
-        return self.pool.chat(self.name, list(dialogs), sampling, lora_request)
+        with self._with_wake():
+            return self.pool.chat(self.name, list(dialogs), sampling, lora_request)
 
     async def agenerate(
         self, prompts: Sequence[str], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
-        self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
-        return await self.pool.agenerate(self.name, list(prompts), sampling, lora_request)
+        with self._with_wake():
+            return await self.pool.agenerate(self.name, list(prompts), sampling, lora_request)
 
     async def achat(
         self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
     ) -> List[RequestOutput]:
-        self._handle_sleep_state()
         sampling = sampling_params or SamplingParams()
-        return await self.pool.achat(self.name, list(dialogs), sampling, lora_request)
+        with self._with_wake():
+            return await self.pool.achat(self.name, list(dialogs), sampling, lora_request)
 
     def start_weight_update(self):
         self.pool.start_update(self.name)
@@ -197,3 +196,19 @@ class vLLMActor(TrainableLLMActor):
             raise RuntimeError(
                 f"Model {self.name} is sleeping at level 2. While attempting to generate or chat."
             )
+    
+    def _with_wake(self):
+        """Context manager to temporarily wake up and restore previous sleep state."""
+        from contextlib import contextmanager
+        
+        @contextmanager
+        def wake_context():
+            previous_sleep_level = self._sleep_level
+            self._handle_sleep_state()
+            try:
+                yield
+            finally:
+                if previous_sleep_level > 0:
+                    self.sleep(level=previous_sleep_level)
+        
+        return wake_context()

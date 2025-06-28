@@ -22,7 +22,7 @@ from accelerate.utils import DeepSpeedPlugin, DistributedType
 
 # ----- project-local helpers -------------------------------------------------
 from actors.actors.base import TrainableLLMActor
-from actors.utils.deepspeed import _OptimizerProxy, prepare_deepspeed, prepare_deepspeed_reference, offload_model_and_optimizer, reload_model_and_optimizer, log_memory_usage
+from actors.utils.deepspeed import prepare_deepspeed, prepare_deepspeed_reference, offload_model_and_optimizer, reload_model_and_optimizer, log_memory_usage
 from actors.utils.logger import init_logger, colorize, Palette, VERBOSE, NORMAL, QUIET
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.environments.env_base import Environment
@@ -313,21 +313,11 @@ class Trainer:
             
             # Apply PEFT configuration if available
             if actor_obj.training_config.peft_config is not None:
-                if self.main_accel.is_main_process:
-                    self.logger.info(colorize(f"🔧 Applying PEFT configuration to actor '{name}'", Palette.INFO))
+                self.logger.info(colorize(f"🔧 Applying PEFT configuration to actor '{name}'", Palette.INFO))
                 model = get_peft_model(model, actor_obj.training_config.peft_config)
                 
                 # Track this actor for first LoRA update
                 self._first_lora_update[name] = True
-                
-                # Warn about PEFT + offloading incompatibility
-                if (actor_obj.offload_optimizer or actor_obj.offload_model) and self.main_accel.is_main_process:
-                    self.logger.warning(colorize(
-                        f"⚠️  Actor '{name}' has both PEFT and offloading enabled. "
-                        f"PEFT models don't work well with DeepSpeed offloading due to parameter structure differences. "
-                        f"Offloading will be automatically disabled for this actor.",
-                        Palette.WARNING
-                    ))
 
             if gradient_checkpointing:
                 # Enable gradient checkpointing
@@ -357,8 +347,7 @@ class Trainer:
                 # If PEFT is used, the reference model is not needed since the adapter can be disabled
                 # to revert to the initial model.
                 ref_model = None
-                if self.main_accel.is_main_process:
-                    self.logger.info(colorize(f"📚 Using adapter disabling for reference model with actor '{name}'", Palette.INFO))
+                self.logger.info(colorize(f"📚 Using adapter disabling for reference model with actor '{name}'", Palette.INFO))
             else:
                 # For deepspeed, fsdp or non-distributed models, create a reference model from scratch
                 ref_model = (
@@ -366,18 +355,16 @@ class Trainer:
                     if actor_obj.training_config.reference_model_factory and beta != 0.0
                     else None
                 )
-                if ref_model is not None and self.main_accel.is_main_process:
+                if ref_model is not None:
                     self.logger.info(colorize(f"📚 Created separate reference model for actor '{name}'", Palette.INFO))
 
             # ── optimiser / scheduler ─────────────────────────────────
             optim = actor_obj.training_config.optim_factory(model.parameters())
-            if actor_obj.offload_optimizer or actor_obj.offload_model:
-                optim = _OptimizerProxy(optim)
             # ── wrap with this actor’s accelerator ────────────────────
             model, optim = accel.prepare(model, optim)
             
             # Log activation offloading status
-            if actor_obj.offload_activations_to_cpu and self.main_accel.is_main_process:
+            if actor_obj.offload_activations_to_cpu:
                 self.logger.info(colorize(f"💾 Enabled CPU activation offloading for training model '{name}'", Palette.INFO))
             
             if ref_model is not None:
@@ -387,8 +374,7 @@ class Trainer:
                 ref_model = ref_model.to(dtype=model.dtype)
                 # Use specialized DeepSpeed config for reference model with CPU offloading
                 if actor_obj.offload_reference_to_cpu:
-                    if self.main_accel.is_main_process:
-                        self.logger.info(colorize(f"🔄 Using CPU-offloaded DeepSpeed config for reference model '{name}'", Palette.INFO))
+                    self.logger.info(colorize(f"🔄 Using CPU-offloaded DeepSpeed config for reference model '{name}'", Palette.INFO))
                     ref_model = prepare_deepspeed_reference(ref_model, accel, use_cpu_offload=True)
                 else:
                     ref_model = prepare_deepspeed(ref_model, accel)
@@ -409,12 +395,11 @@ class Trainer:
             )
             # We offload the model and optimizer if requested
             if actor_obj.offload_optimizer or actor_obj.offload_model:
-                if self.main_accel.is_main_process:
-                    self.logger.info(colorize(f"🔄 Offloading model and optimizer for actor '{name}'", Palette.INFO))
+                self.logger.info(colorize(f"🔄 Offloading model and optimizer for actor '{name}'", Palette.INFO))
                 offload_model_and_optimizer(self.actors[name].model, self.actors[name].optim, 
                                            offload_optimizer=actor_obj.offload_optimizer, 
                                            offload_model=actor_obj.offload_model)
-
+                self.logger.info(colorize(f"✅ Offloaded model and optimizer for actor '{name}'", Palette.SUCCESS))
 
         # Initialize the lora adapters for all actors
         self._setup_loras()
@@ -1340,7 +1325,6 @@ class Trainer:
         if self.main_accel.is_local_main_process:
             for name, ta in self.actors.items():
                 if ta.actor.has_peft_config:
-                    print(os.listdir(os.path.join(temp_dir, name)) if multiple_actors else os.listdir(temp_dir))
                     ta.actor.create_lora_if_not_present(os.path.join(temp_dir, name) if multiple_actors else temp_dir)
             
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -1447,15 +1431,26 @@ class Trainer:
         for name, ta in self.actors.items():
             # reload if offloaded
             if ta.actor.offload_model:
+                self.logger.normal(
+                    colorize(f"🔄 Reloading model for actor LORA", Palette.INFO)
+                )
                 reload_model_and_optimizer(ta.model, ta.optim, reload_model=True, reload_optimizer=False)
+                self.logger.normal(
+                    colorize(f"🔄 Model reloaded for actor LORA", Palette.INFO)
+                )
             tgt = os.path.join(output_dir, name) if multi else output_dir
             os.makedirs(tgt, exist_ok=True)
             
             state_dict = ta.accel.get_state_dict(ta.model)
-
+            self.logger.normal(
+                colorize(f"Gathered a state dict", Palette.INFO)
+            )
 
             ta.accel.unwrap_model(ta.model, keep_torch_compile=False).save_pretrained(
                 tgt, state_dict=state_dict, safe_serialization=True,
+            )
+            self.logger.normal(
+                colorize(f"Model saved to {tgt}", Palette.INFO)
             )
 
             if ta.tokenizer is not None:
@@ -1469,6 +1464,9 @@ class Trainer:
                     ta.model, ta.optim,
                     offload_optimizer=False,
                     offload_model=True
+                )
+                self.logger.normal(
+                    colorize(f"💤 Offloaded model for actor '{name}'", Palette.INFO)
                 )
     # ------------------------------------------------------------------ #
     # Hugging Face Hub upload

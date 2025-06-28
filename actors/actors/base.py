@@ -195,6 +195,11 @@ class TrainingConfig:
         return self._reference_model_factory
 
 class TrainableLLMActor(LLMActor):
+    
+    @abc.abstractmethod
+    def sleep(self, level: int = 1) -> None: ...
+    @abc.abstractmethod
+    def wake(self) -> None: ...
    
     @abc.abstractmethod
     def start_weight_update(self): ...
@@ -202,22 +207,15 @@ class TrainableLLMActor(LLMActor):
     def update_weights_batch(self, state_dict: Dict[str, torch.Tensor]): ...
     @abc.abstractmethod
     def finalize_weight_update(self): ...
+    
+
+    # ═══════════════════════════════════════════════════════════════
+    # LoRA/PEFT Support Methods
+    # ═══════════════════════════════════════════════════════════════
     @abc.abstractmethod
-    def sleep(self, level: int = 1) -> None: ...
+    def update_lora_weights(self): ...
     @abc.abstractmethod
-    def wake(self) -> None: ...
-    
-    def update_lora_weights(self):
-        """Update LoRA weights. Default implementation calls finalize_weight_update for non-LoRA models."""
-        self.finalize_weight_update()
-    
-    def initialize_lora(self, lora_path: str):
-        """Initialize LoRA adapter. This method should be overridden by subclasses that support LoRA."""
-        pass
-    
-    def create_lora_if_not_present(self, lora_path: str):
-        """Create and initialize LoRA adapter if not already present. This method should be overridden by subclasses."""
-        pass
+    def create_lora_if_not_present(self, lora_path: str): ...
 
     def __init__(
         self, 

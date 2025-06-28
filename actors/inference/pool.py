@@ -219,7 +219,6 @@ class ModelPool:
 
     def finalize_update(self, name: str) -> None:
         rec = self.models[name]
-        self.wake(name)
         results = ray.get([w.finalize_update.remote() for w in rec.workers])
         for status, msg in results:
             if status == "ERROR":
@@ -227,19 +226,9 @@ class ModelPool:
         logger.normal(colorize(f"✅  Updated {name} weights", Palette.SUCCESS))
 
     # ------------- LoRA methods -----------------------------------
-    def initialize_lora(self, name: str, lora_path: str) -> None:
-        rec = self.models[name]
-        results = ray.get(
-            [w.initialize_lora.remote(lora_path) for w in rec.workers]
-        )
-        for status, msg in results:
-            if status == "ERROR":
-                raise RuntimeError(msg)
-        logger.normal(colorize(f"🔧 Initialized LoRA for {name}", Palette.SUCCESS))
 
     def update_lora_weights(self, name: str) -> None:
         rec = self.models[name]
-        self.wake(name)
         results = ray.get([w.update_lora_weights.remote() for w in rec.workers])
         for status, msg in results:
             if status == "ERROR":
@@ -249,11 +238,9 @@ class ModelPool:
     def create_lora_if_not_present(self, name: str, lora_path: str) -> None:
         """Create and initialize LoRA adapter if not already present."""
         rec = self.models[name]
-        self.wake(name)
         results = ray.get(
             [w.create_lora_if_not_present.remote(lora_path) for w in rec.workers]
         )
-        self.sleep(name)
         for status, msg in results:
             if status == "ERROR":
                 raise RuntimeError(msg)
@@ -292,6 +279,8 @@ class ModelPool:
                 lora_int_id=1,
                 lora_local_path='placeholder'
             )
+        if lora_request is DEFAULT_LORA:
+            lora_request = None
         
         shards = self._scatter(payload, rec.workers)
 
@@ -342,6 +331,8 @@ class ModelPool:
                 lora_int_id=1,
                 lora_local_path='placeholder'
             )
+        if lora_request is DEFAULT_LORA:
+            lora_request = None
         
         shards = self._scatter(payload, rec.workers)
 
