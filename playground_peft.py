@@ -24,7 +24,7 @@ def length_reward(completion: str) -> float:
 def main():
     # Create LoRA configuration
     lora_config = LoraConfig(
-        r=512,  # LoRA rank
+        r=64,  # LoRA rank
         lora_alpha=64,  # LoRA scaling parameter
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],  # Target all linear layers
         lora_dropout=0.1,  # LoRA dropout
@@ -35,16 +35,16 @@ def main():
     # Create actor with PEFT configuration
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-1.5B-Instruct",
+        model_path="Qwen/Qwen2.5-3B-Instruct",
         engine_kwargs={
             "gpu_memory_utilization": 0.6,
             "max_model_len": 2048,
-            # "quantization": "fp8"
+            "quantization": "fp8"
         },
         # Training configuration now directly in constructor
         learning_rate=2e-4,  # Higher learning rate for LoRA training
         optimizer="adamw_32bit",  # Using string for convenience
-        loss="grpo",  # Using string for liger loss
+        loss="liger_grpo",  # Using string for liger loss
         loss_kwargs={"beta": 0.0, "temperature": 1.0},
         scheduler="cosine",  # Using string for cosine scheduler
         # PEFT/LoRA configuration
@@ -114,7 +114,7 @@ def main():
         batch_size=64,
         grad_accumulation_steps=4,
         num_iterations=2,
-        reference_batch_size=64,
+        reference_batch_size=4,
         log_every_n=1,
         data=data,
         std_normalization=True,
@@ -125,7 +125,7 @@ def main():
 
     import wandb
 
-    wandb.init(project="test_actors", entity="rd211", name="0.5B-test-lora-training")
+    wandb.init(project="test_actors", entity="rd211", name="3b-lora")
     trainer.train(checkpoint_every_n=30)
     trainer.push_to_hub(
         "rd211/test_actors_lora_main",

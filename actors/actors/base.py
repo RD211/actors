@@ -47,7 +47,7 @@ class TrainingConfig:
 
     def __post_init__(self):
         if self._model_factory is None:
-            self._model_factory = lambda: AutoLigerKernelForCausalLM.from_pretrained(self.model_path, trust_remote_code=True)
+            self._model_factory = lambda: AutoLigerKernelForCausalLM.from_pretrained(self.model_path, trust_remote_code=True, attn_implementation="flash_attention_2")
         if self._optim_factory is None:
             self._optim_factory = lambda p: optim.AdamW(p)
         # When using PEFT, reference model factory should be None since we'll use adapter disabling
@@ -195,7 +195,6 @@ class TrainingConfig:
         return self._reference_model_factory
 
 class TrainableLLMActor(LLMActor):
-    
     @abc.abstractmethod
     def sleep(self, level: int = 1) -> None: ...
     @abc.abstractmethod

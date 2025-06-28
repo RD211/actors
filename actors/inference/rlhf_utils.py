@@ -120,10 +120,8 @@ class ColocateWorkerExtension:
                 if lora_a_key:
                     self.cpu_cache[lora_a_key][i] = self.cpu_cache[lora_a_key][i].unsqueeze(0).unsqueeze(0)
                     loras[lora_key].lora_a_stacked[i].data.copy_(self.cpu_cache[lora_a_key][i])
-                    # loras[lora_key].lora_b_stacked[i].data+= 500
                 if lora_b_key:
                     self.cpu_cache[lora_b_key][i] = self.cpu_cache[lora_b_key][i].unsqueeze(0).unsqueeze(0)
                     loras[lora_key].lora_b_stacked[i].data.copy_(self.cpu_cache[lora_b_key][i])
-                    # loras[lora_key].lora_b_stacked[i].data+= 1000
         # Clean up the cache to free memory
         self.cpu_cache = {}

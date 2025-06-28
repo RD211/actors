@@ -46,7 +46,9 @@ class LigerLoss(BaseRLLoss):
         self.beta: float = beta
         self.loss_type: AllowedLoss = loss_type
 
+
     # ---------------------------------------------------------------- forward
+
     def forward(
         self,
         policy: nn.Module,
@@ -58,11 +60,9 @@ class LigerLoss(BaseRLLoss):
         old_logps: Optional[Tensor] = None, # (B, L-1)
         **_: Dict,
     ) -> Tuple[Tensor, Dict[str, float]]:
-        #TODO: Fix for zero3
         hidden: Tensor = policy.model(
-            input_ids
+            input_ids, attention_mask=attention_mask
         ).last_hidden_state[:, :-1, :]
-
         tgt_ids: Tensor = input_ids[:, 1:]
         mask: Tensor = attention_mask[:, 1:]
         gp = deepspeed.zero.GatheredParameters(
@@ -88,3 +88,4 @@ class LigerLoss(BaseRLLoss):
             kl = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
         return loss, {"kl": kl.item()}
+

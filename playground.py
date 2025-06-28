@@ -30,8 +30,8 @@ def main():
         # Training configuration now directly in constructor
         learning_rate=2e-6,
         optimizer="adamw_8bit",  # Using string for convenience
-        loss="grpo",  # Using string for liger loss
-        loss_kwargs={"beta": 0.04, "temperature": 1.0},
+        loss="liger_grpo",  # Using string for liger loss
+        loss_kwargs={"beta": 0.0, "temperature": 1.0},
         scheduler="cosine",  # Using string for cosine scheduler
         # Offloading configuration now in actor
         offload_model=True,
@@ -102,6 +102,7 @@ def main():
         log_every_n=1,
         data=data,
         std_normalization=True,
+        gradient_checkpointing=True,
         eval_data=eval_data,
         eval_every_n=2,  # Run evaluation every 2 steps
         eval_strategy=EvalStrategy.ALL,  # Run evaluation both periodically and at the end
@@ -109,7 +110,7 @@ def main():
 
     import wandb
 
-    wandb.init(project="test_actors", entity="rd211", name="0.5B-test-full-offloading-ref+activations")
+    wandb.init(project="test_actors", entity="rd211", name="0.5B-no-peft-grad-checkpointing")
     trainer.train(checkpoint_every_n=30)
     trainer.push_to_hub(
         "rd211/test_actors_main",

@@ -31,7 +31,7 @@ from actors.losses.base_loss import BaseRLLoss
 from actors.utils.softmax import _selective_softmax
 from actors.utils.tracker import start_step_profiling, log_step_profiling, _step_profiler, gpu_profiler
 from actors.utils.wandb import is_wandb_active
-from actors.utils.train_utils import disable_dropout_in_model, free_memory
+from actors.utils.train_utils import _ForwardRedirection, disable_dropout_in_model, free_memory
 
 # Import PEFT
 from peft import PeftConfig, get_peft_model
@@ -167,6 +167,7 @@ class Trainer:
         self.use_dashboard = use_dashboard
         self._step = 0
         self._logical_step = 0
+        self._forward_redirection = _ForwardRedirection()
 
         # ─── advantage calculation setup ──────────────────────────────
         if advantage_calculator is not None:
@@ -276,15 +277,12 @@ class Trainer:
         # ═══════════════════════════════════════════════════════════════
         first_actor = next(iter(self.ds_plugins))
         self.accelerators: Dict[str, Accelerator] = {
-            first_actor: Accelerator(
+            actor: Accelerator(
                 mixed_precision="bf16",
-                deepspeed_plugin=self.ds_plugins[first_actor],
+                deepspeed_plugin=self.ds_plugins[actor],
                 kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=10))],
-            )
+            ) for actor in self.ds_plugins
         }
-        for name in self.ds_plugins:
-            if name != first_actor:
-                self.accelerators[name] = Accelerator()  # shares AcceleratorState
 
         # main handle used for cross-actor ops (metrics gather etc.)
         self.main_accel = self.accelerators[first_actor]
@@ -309,7 +307,7 @@ class Trainer:
             accel = self.accelerators[name]
 
             # ── create & optionally checkpoint-enable model ────────────
-            model = actor_obj.model_factory()  # Use the convenient property
+            model = actor_obj.model_factory().train()  # Use the convenient property
             
             # Apply PEFT configuration if available
             if actor_obj.training_config.peft_config is not None:
@@ -323,12 +321,15 @@ class Trainer:
                 # Enable gradient checkpointing
                 if is_peft_model(model):
                     # For PEFT models, apply to base model
-                    model.base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                    model.base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
+                    model.config.use_cache = False
+                    model.enable_input_require_grads()
                     model.base_model.config.use_cache = False
                     model.base_model.enable_input_require_grads()
                 else:
                     # For regular models
-                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+                    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": True})
                     model.config.use_cache = False
                     model.enable_input_require_grads()
             disable_dropout_in_model(model)
@@ -362,7 +363,7 @@ class Trainer:
             optim = actor_obj.training_config.optim_factory(model.parameters())
             # ── wrap with this actor’s accelerator ────────────────────
             model, optim = accel.prepare(model, optim)
-            
+
             # Log activation offloading status
             if actor_obj.offload_activations_to_cpu:
                 self.logger.info(colorize(f"💾 Enabled CPU activation offloading for training model '{name}'", Palette.INFO))
@@ -403,6 +404,8 @@ class Trainer:
 
         # Initialize the lora adapters for all actors
         self._setup_loras()
+
+
     # ------------------------------------------------------------------ #
     # data helpers
     # ------------------------------------------------------------------ #
@@ -524,8 +527,13 @@ class Trainer:
 
             L = input_ids.size(1)
             attn_mask = padded["attention_mask"]
-
-            logits = model(input_ids=input_ids, attention_mask=attn_mask).logits / temperature # (B,L,V)
+            print(f"Shapes: input_ids={input_ids.shape}, attn_mask={attn_mask.shape}, L={L}")
+            with _step_profiler.track("logps_inner"):
+                with torch.no_grad():
+                    logits = model(input_ids=input_ids.to(model.device), 
+                                attention_mask=attn_mask.to(model.device),
+                                use_cache=False
+                    ).logits / temperature # (B,L,V)
             logits = logits[:, :-1, :]  # remove last token logits
             lp = _selective_softmax(logits, input_ids[:, 1:])  # (B,L-1)
 
@@ -1133,23 +1141,21 @@ class Trainer:
         old_lp: Optional[Sequence[Sequence[float]]] = None
         ref_lp: Optional[Sequence[Sequence[float]]] = None
 
-        with torch.no_grad():
-            with _step_profiler.track("get_logps", actor_name=name):
-                old_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, 
-                                        temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
-                
-                # Handle reference logits based on model type
-                if ta.reference_model is not None:
-                    # Traditional separate reference model
-                    ref_lp = self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
-                elif is_peft_model(ta.model):
-                    # PEFT model - disable adapter to get reference logits
-                    with ta.model.disable_adapter():
-                        ref_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
-                else:
-                    # No reference model needed
-                    ref_lp = None
-                
+        with _step_profiler.track("get_logps", actor_name=name):
+            old_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, 
+                                    temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size) if self.num_iterations > 1 else None
+            # Handle reference logits based on model type
+            if ta.reference_model is not None:
+                # Traditional separate reference model
+                ref_lp = self._get_logps(ta.reference_model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
+            elif is_peft_model(ta.model):
+                # PEFT model - disable adapter to get reference logits
+                with ta.model.disable_adapter():
+                    ref_lp = self._get_logps(ta.model, ids_list, ta.tokenizer, temperature=ta.loss_fn.temperature, batch_size=self.reference_batch_size)
+            else:
+                # No reference model needed
+                ref_lp = None
+            
         # iterate over grad-accumulation micro-batches
         for it in range(self.num_iterations):
             # Log backprop iteration in normal mode
@@ -1242,16 +1248,37 @@ class Trainer:
         loss_attention_mask = to_tensor([x[1:] for x in masks]) if masks else None
 
         adv_pt  = torch.tensor(advantages, dtype=torch.float32, device=dev)
+        unwrapped_model = ta.accel.unwrap_model(ta.model)
+        # policy_for_loss = (
+        #     unwrapped_model.base_model.model  # PEFT: use the inner model
+        #     if is_peft_model(ta.model)
+        #     else unwrapped_model              # vanilla model
+        # )
 
-        loss, stats = ta.loss_fn(
-            policy       = ta.accel.unwrap_model(ta.model),
-            input_ids    = ids_pt,
-            attention_mask=attention_mask,
-            loss_attention_mask=loss_attention_mask,
-            advantages   = adv_pt,
-            ref_logps    = ref_lp,
-            old_logps    = old_lp,
-        )
+        with _step_profiler.track("loss_fn", actor_name=ta.name):
+            #TODO: Higher VRAM usage here which is undesirable.
+            # loss, stats = self._forward_redirection(
+            #     ta.model,              # wrapper  (DeepSpeedEngine/FSDP/…)
+            #     unwrapped_model,       # original (torch.nn.Module)
+            #     ta.loss_fn.forward,    # *bound* method of the loss object
+            #     # ---- everything the loss expects --------------------
+            #     policy_for_loss,       # ← first positional arg: `policy`
+            #     ids_pt,
+            #     attention_mask,
+            #     loss_attention_mask,
+            #     adv_pt,
+            #     ref_lp,
+            #     old_lp,
+            # )
+            loss, stats = ta.loss_fn(
+                policy       = unwrapped_model.base_model.model if is_peft_model(ta.model) else unwrapped_model,
+                input_ids    = ids_pt,
+                attention_mask=attention_mask,
+                loss_attention_mask=loss_attention_mask,
+                advantages   = adv_pt,
+                ref_logps    = ref_lp,
+                old_logps    = old_lp,
+            )
         ta.accel.backward(loss)
 
         bucket["loss"].append(loss.item())
