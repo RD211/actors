@@ -45,7 +45,7 @@ def main():
         learning_rate=2e-4,  # Higher learning rate for LoRA training
         optimizer="adamw_32bit",  # Using string for convenience
         loss="liger_grpo",  # Using string for liger loss
-        loss_kwargs={"beta": 0.0, "temperature": 1.0},
+        loss_kwargs={"beta": 0.04, "temperature": 1.0},
         scheduler="cosine",  # Using string for cosine scheduler
         # PEFT/LoRA configuration
         peft_config=lora_config,

@@ -38,10 +38,6 @@ from peft import PeftConfig, get_peft_model
 import shutil
 import tempfile
 
-def is_peft_model(model):
-    """Check if a model is a PEFT model."""
-    return hasattr(model, 'peft_config') and hasattr(model, 'base_model')
-
 # ═════════════════════════════════════════════════════════════════════════════
 @dataclass(frozen=False)
 class InitializedTrainableLLMActor:
@@ -217,33 +213,14 @@ class Trainer:
             name: DeepSpeedPlugin() for name in env.get_trainable_actors().keys()
         }
 
-        # tweak each plugin’s config **after** creation (no base template)
         for name, plug in self.ds_plugins.items():
-            cfg = plug.deepspeed_config                             # default “auto” dict
+            cfg = plug.deepspeed_config
             cfg["max_grad_norm"] = max_grad_norm
             cfg["train_batch_size"] = batch_size
             cfg["gradient_accumulation_steps"] = grad_accumulation_steps
             cfg["train_micro_batch_size_per_gpu"] = (
                 batch_size // grad_accumulation_steps // torch.cuda.device_count()
             )
-            if gradient_checkpointing:
-                activation_config = {
-                    "partition_activations": True,
-                    "contiguous_memory_optimization": True,
-                    "number_checkpoints": 1,
-                    "synchronize_checkpoint_boundary": False,
-                }
-                
-                # Add CPU offloading for activations if enabled for this actor
-                actor = env.get_trainable_actors().get(name)
-                if actor.offload_activations_to_cpu:
-                    activation_config.update({
-                        "cpu_checkpointing": True,
-                        "contiguous_memory_optimization": False,  # Disable when using CPU checkpointing
-                        "synchronize_checkpoint_boundary": True,  # Better for CPU offloading
-                    })
-                
-                cfg.setdefault("activation_checkpointing", activation_config)
 
         # ─── validate offloading compatibility ────────────────────────
         # Check if any actors have offloading enabled
@@ -373,12 +350,7 @@ class Trainer:
                 ref_model.config.use_cache = False  # disable cache for reference model
 
                 ref_model = ref_model.to(dtype=model.dtype)
-                # Use specialized DeepSpeed config for reference model with CPU offloading
-                if actor_obj.offload_reference_to_cpu:
-                    self.logger.info(colorize(f"🔄 Using CPU-offloaded DeepSpeed config for reference model '{name}'", Palette.INFO))
-                    ref_model = prepare_deepspeed_reference(ref_model, accel, use_cpu_offload=True)
-                else:
-                    ref_model = prepare_deepspeed(ref_model, accel)
+                ref_model = prepare_deepspeed(ref_model, accel)
                 disable_dropout_in_model(ref_model)
 
             # ── register ──────────────────────────────────────────────
@@ -527,7 +499,7 @@ class Trainer:
 
             L = input_ids.size(1)
             attn_mask = padded["attention_mask"]
-            print(f"Shapes: input_ids={input_ids.shape}, attn_mask={attn_mask.shape}, L={L}")
+
             with _step_profiler.track("logps_inner"):
                 with torch.no_grad():
                     logits = model(input_ids=input_ids.to(model.device), 
@@ -878,39 +850,38 @@ class Trainer:
                         else f"STEP {self._logical_step:,} • EPOCH {fractional_epoch:.2f}/{epochs} "
                              f"({progress:.1f}%) • ETA: {eta_str}"
                     )
-                    if self.logger.isEnabledFor(QUIET):
-                        self.logger.quiet(colorize(header, Palette.BOLD))
+                    self.logger.quiet(colorize(header, Palette.BOLD))
 
-                        for actor_name, actor_metrics_list in metrics.items():
-                            if not actor_metrics_list or not any(actor_metrics_list):
+                    for actor_name, actor_metrics_list in metrics.items():
+                        if not actor_metrics_list or not any(actor_metrics_list):
+                            continue
+                        self.logger.quiet(colorize(f"   🎭 {actor_name}:", Palette.CYAN))
+                        for iteration_idx, actor_metrics in enumerate(actor_metrics_list):
+                            if not actor_metrics:
                                 continue
-                            self.logger.quiet(colorize(f"   🎭 {actor_name}:", Palette.CYAN))
-                            for iteration_idx, actor_metrics in enumerate(actor_metrics_list):
-                                if not actor_metrics:
+                            indent = "      "
+                            if self.num_iterations > 1:
+                                self.logger.quiet(
+                                    colorize(f"      📊 Iter {iteration_idx+1}:", Palette.YELLOW)
+                                )
+                                indent = "         "
+                            # Include reward component metrics in static set
+                            static = {"completion_len", "reward_mean", "reward_std"}
+                            for metric_name in actor_metrics.keys():
+                                if metric_name.endswith("_mean") or metric_name.endswith("_std"):
+                                    static.add(metric_name)
+                                    
+                            for m, v in actor_metrics.items():
+                                if iteration_idx and m in static:
                                     continue
-                                indent = "      "
-                                if self.num_iterations > 1:
+                                if m == "learning_rate":
                                     self.logger.quiet(
-                                        colorize(f"      📊 Iter {iteration_idx+1}:", Palette.YELLOW)
+                                        colorize(f"{indent}• {m}: {v:.2e}", Palette.CYAN)
                                     )
-                                    indent = "         "
-                                # Include reward component metrics in static set
-                                static = {"completion_len", "reward_mean", "reward_std"}
-                                for metric_name in actor_metrics.keys():
-                                    if metric_name.endswith("_mean") or metric_name.endswith("_std"):
-                                        static.add(metric_name)
-                                        
-                                for m, v in actor_metrics.items():
-                                    if iteration_idx and m in static:
-                                        continue
-                                    if m == "learning_rate":
-                                        self.logger.quiet(
-                                            colorize(f"{indent}• {m}: {v:.2e}", Palette.CYAN)
-                                        )
-                                    else:
-                                        self.logger.quiet(
-                                            colorize(f"{indent}• {m}: {v:.3f}", Palette.CYAN)
-                                        )
+                                else:
+                                    self.logger.quiet(
+                                        colorize(f"{indent}• {m}: {v:.3f}", Palette.CYAN)
+                                    )
                         self.logger.quiet("")
 
                 if self.use_wandb and is_wandb_active() and self.main_accel.is_main_process:
@@ -1044,13 +1015,6 @@ class Trainer:
                     
                     wandb.log({f"completions/{name}_step_{self._logical_step}": table}, step=self._step)
 
-        # warn about unexpected actor keys (once per step, rank==0 only)
-        if self.rank == 0:
-            for k in env_out.actors.keys() - self.actors.keys():
-                logger_method = self.logger.verbose if self.logger.isEnabledFor(VERBOSE) else self.logger.quiet
-                logger_method(colorize(f"env produced data for unknown actor '{k}'",
-                                             Palette.WARNING))
-
         base_metrics: Dict[str, List[float]] = {
             "loss":           [],
             "kl":             [],
@@ -1159,7 +1123,7 @@ class Trainer:
         # iterate over grad-accumulation micro-batches
         for it in range(self.num_iterations):
             # Log backprop iteration in normal mode
-            if self.main_accel.is_main_process and self.logger.isEnabledFor(NORMAL):
+            if self.main_accel.is_main_process:
                 if self.num_iterations > 1:
                     self.logger.normal(colorize(f"🔄 Backwards iter {it+1}/{self.num_iterations} for actor '{name}'", Palette.INFO))
                 else:
@@ -1323,7 +1287,7 @@ class Trainer:
                     offload_optimizer=False,
                     offload_model=True
                 )
-                if self.main_accel.is_main_process and self.logger.isEnabledFor(NORMAL):
+                if self.main_accel.is_main_process:
                     if offload_info["model_offloaded"]:
                         self.logger.normal(colorize(f"💤 Offloaded model", Palette.INFO))
 

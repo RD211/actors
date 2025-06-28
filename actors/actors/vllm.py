@@ -24,7 +24,7 @@ class vLLMActor(TrainableLLMActor):
         learning_rate: float = 5e-6,
         optimizer: str | type | callable = "paged_adamw_8bit",
         optimizer_kwargs: Dict | None = None,
-        loss: str | type | callable = "grpo",
+        loss: str | type | callable = "liger_grpo",
         loss_kwargs: Dict | None = None,
         scheduler: str | type | callable = "cosine",
         scheduler_kwargs: Dict | None = None,

@@ -31,7 +31,7 @@ def main():
         learning_rate=2e-6,
         optimizer="adamw_8bit",  # Using string for convenience
         loss="liger_grpo",  # Using string for liger loss
-        loss_kwargs={"beta": 0.0, "temperature": 1.0},
+        loss_kwargs={"beta": 0.04, "temperature": 1.0},
         scheduler="cosine",  # Using string for cosine scheduler
         # Offloading configuration now in actor
         offload_model=True,
@@ -110,7 +110,7 @@ def main():
 
     import wandb
 
-    wandb.init(project="test_actors", entity="rd211", name="0.5B-no-peft-grad-checkpointing")
+    wandb.init(project="test_actors", entity="rd211", name="0.5B-test-ref-off")
     trainer.train(checkpoint_every_n=30)
     trainer.push_to_hub(
         "rd211/test_actors_main",
