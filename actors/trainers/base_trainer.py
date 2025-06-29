@@ -359,12 +359,6 @@ class BaseRLTrainer:
 
             # Apply PEFT configuration if available
             if actor_obj.training_config.peft_config is not None:
-                self.logger.info(
-                    colorize(
-                        f"🔧 Applying PEFT configuration to actor '{name}'",
-                        Palette.INFO,
-                    )
-                )
                 model = get_peft_model(model, actor_obj.training_config.peft_config).train()
 
             if self.cfg.gradient_checkpointing:
@@ -413,12 +407,6 @@ class BaseRLTrainer:
                 ref_model = None
             else:
                 ref_model = actor_obj.training_config.reference_model_factory().eval()
-                self.logger.normal(
-                    colorize(
-                        f"🔧 Initialized reference model for actor '{name}'",
-                        Palette.INFO,
-                    )
-                )
 
                 ref_model.requires_grad_(False)
                 ref_model.config.use_cache = False
@@ -447,28 +435,18 @@ class BaseRLTrainer:
 
             # We offload the model and optimizer if requested
             if actor_obj.offload_optimizer or actor_obj.offload_model:
-                self.logger.info(
-                    colorize(
-                        f"🔄 Offloading model and optimizer for actor '{name}'",
-                        Palette.INFO,
-                    )
-                )
                 offload_model_and_optimizer(
                     actors[name].model,
                     actors[name].optim,
                     offload_optimizer=actor_obj.offload_optimizer,
                     offload_model=actor_obj.offload_model,
                 )
-                self.logger.info(
-                    colorize(
-                        f"✅ Offloaded model and optimizer for actor '{name}'",
-                        Palette.SUCCESS,
-                    )
-                )
 
         return actors
 
     def _setup_loras(self) -> str:
+        #TODO: If not loras. there is no need to do all of this.
+        os.makedirs(self.cfg.checkpoint_path, exist_ok=True)
 
         if self.accel.is_main_process:
             temp_dir = tempfile.mkdtemp(
@@ -585,128 +563,125 @@ class BaseRLTrainer:
         steps_per_epoch = len(dataloader)
         
         while True:
-            # Process remaining batches in current epoch
-            while self.env.batches_left(self.batch_size // self.group_size) > 0:
-                if self.cfg.max_steps is not None and self._step >= self.cfg.max_steps:
-                    self.logger.normal(
-                        colorize(
-                            f"🏁 Reached max steps {self.cfg.max_steps:,}, stopping training.",
-                            Palette.INFO,
-                        )
+            if self.cfg.max_steps is not None and self._step >= self.cfg.max_steps:
+                self.logger.normal(
+                    colorize(
+                        f"🏁 Reached max steps {self.cfg.max_steps:,}, stopping training.",
+                        Palette.INFO,
                     )
+                )
+                break
+                
+            if self.cfg.max_steps is None:
+                current_epoch = self.env.get_data_state()["epoch"]
+                if current_epoch >= self.cfg.epochs:
+                    break
+                    
+                if self.env.batches_left(self.batch_size // self.group_size) == 0:
                     break
 
-                self._step += 1
+            self._step += 1
 
-                start_step_profiling()
-                with _step_profiler.track(
-                    "full_train_step", no_memory_measurement=True
-                ):
-                    try:
-                        env_output = self.env(batch_size=self.batch_size // self.group_size, group_size=self.group_size)
-                        result = self.train_step(env_output)
-                    except StopIteration:
-                        break
-                        
-                log_step_profiling(
-                    self._substep, self.accel, use_wandb=self.cfg.use_wandb
-                )
+            start_step_profiling()
+            with _step_profiler.track(
+                "full_train_step", no_memory_measurement=True
+            ):
+                try:
+                    env_output = self.env(batch_size=self.batch_size // self.group_size, group_size=self.group_size)
+                    result = self.train_step(env_output)
+                except StopIteration:
+                    break
+                    
+            log_step_profiling(
+                self._substep, self.accel, use_wandb=self.cfg.use_wandb
+            )
 
-                # Handle TrainingMetrics result
-                metrics = result.get_combined_metrics()
-                
-                if self._step % self.log_every_n == 0:
-                    self.log_training_metrics(metrics)
-                    for actor_name, completion_data in result.completions.items():
-                        if completion_data:
-                            # Put environment fields first, then completion fields
-                            enhanced_completion_data = {}
-                            
-                            # Add environment fields first
-                            if env_output.problems:
-                                completion_length = len(next(iter(completion_data.values())))
-                                
-                                for key in env_output.problems[0].keys():
-                                    enhanced_completion_data[key] = []
-                                    for problem in env_output.problems:
-                                        for _ in range(completion_length // len(env_output.problems)):
-                                            enhanced_completion_data[key].append(problem[key])
-                            
-                            # Add completion fields after environment fields
-                            enhanced_completion_data.update(completion_data)
-                            
-                            self.log_completions(
-                                enhanced_completion_data, prefix=f"completions/{actor_name}"
-                            )
-
-                if (
-                    self.cfg.save_strategy in {SaveStrategy.STEPS, SaveStrategy.ALL}
-                    and self.cfg.checkpoint_every_n
-                    and self._step % self.cfg.checkpoint_every_n == 0
-                ):
-                    path = os.path.join(run_checkpoint_path, f"step_{self._step}")
-                    if self.accel.is_main_process:
-                        self.logger.quiet(
-                            colorize(
-                                f"💾 Checkpoint saved: step_{self._step}",
-                                Palette.VERB,
-                            )
-                        )
-                    self.save_checkpoint(path)
-
-                    if (
-                        self.accel.is_main_process
-                        and self.cfg.max_checkpoints_to_keep is not None
-                    ):
-                        checkpoints = [
-                            d
-                            for d in os.listdir(run_checkpoint_path)
-                            if d.startswith("step_")
-                            and os.path.isdir(os.path.join(run_checkpoint_path, d))
-                        ]
-                        if len(checkpoints) > self.cfg.max_checkpoints_to_keep:
-                            checkpoints.sort(key=lambda x: int(x.split("_")[1]))
-                            for c in checkpoints[: -self.cfg.max_checkpoints_to_keep]:
-                                shutil.rmtree(os.path.join(run_checkpoint_path, c))
-
-                if self.accel.is_main_process and self._step % self.log_every_n == 0:
-                    progress = (
-                        total_steps * self.num_iterations / self.total_expected_steps
-                    ) * 100
-                    eta_str = "N/A"
-                    if total_steps:
-                        elapsed = time.time() - start_time
-                        eta_seconds = (
-                            elapsed
-                            / total_steps
-                            * (self.total_expected_steps - total_steps)
-                        )
-                        eta_str = str(timedelta(seconds=int(eta_seconds)))
-
-                    current_data_state = self.env.get_data_state()
-                    fractional_epoch = current_data_state["epoch"] + (current_data_state["step_in_epoch"] / steps_per_epoch)
-                    header = (
-                        f"STEP {self._step:,}/{self.cfg.max_steps:,} ({progress:.1f}%) • ETA: {eta_str}"
-                        if self.cfg.max_steps
-                        else f"STEP {self._step:,} • EPOCH {fractional_epoch:.2f}/{self.cfg.epochs} "
-                        f"({progress:.1f}%) • ETA: {eta_str}"
-                    )
-                    self.logger.quiet(colorize(header, Palette.BOLD))
-
-                if (
-                    self.env.eval_datasets
-                    and self.eval_strategy in {EvalStrategy.STEPS, EvalStrategy.ALL}
-                    and self.eval_every_n is not None
-                    and self._step % self.eval_every_n == 0
-                ):
-                    self.evaluate(is_final=False)
-                
-                total_steps += 1
+            metrics = result.get_combined_metrics()
             
-            # Check if we should stop based on epochs
-            current_epoch = self.env.get_data_state()["epoch"]
-            if current_epoch >= self.cfg.epochs:
-                break
+            if self._step % self.log_every_n == 0:
+                self.log_training_metrics(metrics)
+                for actor_name, completion_data in result.completions.items():
+                    if completion_data:
+                        enhanced_completion_data = {}
+                        
+                        if env_output.problems:
+                            completion_length = len(next(iter(completion_data.values())))
+                            
+                            for key in env_output.problems[0].keys():
+                                enhanced_completion_data[key] = []
+                                for problem in env_output.problems:
+                                    for _ in range(completion_length // len(env_output.problems)):
+                                        enhanced_completion_data[key].append(problem[key])
+                        
+                        enhanced_completion_data.update(completion_data)
+                        
+                        self.log_completions(
+                            enhanced_completion_data, prefix=f"completions/{actor_name}"
+                        )
+
+            if (
+                self.cfg.save_strategy in {SaveStrategy.STEPS, SaveStrategy.ALL}
+                and self.cfg.checkpoint_every_n
+                and self._step % self.cfg.checkpoint_every_n == 0
+            ):
+                path = os.path.join(run_checkpoint_path, f"step_{self._step}")
+                if self.accel.is_main_process:
+                    self.logger.quiet(
+                        colorize(
+                            f"💾 Checkpoint saved: step_{self._step}",
+                            Palette.VERB,
+                        )
+                    )
+                self.save_checkpoint(path)
+
+                if (
+                    self.accel.is_main_process
+                    and self.cfg.max_checkpoints_to_keep is not None
+                ):
+                    checkpoints = [
+                        d
+                        for d in os.listdir(run_checkpoint_path)
+                        if d.startswith("step_")
+                        and os.path.isdir(os.path.join(run_checkpoint_path, d))
+                    ]
+                    if len(checkpoints) > self.cfg.max_checkpoints_to_keep:
+                        checkpoints.sort(key=lambda x: int(x.split("_")[1]))
+                        for c in checkpoints[: -self.cfg.max_checkpoints_to_keep]:
+                            shutil.rmtree(os.path.join(run_checkpoint_path, c))
+
+            if self.accel.is_main_process and self._step % self.log_every_n == 0:
+                progress = (
+                    total_steps * self.num_iterations / self.total_expected_steps
+                ) * 100
+                eta_str = "N/A"
+                if total_steps:
+                    elapsed = time.time() - start_time
+                    eta_seconds = (
+                        elapsed
+                        / total_steps
+                        * (self.total_expected_steps - total_steps)
+                    )
+                    eta_str = str(timedelta(seconds=int(eta_seconds)))
+
+                current_data_state = self.env.get_data_state()
+                fractional_epoch = current_data_state["epoch"] + (current_data_state["step_in_epoch"] / steps_per_epoch)
+                header = (
+                    f"STEP {self._step:,}/{self.cfg.max_steps:,} ({progress:.1f}%) • ETA: {eta_str}"
+                    if self.cfg.max_steps
+                    else f"STEP {self._step:,} • EPOCH {fractional_epoch:.2f}/{self.cfg.epochs} "
+                    f"({progress:.1f}%) • ETA: {eta_str}"
+                )
+                self.logger.quiet(colorize(header, Palette.BOLD))
+
+            if (
+                self.env.eval_datasets
+                and self.eval_strategy in {EvalStrategy.STEPS, EvalStrategy.ALL}
+                and self.eval_every_n is not None
+                and self._step % self.eval_every_n == 0
+            ):
+                self.evaluate(is_final=False)
+            
+            total_steps += 1
 
         if self.env.eval_datasets and self.eval_strategy in {
             EvalStrategy.FINAL,
@@ -754,8 +729,96 @@ class BaseRLTrainer:
         return all_eval_metrics
 
     def eval_step(self, env_output: GroupedEnvironmentOutput) -> EvaluationMetrics:
-        """Eval step that takes GroupedEnvironmentOutput directly."""
-        raise NotImplementedError("eval_step must be implemented in subclasses.")
+        """Generic eval step implementation."""
+        result = EvaluationMetrics()
+
+        flat_output = env_output.to_environment_output()
+
+        for actor_name, actor_output in flat_output.actors.items():
+            if actor_name not in self.actors:
+                continue
+
+            ta = self.actors[actor_name]
+
+            metrics = self._compute_actor_eval_metrics(actor_output)
+            result.add_actor_metrics(actor_name, metrics)
+
+            completion_data = self._build_completion_data(ta, actor_output, is_eval=True)
+            result.add_completion_data(actor_name, completion_data)
+
+        return result
+
+    def _compute_actor_eval_metrics(self, actor_output: "ActorOutput") -> Dict[str, float]:
+        """Compute evaluation metrics for an actor output."""
+        rewards = actor_output.rewards
+        reward_mean = sum(rewards) / len(rewards) if rewards else 0.0
+        reward_std = (
+            (sum((r - reward_mean) ** 2 for r in rewards) / len(rewards)) ** 0.5
+            if len(rewards) > 1
+            else 0.0
+        )
+
+        completion_lens = [len(ids) for ids in actor_output.input_ids]
+        completion_len_mean = (
+            sum(completion_lens) / len(completion_lens) if completion_lens else 0.0
+        )
+
+        metrics = {
+            "reward_mean": reward_mean,
+            "reward_std": reward_std,
+            "completion_len_mean": completion_len_mean,
+        }
+
+        if actor_output.reward_components:
+            for comp_name, comp_rewards in actor_output.reward_components.items():
+                comp_mean = (
+                    sum(comp_rewards) / len(comp_rewards) if comp_rewards else 0.0
+                )
+                comp_std = (
+                    (
+                        sum((r - comp_mean) ** 2 for r in comp_rewards)
+                        / len(comp_rewards)
+                    )
+                    ** 0.5
+                    if len(comp_rewards) > 1
+                    else 0.0
+                )
+                metrics[f"{comp_name}_mean"] = comp_mean
+                metrics[f"{comp_name}_std"] = comp_std
+
+        return metrics
+
+    def _build_completion_data(
+        self,
+        ta: InitializedTrainableLLMActor,
+        actor_output: "ActorOutput",
+        is_eval: bool = False,
+    ) -> Dict[str, List[Any]]:
+        """Build completion data for logging. Works for both training and eval."""
+        data = {}
+        
+        data["completion"] = [
+            ta.tokenizer.decode(completion_ids, skip_special_tokens=False)
+            for completion_ids in actor_output.input_ids
+        ]
+
+        data["total_reward"] = actor_output.rewards
+
+        # Add advantages only for training
+        if not is_eval and hasattr(self, "_calculate_advantages"):
+            advantages = self._calculate_advantages(
+                actor_output.rewards,
+                self.group_size,
+                actor_output.ended_in_eos,
+            )
+            data["advantage"] = advantages
+
+        # Add reward components if available
+        if actor_output.reward_components:
+            for comp_name, comp_values in actor_output.reward_components.items():
+                data[comp_name] = comp_values
+
+        return data
 
     # ═══════════════════════════════════════════════════════════════════════
     # Checkpointing & Uploading methods
@@ -1055,11 +1118,9 @@ class BaseRLTrainer:
         if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
             import wandb
 
-            # Validate data structure
             if not data:
                 return
 
-            # Get length from first non-empty list
             data_length = None
             for values in data.values():
                 if isinstance(values, list) and values:
@@ -1069,7 +1130,6 @@ class BaseRLTrainer:
             if data_length is None:
                 return
 
-            # Validate all lists have same length
             for key, values in data.items():
                 if not isinstance(values, list) or len(values) != data_length:
                     self.logger.warning(
@@ -1090,7 +1150,6 @@ class BaseRLTrainer:
             )
 
     def log_training_metrics(self, metrics: Dict[str, List[Dict[str, float]]]):
-        # Console logging
         if self.accel.is_main_process and self._step % self.log_every_n == 0:
             for actor_name, actor_metrics_list in metrics.items():
                 if not actor_metrics_list or not any(actor_metrics_list):
@@ -1109,7 +1168,6 @@ class BaseRLTrainer:
                         )
                         indent = "         "
 
-                    # Determine which metrics are "static" (only log once across iterations)
                     static_metrics = set()
                     for metric_name in actor_metrics.keys():
                         if any(
@@ -1131,11 +1189,9 @@ class BaseRLTrainer:
                             )
                     self.logger.quiet("")
 
-        # Wandb logging
         if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
             import wandb
 
-            # Determine static metrics from all actors
             static_metrics = set()
             for actor_metrics_list in metrics.values():
                 if actor_metrics_list:
@@ -1165,7 +1221,6 @@ class BaseRLTrainer:
     def log_evaluation_metrics(
         self, eval_name: str, metrics: "EvaluationMetrics", env_output: GroupedEnvironmentOutput, is_final: bool = False
     ):
-        # Console logging
         if self.accel.is_main_process:
             self.logger.quiet(
                 colorize(f"📊 Evaluation Results for '{eval_name}':", Palette.BOLD)
@@ -1178,11 +1233,9 @@ class BaseRLTrainer:
                     )
             self.logger.quiet("")
 
-        # Wandb logging
         if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
             import wandb
 
-            # Log evaluation metrics
             for actor_name, actor_metrics in metrics.metrics.items():
                 for metric_name, value in actor_metrics.items():
                     wandb.log(
@@ -1190,13 +1243,10 @@ class BaseRLTrainer:
                         step=self._substep,
                     )
 
-            # Log completion tables
             for actor_name, completion_data in metrics.completions.items():
                 if completion_data:
-                    # Put environment fields first, then completion fields
                     enhanced_completion_data = {}
                     
-                    # Add environment fields first
                     if env_output.problems:
                         completion_length = len(next(iter(completion_data.values())))
                         
@@ -1206,7 +1256,6 @@ class BaseRLTrainer:
                                 for _ in range(completion_length // len(env_output.problems)):
                                     enhanced_completion_data[key].append(problem[key])
                     
-                    # Add completion fields after environment fields
                     enhanced_completion_data.update(completion_data)
                     
                     columns = list(enhanced_completion_data.keys())

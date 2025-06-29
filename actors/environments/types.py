@@ -1,6 +1,7 @@
 """
 Type definitions for environment outputs with support for multiple reward types.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Union
@@ -11,7 +12,7 @@ import torch
 class ActorOutput:
     """
     Type-safe output for a single actor from an environment step.
-    
+
     Attributes:
         input_ids: List of token sequences for generated text
         attention_mask: Attention masks corresponding to input_ids
@@ -20,30 +21,36 @@ class ActorOutput:
         ended_in_eos: Optional list indicating if each sequence ended with an EOS token. If not provided, it is assumed all sequences ended in EOS.
         metadata: Optional metadata about the generation
     """
+
     input_ids: List[List[int]]
     attention_mask: List[List[int]]
     rewards: List[float]
     reward_components: Optional[Dict[str, List[float]]] = None
     ended_in_eos: List[bool] = None
     metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
-    
+
     def __post_init__(self):
         """Validate that all lists have consistent lengths."""
         lengths = [len(self.input_ids), len(self.attention_mask), len(self.rewards)]
         if self.reward_components:
             for name, values in self.reward_components.items():
                 lengths.append(len(values))
-        
+
         if not all(length == lengths[0] for length in lengths):
             raise ValueError(
                 f"Inconsistent lengths in ActorOutput: "
                 f"input_ids={len(self.input_ids)}, attention_mask={len(self.attention_mask)}, "
                 f"rewards={len(self.rewards)}"
-                + (f", reward_components={[(name, len(values)) for name, values in self.reward_components.items()]}" 
-                   if self.reward_components else "")
+                + (
+                    f", reward_components={[(name, len(values)) for name, values in self.reward_components.items()]}"
+                    if self.reward_components
+                    else ""
+                )
             )
         # verify that if ended_in_eos is provided, it matches the length of input_ids
-        if self.ended_in_eos is not None and len(self.ended_in_eos) != len(self.input_ids):
+        if self.ended_in_eos is not None and len(self.ended_in_eos) != len(
+            self.input_ids
+        ):
             raise ValueError(
                 f"ended_in_eos length {len(self.ended_in_eos)} does not match input_ids length {len(self.input_ids)}"
             )
@@ -55,21 +62,23 @@ class ActorOutput:
             raise ValueError("input_ids contains an empty sequence")
         if any(len(seq) == 0 for seq in self.attention_mask):
             raise ValueError("attention_mask contains an empty sequence")
-    
-    def get_total_reward(self, weights: Optional[Dict[str, float]] = None) -> List[float]:
+
+    def get_total_reward(
+        self, weights: Optional[Dict[str, float]] = None
+    ) -> List[float]:
         """
         Compute total reward as weighted sum of components.
-        
+
         Args:
             weights: Dictionary mapping reward component names to weights.
                     If None, uses only the primary rewards.
-        
+
         Returns:
             List of total reward values
         """
         if weights is None or self.reward_components is None:
             return self.rewards.copy()
-        
+
         total_rewards = []
         for i in range(len(self.rewards)):
             total = self.rewards[i]
@@ -77,20 +86,21 @@ class ActorOutput:
                 if component_name in self.reward_components:
                     total += weight * self.reward_components[component_name][i]
             total_rewards.append(total)
-        
+
         return total_rewards
-    
+
     def get_reward_stats(self) -> Dict[str, Dict[str, float]]:
         """
         Get statistics for all reward types.
-        
+
         Returns:
             Dictionary mapping reward names to their statistics (mean, std, min, max)
         """
+
         def compute_stats(values: List[float]) -> Dict[str, float]:
             if not values:
                 return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
-            
+
             tensor_vals = torch.tensor(values, dtype=torch.float32)
             return {
                 "mean": tensor_vals.mean().item(),
@@ -98,31 +108,32 @@ class ActorOutput:
                 "min": tensor_vals.min().item(),
                 "max": tensor_vals.max().item(),
             }
-        
+
         stats = {"primary": compute_stats(self.rewards)}
-        
+
         if self.reward_components:
             for name, values in self.reward_components.items():
                 stats[name] = compute_stats(values)
-        
+
         return stats
 
 
-@dataclass 
+@dataclass
 class EnvironmentOutput:
     """
     Type-safe output from an environment step containing outputs for all actors.
-    
+
     Attributes:
         actors: Dictionary mapping actor names to their outputs
         global_metadata: Optional metadata about the environment step
     """
+
     actors: Dict[str, ActorOutput]
     global_metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate that all actor outputs have consistent structure."""
-        
+
         # We need to check that all actors have the same lengths for input_ids, attention_mask, and rewards
         if not self.actors:
             raise ValueError("EnvironmentOutput must contain at least one actor output")
@@ -135,20 +146,22 @@ class EnvironmentOutput:
                     "rewards": len(actor_output.rewards),
                 }
             else:
-                if (len(actor_output.input_ids) != lengths["input_ids"] or
-                    len(actor_output.attention_mask) != lengths["attention_mask"] or
-                    len(actor_output.rewards) != lengths["rewards"]):
+                if (
+                    len(actor_output.input_ids) != lengths["input_ids"]
+                    or len(actor_output.attention_mask) != lengths["attention_mask"]
+                    or len(actor_output.rewards) != lengths["rewards"]
+                ):
                     raise ValueError(
                         f"Inconsistent lengths in actor '{actor_name}': "
                         f"input_ids={len(actor_output.input_ids)}, "
                         f"attention_mask={len(actor_output.attention_mask)}, "
                         f"rewards={len(actor_output.rewards)}"
                     )
-    
+
     def to_dict(self) -> Dict[str, Dict[str, Any]]:
         """
         Convert to dictionary format for backward compatibility.
-        
+
         Returns:
             Dictionary in the format expected by the current trainer
         """
@@ -156,24 +169,24 @@ class EnvironmentOutput:
         for actor_name, actor_output in self.actors.items():
             result[actor_name] = {
                 "input_ids": actor_output.input_ids,
-                "attention_mask": actor_output.attention_mask, 
+                "attention_mask": actor_output.attention_mask,
                 "rewards": actor_output.rewards,
             }
             if actor_output.reward_components:
                 result[actor_name]["reward_components"] = actor_output.reward_components
             if actor_output.metadata:
                 result[actor_name]["metadata"] = actor_output.metadata
-        
+
         return result
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Dict[str, Any]]) -> EnvironmentOutput:
         """
         Create EnvironmentOutput from dictionary format.
-        
+
         Args:
             data: Dictionary in the format returned by current environments
-            
+
         Returns:
             EnvironmentOutput instance
         """
@@ -183,19 +196,19 @@ class EnvironmentOutput:
             input_ids = actor_data["input_ids"]
             attention_mask = actor_data["attention_mask"]
             rewards = actor_data["rewards"]
-            
+
             # Extract optional fields
             reward_components = actor_data.get("reward_components")
             metadata = actor_data.get("metadata", {})
-            
+
             actors[actor_name] = ActorOutput(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 rewards=rewards,
                 reward_components=reward_components,
-                metadata=metadata
+                metadata=metadata,
             )
-        
+
         return cls(actors=actors)
 
 
@@ -203,29 +216,30 @@ class EnvironmentOutput:
 class GroupedEnvironmentOutput:
     """
     Environment output organized by problems and groups.
-    
+
     This organizes the outputs by problems (unique inputs) and groups (multiple generations per problem).
-    
+
     Attributes:
         problems: List of unique problem inputs
         groups: Dictionary mapping actor names to their grouped outputs
                 Format: {actor_name: [[group1_for_problem1], [group2_for_problem1], ...]}
         group_size: Number of generations per problem
     """
+
     problems: List[Dict[str, Any]]
     groups: Dict[str, List[List[ActorOutput]]]
     group_size: int
-    
+
     @classmethod
     def from_environment_output(
-        cls, 
-        env_output: EnvironmentOutput, 
-        original_batch: List[Dict[str, Any]], 
-        group_size: int
+        cls,
+        env_output: EnvironmentOutput,
+        original_batch: List[Dict[str, Any]],
+        group_size: int,
     ) -> "GroupedEnvironmentOutput":
         """
         Create GroupedEnvironmentOutput from regular EnvironmentOutput.
-        
+
         Args:
             env_output: Original environment output
             original_batch: The original problems before group expansion
@@ -233,14 +247,14 @@ class GroupedEnvironmentOutput:
         """
         problems = original_batch
         groups = {}
-        
+
         for actor_name, actor_output in env_output.actors.items():
             actor_groups = []
-            
+
             # Reshape the flat actor output into groups
             total_outputs = len(actor_output.input_ids)
             num_problems = total_outputs // group_size
-            
+
             for problem_idx in range(num_problems):
                 group_outputs = []
                 for group_idx in range(group_size):
@@ -250,29 +264,37 @@ class GroupedEnvironmentOutput:
                             input_ids=[actor_output.input_ids[flat_idx]],
                             attention_mask=[actor_output.attention_mask[flat_idx]],
                             rewards=[actor_output.rewards[flat_idx]],
-                            reward_components={
-                                comp_name: [comp_values[flat_idx]]
-                                for comp_name, comp_values in actor_output.reward_components.items()
-                            } if actor_output.reward_components else None,
-                            ended_in_eos=[actor_output.ended_in_eos[flat_idx]] if actor_output.ended_in_eos else None,
-                            metadata=actor_output.metadata
+                            reward_components=(
+                                {
+                                    comp_name: [comp_values[flat_idx]]
+                                    for comp_name, comp_values in actor_output.reward_components.items()
+                                }
+                                if actor_output.reward_components
+                                else None
+                            ),
+                            ended_in_eos=(
+                                [actor_output.ended_in_eos[flat_idx]]
+                                if actor_output.ended_in_eos
+                                else None
+                            ),
+                            metadata=actor_output.metadata,
                         )
                         group_outputs.append(group_output)
-                
+
                 actor_groups.append(group_outputs)
-            
+
             groups[actor_name] = actor_groups
-        
+
         return cls(
             problems=problems,
             groups=groups,
             group_size=group_size,
         )
-    
+
     def to_environment_output(self) -> EnvironmentOutput:
         """Convert back to regular EnvironmentOutput by flattening groups."""
         actors = {}
-        
+
         for actor_name, actor_groups in self.groups.items():
             # Flatten the grouped outputs back to a single actor output
             all_input_ids = []
@@ -280,29 +302,37 @@ class GroupedEnvironmentOutput:
             all_rewards = []
             all_reward_components = {}
             all_ended_in_eos = []
-            
+
             for problem_groups in actor_groups:
                 for group_output in problem_groups:
                     all_input_ids.extend(group_output.input_ids)
                     all_attention_mask.extend(group_output.attention_mask)
                     all_rewards.extend(group_output.rewards)
-                    all_ended_in_eos.extend(group_output.ended_in_eos or [True] * len(group_output.input_ids))
-                    
+                    all_ended_in_eos.extend(
+                        group_output.ended_in_eos
+                        or [True] * len(group_output.input_ids)
+                    )
+
                     if group_output.reward_components:
-                        for comp_name, comp_values in group_output.reward_components.items():
+                        for (
+                            comp_name,
+                            comp_values,
+                        ) in group_output.reward_components.items():
                             if comp_name not in all_reward_components:
                                 all_reward_components[comp_name] = []
                             all_reward_components[comp_name].extend(comp_values)
-            
+
             actors[actor_name] = ActorOutput(
                 input_ids=all_input_ids,
                 attention_mask=all_attention_mask,
                 rewards=all_rewards,
-                reward_components=all_reward_components if all_reward_components else None,
+                reward_components=(
+                    all_reward_components if all_reward_components else None
+                ),
                 ended_in_eos=all_ended_in_eos,
-                metadata={}
+                metadata={},
             )
-        
+
         return EnvironmentOutput(actors=actors)
 
 

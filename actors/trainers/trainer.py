@@ -42,28 +42,9 @@ class GRPOTrainerCfg(TrainerCfg):
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-def expand_batch(batch: Dict[str, List[Any]], group_size: int) -> Dict[str, List[Any]]:
-    if not isinstance(batch, dict):
-        raise ValueError("batch must be a dictionary")
-    return {
-        k: [item for item in v for _ in range(group_size)] for k, v in batch.items()
-    }
-
-
 def split_for_grad_accum(seq: Sequence[Any], steps: int) -> List[Sequence[Any]]:
     stride = len(seq) // steps
     return [seq[i * stride : (i + 1) * stride] for i in range(steps)]
-
-
-def norm_advantages(rewards: List[float], group_size: int) -> List[float]:
-    out: List[float] = []
-    for i in range(0, len(rewards), group_size):
-        grp = rewards[i : i + group_size]
-        µ = sum(grp) / len(grp)
-        σ = (sum((x - µ) ** 2 for x in grp) / len(grp)) ** 0.5 + 1e-8
-        out.extend([(r - µ) / σ for r in grp])
-    return out
-
 
 def default_advantage_calculator(
     rewards: List[float],
@@ -144,87 +125,6 @@ class GRPOTrainer(BaseRLTrainer):
                         rewards, group_size, ended_in_eos, True
                     )
 
-    def eval_step(self, env_output: GroupedEnvironmentOutput) -> EvaluationMetrics:
-
-        result = EvaluationMetrics()
-
-        flat_output = env_output.to_environment_output()
-
-        for actor_name, actor_output in flat_output.actors.items():
-            if actor_name not in self.actors:
-                continue
-
-            ta = self.actors[actor_name]
-
-            metrics = self._compute_actor_eval_metrics(actor_output)
-            result.add_actor_metrics(actor_name, metrics)
-
-            completion_data = self._build_eval_completion_data(
-                ta, actor_output
-            )
-            result.add_completion_data(actor_name, completion_data)
-
-        return result
-
-    def _build_eval_completion_data(
-        self,
-        ta: InitializedTrainableLLMActor,
-        actor_output: ActorOutput,
-    ) -> Dict[str, List[Any]]:
-        data = {}
-        data["completion"] = [
-            ta.tokenizer.decode(completion_ids, skip_special_tokens=False)
-            for completion_ids in actor_output.input_ids
-        ]
-
-        data["total_reward"] = actor_output.rewards
-
-        if actor_output.reward_components:
-            for comp_name, comp_values in actor_output.reward_components.items():
-                data[comp_name] = comp_values
-
-        return data
-
-    def _compute_actor_eval_metrics(
-        self, actor_output: ActorOutput
-    ) -> Dict[str, float]:
-        rewards = actor_output.rewards
-        reward_mean = sum(rewards) / len(rewards) if rewards else 0.0
-        reward_std = (
-            (sum((r - reward_mean) ** 2 for r in rewards) / len(rewards)) ** 0.5
-            if len(rewards) > 1
-            else 0.0
-        )
-
-        completion_lens = [len(ids) for ids in actor_output.input_ids]
-        completion_len_mean = (
-            sum(completion_lens) / len(completion_lens) if completion_lens else 0.0
-        )
-
-        metrics = {
-            "reward_mean": reward_mean,
-            "reward_std": reward_std,
-            "completion_len_mean": completion_len_mean,
-        }
-
-        if actor_output.reward_components:
-            for comp_name, comp_rewards in actor_output.reward_components.items():
-                comp_mean = (
-                    sum(comp_rewards) / len(comp_rewards) if comp_rewards else 0.0
-                )
-                comp_std = (
-                    (
-                        sum((r - comp_mean) ** 2 for r in comp_rewards)
-                        / len(comp_rewards)
-                    )
-                    ** 0.5
-                    if len(comp_rewards) > 1
-                    else 0.0
-                )
-                metrics[f"{comp_name}_mean"] = comp_mean
-                metrics[f"{comp_name}_std"] = comp_std
-
-        return metrics
 
     def train_step(self, env_output: GroupedEnvironmentOutput) -> TrainingMetrics:
 
@@ -236,21 +136,17 @@ class GRPOTrainer(BaseRLTrainer):
 
             ta = self.actors[actor_name]
 
-            # Build completion data from the flattened output (contains all elements)
             flat_output = env_output.to_environment_output().actors[actor_name]
-            completion_data = self._build_completion_data(
-                ta, flat_output
-            )
+            completion_data = self._build_completion_data(ta, flat_output, is_eval=False)
             result.add_completion_data(actor_name, completion_data)
 
             self._process_actor_step(actor_name, ta, flat_output, result)
 
         return result
+    
 
-    # ------------------------------------------------------------------ #
-    # internal – per-actor handling
-    # ------------------------------------------------------------------ #
 
+    
     def _process_actor_step(
         self,
         name: str,
@@ -273,6 +169,7 @@ class GRPOTrainer(BaseRLTrainer):
 
         ids_list = actor_output.input_ids
         mask_list = actor_output.attention_mask
+        
 
         assert (
             len(ids_list) == len(mask_list) == len(total_rewards) == len(advantages)
@@ -388,6 +285,11 @@ class GRPOTrainer(BaseRLTrainer):
         # Track actor weight update
         self._update_actor_weights(ta)
 
+        if ta.actor.offload_model:
+            offload_model_and_optimizer(
+                ta.model, ta.optim, offload_optimizer=False, offload_model=True
+            )
+
     def _backward_one_slice(
         self,
         ta: InitializedTrainableLLMActor,
@@ -466,35 +368,3 @@ class GRPOTrainer(BaseRLTrainer):
             "completion_len",
             attention_mask[:, 1:].sum(-1).float().mean().item(),
         )
-
-
-    def _build_completion_data(
-        self,
-        ta: InitializedTrainableLLMActor,
-        actor_output,
-    ) -> Dict[str, List[Any]]:
-        completions_ids = actor_output.input_ids
-        total_rewards = actor_output.rewards
-
-        data = {}
-
-        data["completion"] = [
-            ta.tokenizer.decode(completion_ids, skip_special_tokens=False)
-            for completion_ids in completions_ids
-        ]
-
-        data["total_reward"] = total_rewards
-
-        if hasattr(self, "_calculate_advantages"):
-            advantages = self._calculate_advantages(
-                total_rewards,
-                self.group_size,
-                actor_output.ended_in_eos,
-            )
-            data["advantage"] = advantages
-
-        if actor_output.reward_components:
-            for comp_name, comp_values in actor_output.reward_components.items():
-                data[comp_name] = comp_values
-
-        return data

@@ -38,8 +38,6 @@ def main():
         # Offloading configuration now in actor
         offload_model=True,
         offload_optimizer=True,
-        offload_reference_to_cpu=True,  # Enable aggressive CPU offloading for reference model
-        offload_activations_to_cpu=False,  # Enable CPU activation offloading for training model
     )
     tokenizer = actor.tokenizer
 
@@ -54,7 +52,7 @@ def main():
         {"text": "Who wrote 'To Kill a Mockingbird'?"},
         {"text": "What is the speed of light?"},
         {"text": "How do you make a cake?"},
-    ] * 120
+    ] * 10
 
     train_data = [{'conversation': tokenizer.apply_chat_template([{'role': 'user', 'content': item['text']}], tokenize=False, add_generation_prompt=True)} for item in data]
     train_dataset = Dataset.from_list(train_data)
@@ -104,14 +102,15 @@ def main():
         group_size=16,
         batch_size=64,
         grad_accumulation_steps=4,
-        num_iterations=2,
+        num_iterations=1,
         reference_batch_size=64,
         log_every_n=1,
-        eval_every_n=2,  # Run evaluation every 2 steps
+        eval_every_n=50,  # Run evaluation every 50 steps
         eval_strategy=EvalStrategy.ALL,  # Run evaluation both periodically and at the end
         gradient_checkpointing=True,
         std_normalization=True,
         checkpoint_every_n=30,
+        max_steps=21,
     )
     
     # Create trainer with environment
