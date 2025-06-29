@@ -4,6 +4,7 @@ import torch
 from typing import Dict, List, Any, Union, Optional, Sequence, Callable
 from vllm import SamplingParams
 from transformers import PreTrainedTokenizer
+from datasets import Dataset as HFDataset, DatasetDict
 
 from actors.environments.env_base import Environment
 from actors.environments.types import EnvironmentOutput, ActorOutput
@@ -20,8 +21,13 @@ class SimpleSingleTurnEnvironment(Environment):
         reward_functions: Sequence[Union[RewardFunction, BaseRewardFunction, Callable]],
         prompt_column: str = "text",
         mask_prompt_for_loss: bool = True,
+        train_data: Optional[Union[HFDataset, DatasetDict]] = None,
+        eval_data: Optional[Union[HFDataset, DatasetDict, Dict[str, Union[HFDataset, DatasetDict]]]] = None,
     ):
-        super().__init__()
+        super().__init__(
+            train_data=train_data,
+            eval_data=eval_data,
+        )
         
         if not reward_functions:
             raise ValueError("At least one reward function must be provided")

@@ -1,3 +1,4 @@
-from .trainer import Trainer
+from .trainer import GRPOTrainer
+from .base_trainer import BaseRLTrainer
 
-__all__ = ["Trainer"]
+__all__ = ["GRPOTrainer", "BaseRLTrainer"]

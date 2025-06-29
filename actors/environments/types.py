@@ -199,6 +199,113 @@ class EnvironmentOutput:
         return cls(actors=actors)
 
 
+@dataclass
+class GroupedEnvironmentOutput:
+    """
+    Environment output organized by problems and groups.
+    
+    This organizes the outputs by problems (unique inputs) and groups (multiple generations per problem).
+    
+    Attributes:
+        problems: List of unique problem inputs
+        groups: Dictionary mapping actor names to their grouped outputs
+                Format: {actor_name: [[group1_for_problem1], [group2_for_problem1], ...]}
+        group_size: Number of generations per problem
+    """
+    problems: List[Dict[str, Any]]
+    groups: Dict[str, List[List[ActorOutput]]]
+    group_size: int
+    
+    @classmethod
+    def from_environment_output(
+        cls, 
+        env_output: EnvironmentOutput, 
+        original_batch: List[Dict[str, Any]], 
+        group_size: int
+    ) -> "GroupedEnvironmentOutput":
+        """
+        Create GroupedEnvironmentOutput from regular EnvironmentOutput.
+        
+        Args:
+            env_output: Original environment output
+            original_batch: The original problems before group expansion
+            group_size: Number of generations per problem
+        """
+        problems = original_batch
+        groups = {}
+        
+        for actor_name, actor_output in env_output.actors.items():
+            actor_groups = []
+            
+            # Reshape the flat actor output into groups
+            total_outputs = len(actor_output.input_ids)
+            num_problems = total_outputs // group_size
+            
+            for problem_idx in range(num_problems):
+                group_outputs = []
+                for group_idx in range(group_size):
+                    flat_idx = problem_idx * group_size + group_idx
+                    if flat_idx < total_outputs:
+                        group_output = ActorOutput(
+                            input_ids=[actor_output.input_ids[flat_idx]],
+                            attention_mask=[actor_output.attention_mask[flat_idx]],
+                            rewards=[actor_output.rewards[flat_idx]],
+                            reward_components={
+                                comp_name: [comp_values[flat_idx]]
+                                for comp_name, comp_values in actor_output.reward_components.items()
+                            } if actor_output.reward_components else None,
+                            ended_in_eos=[actor_output.ended_in_eos[flat_idx]] if actor_output.ended_in_eos else None,
+                            metadata=actor_output.metadata
+                        )
+                        group_outputs.append(group_output)
+                
+                actor_groups.append(group_outputs)
+            
+            groups[actor_name] = actor_groups
+        
+        return cls(
+            problems=problems,
+            groups=groups,
+            group_size=group_size,
+        )
+    
+    def to_environment_output(self) -> EnvironmentOutput:
+        """Convert back to regular EnvironmentOutput by flattening groups."""
+        actors = {}
+        
+        for actor_name, actor_groups in self.groups.items():
+            # Flatten the grouped outputs back to a single actor output
+            all_input_ids = []
+            all_attention_mask = []
+            all_rewards = []
+            all_reward_components = {}
+            all_ended_in_eos = []
+            
+            for problem_groups in actor_groups:
+                for group_output in problem_groups:
+                    all_input_ids.extend(group_output.input_ids)
+                    all_attention_mask.extend(group_output.attention_mask)
+                    all_rewards.extend(group_output.rewards)
+                    all_ended_in_eos.extend(group_output.ended_in_eos or [True] * len(group_output.input_ids))
+                    
+                    if group_output.reward_components:
+                        for comp_name, comp_values in group_output.reward_components.items():
+                            if comp_name not in all_reward_components:
+                                all_reward_components[comp_name] = []
+                            all_reward_components[comp_name].extend(comp_values)
+            
+            actors[actor_name] = ActorOutput(
+                input_ids=all_input_ids,
+                attention_mask=all_attention_mask,
+                rewards=all_rewards,
+                reward_components=all_reward_components if all_reward_components else None,
+                ended_in_eos=all_ended_in_eos,
+                metadata={}
+            )
+        
+        return EnvironmentOutput(actors=actors)
+
+
 # Type aliases for convenience
 RewardComponents = Dict[str, List[float]]
 ActorOutputDict = Dict[str, ActorOutput]
