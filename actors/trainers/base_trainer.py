@@ -365,7 +365,7 @@ class BaseRLTrainer:
                         Palette.INFO,
                     )
                 )
-                model = get_peft_model(model, actor_obj.training_config.peft_config)
+                model = get_peft_model(model, actor_obj.training_config.peft_config).train()
 
             if self.cfg.gradient_checkpointing:
                 if is_peft_model(model):
@@ -396,7 +396,7 @@ class BaseRLTrainer:
                     model.enable_input_require_grads()
 
             disable_dropout_in_model(model)
-
+            model.train()
             model_cfg = model.config.to_dict()
 
             optim = actor_obj.training_config.optim_factory(model.parameters())
@@ -583,9 +583,6 @@ class BaseRLTrainer:
             raise ValueError("Environment has no training data")
         
         steps_per_epoch = len(dataloader)
-
-        epoch = self.env.get_data_state()["epoch"]
-        step_in_epoch = self.env.get_data_state()["step_in_epoch"]
         
         while True:
             # Process remaining batches in current epoch
@@ -603,7 +600,7 @@ class BaseRLTrainer:
 
                 start_step_profiling()
                 with _step_profiler.track(
-                    "complete_train_step", no_memory_measurement=True
+                    "full_train_step", no_memory_measurement=True
                 ):
                     try:
                         env_output = self.env(batch_size=self.batch_size // self.group_size, group_size=self.group_size)
@@ -611,10 +608,9 @@ class BaseRLTrainer:
                     except StopIteration:
                         break
                         
-                if self.accel.is_main_process:
-                    log_step_profiling(
-                        self._substep, self.accel, use_wandb=self.cfg.use_wandb
-                    )
+                log_step_profiling(
+                    self._substep, self.accel, use_wandb=self.cfg.use_wandb
+                )
 
                 # Handle TrainingMetrics result
                 metrics = result.get_combined_metrics()
@@ -623,8 +619,24 @@ class BaseRLTrainer:
                     self.log_training_metrics(metrics)
                     for actor_name, completion_data in result.completions.items():
                         if completion_data:
+                            # Put environment fields first, then completion fields
+                            enhanced_completion_data = {}
+                            
+                            # Add environment fields first
+                            if env_output.problems:
+                                completion_length = len(next(iter(completion_data.values())))
+                                
+                                for key in env_output.problems[0].keys():
+                                    enhanced_completion_data[key] = []
+                                    for problem in env_output.problems:
+                                        for _ in range(completion_length // len(env_output.problems)):
+                                            enhanced_completion_data[key].append(problem[key])
+                            
+                            # Add completion fields after environment fields
+                            enhanced_completion_data.update(completion_data)
+                            
                             self.log_completions(
-                                completion_data, prefix=f"completions/{actor_name}"
+                                enhanced_completion_data, prefix=f"completions/{actor_name}"
                             )
 
                 if (
@@ -733,7 +745,7 @@ class BaseRLTrainer:
         all_eval_metrics = {}
         for eval_name, env_output in eval_outputs.items():
             result = self.eval_step(env_output)
-            self.log_evaluation_metrics(eval_name, result, is_final)
+            self.log_evaluation_metrics(eval_name, result, env_output, is_final)
             all_eval_metrics[eval_name] = result.metrics
 
         if self.accel.is_main_process:
@@ -1151,9 +1163,8 @@ class BaseRLTrainer:
                         )
 
     def log_evaluation_metrics(
-        self, eval_name: str, metrics: "EvaluationMetrics", is_final: bool = False
+        self, eval_name: str, metrics: "EvaluationMetrics", env_output: GroupedEnvironmentOutput, is_final: bool = False
     ):
-        """Log evaluation metrics to console and wandb."""
         # Console logging
         if self.accel.is_main_process:
             self.logger.quiet(
@@ -1182,12 +1193,28 @@ class BaseRLTrainer:
             # Log completion tables
             for actor_name, completion_data in metrics.completions.items():
                 if completion_data:
-                    columns = list(completion_data.keys())
+                    # Put environment fields first, then completion fields
+                    enhanced_completion_data = {}
+                    
+                    # Add environment fields first
+                    if env_output.problems:
+                        completion_length = len(next(iter(completion_data.values())))
+                        
+                        for key in env_output.problems[0].keys():
+                            enhanced_completion_data[key] = []
+                            for problem in env_output.problems:
+                                for _ in range(completion_length // len(env_output.problems)):
+                                    enhanced_completion_data[key].append(problem[key])
+                    
+                    # Add completion fields after environment fields
+                    enhanced_completion_data.update(completion_data)
+                    
+                    columns = list(enhanced_completion_data.keys())
                     table = wandb.Table(columns=columns)
 
-                    data_length = len(next(iter(completion_data.values())))
+                    data_length = len(next(iter(enhanced_completion_data.values())))
                     for i in range(data_length):
-                        row = [completion_data[col][i] for col in columns]
+                        row = [enhanced_completion_data[col][i] for col in columns]
                         table.add_data(*row)
 
                     table_suffix = "_final" if is_final else f"_step_{self._step}"

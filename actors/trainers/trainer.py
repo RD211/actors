@@ -160,7 +160,7 @@ class GRPOTrainer(BaseRLTrainer):
             result.add_actor_metrics(actor_name, metrics)
 
             completion_data = self._build_eval_completion_data(
-                actor_name, ta, actor_output, {}
+                ta, actor_output
             )
             result.add_completion_data(actor_name, completion_data)
 
@@ -168,16 +168,10 @@ class GRPOTrainer(BaseRLTrainer):
 
     def _build_eval_completion_data(
         self,
-        actor_name: str,
         ta: InitializedTrainableLLMActor,
         actor_output: ActorOutput,
-        eval_batch: Dict[str, List[Any]],
     ) -> Dict[str, List[Any]]:
         data = {}
-
-        for k in eval_batch.keys():
-            data[k] = eval_batch[k]
-
         data["completion"] = [
             ta.tokenizer.decode(completion_ids, skip_special_tokens=False)
             for completion_ids in actor_output.input_ids
@@ -236,20 +230,19 @@ class GRPOTrainer(BaseRLTrainer):
 
         result = TrainingMetrics()
 
-        for actor_name, actor_groups in env_output.groups.items():
+        for actor_name, _ in env_output.groups.items():
             if actor_name not in self.actors:
                 continue
 
             ta = self.actors[actor_name]
 
-            if actor_groups and actor_groups[0]:
-                first_output = actor_groups[0][0]  # First group, first output
-                completion_data = self._build_completion_data(
-                    actor_name, ta, first_output, {}
-                )
-                result.add_completion_data(actor_name, completion_data)
-
+            # Build completion data from the flattened output (contains all elements)
             flat_output = env_output.to_environment_output().actors[actor_name]
+            completion_data = self._build_completion_data(
+                ta, flat_output
+            )
+            result.add_completion_data(actor_name, completion_data)
+
             self._process_actor_step(actor_name, ta, flat_output, result)
 
         return result
@@ -267,13 +260,12 @@ class GRPOTrainer(BaseRLTrainer):
     ) -> None:
 
         if ta.actor.offload_optimizer or ta.actor.offload_model:
-            with _step_profiler.track("reload_states", actor_name=name):
-                reload_model_and_optimizer(
-                    ta.model,
-                    ta.optim,
-                    reload_optimizer=ta.actor.offload_optimizer,
-                    reload_model=ta.actor.offload_model,
-                )
+            reload_model_and_optimizer(
+                ta.model,
+                ta.optim,
+                reload_optimizer=ta.actor.offload_optimizer,
+                reload_model=ta.actor.offload_model,
+            )
         total_rewards = actor_output.rewards
         advantages = self._calculate_advantages(
             total_rewards, self.group_size, actor_output.ended_in_eos
@@ -389,14 +381,12 @@ class GRPOTrainer(BaseRLTrainer):
 
         # Offload states after training is complete for this actor
         if ta.actor.offload_optimizer:
-            with _step_profiler.track("offload_optimizer", actor_name=name):
-                offload_model_and_optimizer(
-                    ta.model, ta.optim, offload_optimizer=True, offload_model=False
-                )
+            offload_model_and_optimizer(
+                ta.model, ta.optim, offload_optimizer=True, offload_model=False
+            )
 
         # Track actor weight update
         self._update_actor_weights(ta)
-        ta.actor.sleep()
 
     def _backward_one_slice(
         self,
@@ -477,25 +467,16 @@ class GRPOTrainer(BaseRLTrainer):
             attention_mask[:, 1:].sum(-1).float().mean().item(),
         )
 
-    @property
-    def group_size(self) -> int:
-        return self.cfg.group_size
 
     def _build_completion_data(
         self,
-        actor_name: str,
         ta: InitializedTrainableLLMActor,
         actor_output,
-        batch: Dict[str, List[Any]],
     ) -> Dict[str, List[Any]]:
-        batch_keys = list(batch.keys())
         completions_ids = actor_output.input_ids
         total_rewards = actor_output.rewards
 
         data = {}
-
-        for k in batch_keys:
-            data[k] = batch[k]
 
         data["completion"] = [
             ta.tokenizer.decode(completion_ids, skip_special_tokens=False)
@@ -507,7 +488,7 @@ class GRPOTrainer(BaseRLTrainer):
         if hasattr(self, "_calculate_advantages"):
             advantages = self._calculate_advantages(
                 total_rewards,
-                getattr(self.cfg, "group_size", 1),
+                self.group_size,
                 actor_output.ended_in_eos,
             )
             data["advantage"] = advantages

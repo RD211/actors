@@ -64,19 +64,19 @@ def main():
         {"text": "What is the capital of Italy?"},
         {"text": "Explain photosynthesis briefly."},
         {"text": "What is the largest ocean?"},
-    ]
+    ] * 5
     
     science_qa = [
         {"text": "How does machine learning work?"},
         {"text": "What is quantum entanglement?"},
         {"text": "Explain the theory of evolution."},
-    ]
+    ] * 5
     
     creative_qa = [
         {"text": "Tell me about space exploration."},
         {"text": "Write a haiku about rain."},
         {"text": "Describe a perfect day."},
-    ]
+    ] * 5
     
     # Convert to proper format and create named eval datasets
     eval_datasets = {

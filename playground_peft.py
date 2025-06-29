@@ -51,10 +51,8 @@ def main():
         # PEFT/LoRA configuration
         peft_config=lora_config,
         # Offloading configuration now in actor
-        offload_model=True,
-        offload_optimizer=True,
-        offload_reference_to_cpu=True,  # Enable aggressive CPU offloading for reference model
-        offload_activations_to_cpu=True,  # Enable CPU activation offloading for training model
+        offload_model=False,
+        offload_optimizer=False,
     )
     tokenizer = actor.tokenizer
 
@@ -79,19 +77,19 @@ def main():
         {"text": "What is the capital of Italy?"},
         {"text": "Explain photosynthesis briefly."},
         {"text": "What is the largest ocean?"},
-    ]
+    ] * 5
     
     science_qa = [
         {"text": "How does machine learning work?"},
         {"text": "What is quantum entanglement?"},
         {"text": "Explain the theory of evolution."},
-    ]
+    ] * 5
     
     creative_qa = [
         {"text": "Tell me about space exploration."},
         {"text": "Write a haiku about rain."},
         {"text": "Describe a perfect day."},
-    ]
+    ] * 5
     
     # Convert to proper format and create named eval datasets
     eval_datasets = {
