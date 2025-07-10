@@ -102,7 +102,7 @@ def main():
         group_size=16,
         batch_size=64,
         grad_accumulation_steps=4,
-        num_iterations=1,
+        num_iterations=2,
         reference_batch_size=64,
         log_every_n=1,
         eval_every_n=50,  # Run evaluation every 50 steps

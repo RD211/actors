@@ -36,7 +36,7 @@ def main():
     # Create actor with PEFT configuration
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-0.5B-Instruct",
+        model_path="Qwen/Qwen2.5-3B-Instruct",
         engine_kwargs={
             "gpu_memory_utilization": 0.6,
             "max_model_len": 2048,
@@ -51,8 +51,8 @@ def main():
         # PEFT/LoRA configuration
         peft_config=lora_config,
         # Offloading configuration now in actor
-        offload_model=False,
-        offload_optimizer=False,
+        offload_model=True,
+        offload_optimizer=True,
     )
     tokenizer = actor.tokenizer
 
@@ -132,7 +132,7 @@ def main():
 
     import wandb
 
-    wandb.init(project="test_actors-2", entity="rd211", name="0.5b-lora")
+    wandb.init(project="test_actors-2", entity="rd211", name="3b-lora")
     trainer.train()
     trainer.push_to_hub(
         "rd211/test_actors_lora_main",
