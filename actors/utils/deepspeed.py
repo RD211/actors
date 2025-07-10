@@ -402,8 +402,6 @@ def _validate_offloading_config(model):
     if not hasattr(model.optimizer, "offload_states"):
         return False
     
-
-    
     return True
 
 
@@ -448,7 +446,6 @@ def patched_offload_states(self,
         required = max(offset + numel for _, offset, numel in mapping)
 
         if required > self.lp_param_buffer.numel():
-
             old_buf = self.lp_param_buffer
             new_buf = torch.empty(required,
                                 dtype=old_buf.dtype,
@@ -456,6 +453,10 @@ def patched_offload_states(self,
             new_buf[: old_buf.numel()].copy_(old_buf)
             self.lp_param_buffer = new_buf
             self.lp_param_buffer.data = new_buf
+
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
+                [p.ds_tensor for p in self.module.parameters()]):
+                self.lp_param_buffer.narrow(0, offset, tensor_numel).copy_(tensor.data)
 
         if pin_memory:
             if not hasattr(self, "lp_param_contiguous_pin_buffer"):
@@ -470,7 +471,6 @@ def patched_offload_states(self,
         for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
             [p.ds_tensor for p in self.module.parameters()]):
             tensor.data = cpu_buffer.narrow(0, offset, tensor_numel)
-
         self.fp16_partitioned_groups_flat.clear()
         self.offloaded_states.add(OffloadStateTypeEnum.lp_params)
 
@@ -507,6 +507,75 @@ def patched_offload_states(self,
 
     gc.collect()
     get_accelerator().empty_cache()
+
+from deepspeed.runtime.zero.offload_states import reload_adam_states
+import itertools
+from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
+def patched_reload_states(self, non_blocking: bool = False):
+
+    device = get_accelerator().current_device_name()
+
+    # HP param
+    if OffloadStateTypeEnum.hp_params in self.offloaded_states:
+        if hasattr(self, "hp_params_pin_buffers"):
+            for src, dest in zip(self.hp_params_pin_buffers, self.fp32_partitioned_groups_flat):
+                dest.data = src.to(device, non_blocking=non_blocking)
+        else:
+            for buf in self.fp32_partitioned_groups_flat:
+                buf.data = buf.data.to(device, non_blocking=non_blocking)
+        self.offloaded_states.remove(OffloadStateTypeEnum.hp_params)
+
+    # LP Param
+    if OffloadStateTypeEnum.lp_params in self.offloaded_states:
+        cpu_buffer = self.lp_param_contiguous_pin_buffer if hasattr(
+            self, "lp_param_contiguous_pin_buffer") else self.lp_param_buffer
+        self.lp_param_buffer.data = cpu_buffer.data.to(device, non_blocking=non_blocking)
+        self._set_fp16_partitioned_groups_flat()
+
+        parameter_partitions = [
+            p.ds_tensor
+            for p in self.module.parameters()
+        ]
+
+        for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameter_partitions):
+            tensor.data.copy_(self.lp_param_buffer.narrow(0, offset, tensor_numel))
+        self.offloaded_states.remove(OffloadStateTypeEnum.lp_params)
+
+    # LP grad
+    if OffloadStateTypeEnum.lp_grads in self.offloaded_states:
+        if hasattr(self, "lp_grad_partitions_flat_pin_buffers"):
+            self.grad_partitions_flat_buffer.data = self.lp_grad_partitions_flat_pin_buffers.to(
+                device, non_blocking=non_blocking)
+        else:
+            self.grad_partitions_flat_buffer.data = self.grad_partitions_flat_buffer.data.to(
+                device, non_blocking=non_blocking)
+        self.averaged_gradients = {}
+
+        offset = 0
+        all_params = list(itertools.chain.from_iterable(self.fp16_groups))
+        for param in all_params:
+            self.__param_id_to_grad_partition[param.ds_id] = self.grad_partitions_flat_buffer.narrow(
+                0, offset, param.partition_numel())
+            offset += param.partition_numel()
+
+        self.offloaded_states.remove(OffloadStateTypeEnum.lp_grads)
+
+    # contiguous bucket
+    if OffloadStateTypeEnum.contiguous_grad_buffer in self.offloaded_states:
+        self._DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer = torch.empty_like(self.grad_buffer_meta, device=device)
+        # self.__ipg_bucket_flat_buffer.data = self.__ipg_bucket_flat_buffer.data.to(device)
+        self.offloaded_states.remove(OffloadStateTypeEnum.contiguous_grad_buffer)
+
+    # Adam
+    if OffloadStateTypeEnum.optim_states in self.offloaded_states:
+        reload_adam_states(self.optimizer, device, non_blocking=non_blocking)
+        self.offloaded_states.remove(OffloadStateTypeEnum.optim_states)
+
+    if non_blocking:
+        get_accelerator().synchronize()
+
 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 
 DeepSpeedZeroOptimizer_Stage3.offload_states = patched_offload_states
+DeepSpeedZeroOptimizer_Stage3.reload_states = patched_reload_states
