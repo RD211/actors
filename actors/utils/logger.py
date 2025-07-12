@@ -179,8 +179,6 @@ def init_logger(
     env_level = os.getenv("ACTORS_LOGGING_LEVEL", "normal").lower()
     if env_level == "verbose":
         level = VERBOSE
-        # Set vLLM logging environment for verbose mode
-        os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
         os.environ["VLLM_CONFIGURE_LOGGING"] = "1"
     elif env_level == "normal":
         level = NORMAL
