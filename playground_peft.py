@@ -28,7 +28,7 @@ def main():
         r=64,  # LoRA rank
         lora_alpha=64,  # LoRA scaling parameter
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],  # Target all linear layers
-        lora_dropout=0.1,  # LoRA dropout
+        lora_dropout=0.0,  # LoRA dropout
         bias="none",  # Don't adapt bias parameters
         task_type=TaskType.CAUSAL_LM,  # Task type for causal language modeling
     )
@@ -43,7 +43,7 @@ def main():
             "quantization": "fp8"
         },
         # Training configuration now directly in constructor
-        learning_rate=2e-4,  # Higher learning rate for LoRA training
+        learning_rate=1e-6,  # Higher learning rate for LoRA training
         optimizer="adamw_32bit",  # Using string for convenience
         loss="liger_grpo",  # Using string for liger loss
         loss_kwargs={"beta": 0.04, "temperature": 1.0},
@@ -123,7 +123,7 @@ def main():
         eval_every_n=None,  # No periodic evaluation
         eval_strategy=EvalStrategy.NONE,  # No evaluation
         gradient_checkpointing=True,
-        std_normalization=True,
+        std_normalization=False,
         checkpoint_every_n=30,
     )
     

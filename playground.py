@@ -12,12 +12,35 @@ from actors.trainers.trainer import GRPOTrainer, GRPOTrainerCfg
 from actors.trainers.base_trainer import EvalStrategy
 import bitsandbytes as bnb
 from actors.environments import SimpleSingleTurnEnvironment
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from datasets import Dataset
 
 def length_reward(completion: str) -> float:
     """Rewards shorter responses."""
     return -min(len(completion) / 500, 5.0)  # Negative reward for length, capped at -5.0
+
+def get_lr_scheduler(optimizer, max_step):
+
+    warmup_steps = 50
+    # part 1 – warm-up: linearly increase from 0.1× to 1.0× base_lr
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,          # 0.1 × base_lr -> 100 µ after 1st step
+        end_factor=1.0,
+        total_iters=warmup_steps)
+
+    # part 2 – linear decay all the way to 0
+    decay  = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=1.0,
+        end_factor=0.0,
+        total_iters=max_step - warmup_steps)
+
+    # stitch them together
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, decay],
+        milestones=[warmup_steps])
+    return scheduler
 
 def main():
     # Create actor with improved configuration API
@@ -34,7 +57,7 @@ def main():
         optimizer="adamw_8bit",  # Using string for convenience
         loss="liger_grpo",  # Using string for liger loss
         loss_kwargs={"beta": 0.04, "temperature": 1.0},
-        scheduler="cosine",  # Using string for cosine scheduler
+        scheduler=get_lr_scheduler,
         # Offloading configuration now in actor
         offload_model=True,
         offload_optimizer=True,
@@ -52,7 +75,7 @@ def main():
         {"text": "Who wrote 'To Kill a Mockingbird'?"},
         {"text": "What is the speed of light?"},
         {"text": "How do you make a cake?"},
-    ] * 10
+    ] * 50
 
     train_data = [{'conversation': tokenizer.apply_chat_template([{'role': 'user', 'content': item['text']}], tokenize=False, add_generation_prompt=True)} for item in data]
     train_dataset = Dataset.from_list(train_data)
@@ -101,7 +124,7 @@ def main():
     cfg = GRPOTrainerCfg(
         group_size=16,
         batch_size=64,
-        grad_accumulation_steps=4,
+        grad_accumulation_steps=8,
         num_iterations=2,
         reference_batch_size=64,
         log_every_n=1,
@@ -110,7 +133,6 @@ def main():
         gradient_checkpointing=True,
         std_normalization=True,
         checkpoint_every_n=30,
-        max_steps=21,
     )
     
     # Create trainer with environment
