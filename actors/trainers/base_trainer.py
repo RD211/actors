@@ -1061,7 +1061,7 @@ class BaseRLTrainer:
     @property
     def total_expected_steps(self) -> int:
         if self.cfg.max_steps is not None:
-            return self.cfg.max_steps
+            return self.cfg.max_steps * self.cfg.num_iterations
 
         dataloader = self.env.get_dataloader(self.batch_size // self.group_size)
         if dataloader is None:
