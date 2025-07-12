@@ -3,7 +3,9 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import re
 from typing import Dict
+import warnings
 
 import colorama
 import psutil
@@ -193,6 +195,30 @@ def init_logger(
         os.environ["VLLM_LOGGING_LEVEL"] = "CRITICAL"
         os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
     
+    # Mutes the logs when sleeping/waking up the model
+    # Especially annoying since we offload and onload the model frequently
+    if level > VERBOSE:
+
+        for vllm_logger_name in (
+            "vllm.executor.executor_base",
+            "vllm.v1.core.block_pool",
+            "vllm.v1.worker.gpu_worker",
+        ):
+            lg = logging.getLogger(vllm_logger_name)
+            lg.setLevel(logging.WARNING)
+            lg.propagate = False
+            lg.handlers.clear()
+            lg.addHandler(logging.NullHandler())
+
+    # Mute warning about requires_grad.
+    warnings.filterwarnings(
+        action="ignore",
+        message=re.escape(
+            "None of the inputs have requires_grad=True. Gradients will be None"
+        ),
+        category=UserWarning,
+        module=r"torch\.utils\.checkpoint"
+    )
     logger = logging.getLogger(name)
     logger.setLevel(level)
 
