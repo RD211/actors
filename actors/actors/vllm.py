@@ -8,7 +8,10 @@ from actors.inference.pool import ModelPool
 from actors.inference.worker import DEFAULT_LORA
 from torch.multiprocessing.reductions import reduce_tensor
 from vllm.platforms import current_platform
+
+from actors.utils.logger import Palette, colorize, init_logger
 from .base import TrainableLLMActor
+from transformers import AutoConfig
 
 
 class vLLMActor(TrainableLLMActor):
@@ -22,7 +25,7 @@ class vLLMActor(TrainableLLMActor):
         engine_kwargs: Dict[str, any] | None = None,
         insomnia: bool = False, # If true all sleep calls will be ignored
         learning_rate: float = 5e-6,
-        optimizer: str | type | callable = "paged_adamw_8bit",
+        optimizer: str | type | callable = "adamw_32bit",
         optimizer_kwargs: Dict | None = None,
         loss: str | type | callable = "liger_grpo",
         loss_kwargs: Dict | None = None,
@@ -38,6 +41,28 @@ class vLLMActor(TrainableLLMActor):
         offload_reference_to_cpu: bool = False,
         offload_activations_to_cpu: bool = False,
     ):
+        self.logger = init_logger(name=name)
+        model_config = AutoConfig.from_pretrained(model_path)
+
+        # We extract num_attention_heads if present and check if it is divisible engine_kwargs["tensor_parallel_size"] if tensor parallel size is set
+        if "tensor_parallel_size" in engine_kwargs and hasattr(model_config, "num_attention_heads"):
+            num_heads = model_config.num_attention_heads
+            tensor_parallel_size = engine_kwargs["tensor_parallel_size"]
+            if num_heads % tensor_parallel_size != 0:
+                for pipeline_parallel_size in range(1, tensor_parallel_size + 1):
+                    if tensor_parallel_size % pipeline_parallel_size == 0 and \
+                       num_heads % (tensor_parallel_size // pipeline_parallel_size) == 0:
+                        engine_kwargs["tensor_parallel_size"] = tensor_parallel_size // pipeline_parallel_size
+                        engine_kwargs["pipeline_parallel_size"] = pipeline_parallel_size
+                        break
+                self.logger.warning(
+                    colorize(
+                    f"num_attention_heads ({num_heads}) is not divisible by tensor_parallel_size ({tensor_parallel_size}). "
+                    "In order to keep the model working we will set tensor_parallel_size to "
+                    f"{engine_kwargs['tensor_parallel_size']} and pipeline_parallel_size to {engine_kwargs['pipeline_parallel_size']}."
+                    , Palette.ERROR)
+                )
+            
         super().__init__(
             name, 
             model_path,

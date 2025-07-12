@@ -14,7 +14,7 @@ from actors.losses import GRPOLoss, BaseRLLoss
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
 # Import PEFT 
-from peft import PeftConfig, get_peft_model
+from peft import PeftConfig
 
 
 
