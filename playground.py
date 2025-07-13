@@ -20,7 +20,7 @@ def length_reward(completion: str) -> float:
 
 def get_lr_scheduler(optimizer, max_step):
 
-    warmup_steps = 50
+    warmup_steps = 2
     # part 1 – warm-up: linearly increase from 0.1× to 1.0× base_lr
     warmup = torch.optim.lr_scheduler.LinearLR(
         optimizer,
