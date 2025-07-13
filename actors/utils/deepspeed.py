@@ -439,41 +439,69 @@ def patched_offload_states(self,
                 buf.data = buf.data.to(device, non_blocking=non_blocking)
         self.offloaded_states.add(OffloadStateTypeEnum.hp_params)
 
-    # LP param
     if needs_offload(OffloadStateTypeEnum.lp_params):
         mapping = get_mapping_to_flat_buffer(
                     [p.ds_tensor for p in self.module.parameters()])
         required = max(offset + numel for _, offset, numel in mapping)
+        buffer_size = self.lp_param_buffer.numel()
 
-        if required > self.lp_param_buffer.numel():
-            old_buf = self.lp_param_buffer
-            new_buf = torch.empty(required,
-                                dtype=old_buf.dtype,
-                                device='cpu')
-            new_buf[: old_buf.numel()].copy_(old_buf)
-            self.lp_param_buffer = new_buf
-            self.lp_param_buffer.data = new_buf
+        if required > buffer_size or hasattr(self, "lora_mode"):
+            # We are in LoRA mode.
+            self.lora_mode = True
 
-            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
-                [p.ds_tensor for p in self.module.parameters()]):
+            if required > buffer_size:
+                self.lp_param_buffer = torch.empty(
+                    required, dtype=self.lp_param_buffer.dtype, device=self.lp_param_buffer.device,
+                )
+
+            lora_params = self._get_parameter_partitions()
+
+            parameters_to_offload = [p.ds_tensor for p in self.module.parameters()]
+            # We remove all parameters in parameters_to_offload that are in lora_params
+            parameters_to_offload = [
+                p for p in parameters_to_offload if all(p is not lora_param for lora_param in lora_params)
+            ]
+            # We now add them back at the beginning of the list
+            parameters_to_offload = lora_params + parameters_to_offload
+
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameters_to_offload):
                 self.lp_param_buffer.narrow(0, offset, tensor_numel).copy_(tensor.data)
 
-        if pin_memory:
-            if not hasattr(self, "lp_param_contiguous_pin_buffer"):
-                self.lp_param_contiguous_pin_buffer = get_accelerator().pin_memory(
-                    torch.empty_like(self.lp_param_buffer, device=device))
-            self.lp_param_contiguous_pin_buffer.copy_(self.lp_param_buffer, non_blocking=non_blocking)
-            cpu_buffer = self.lp_param_contiguous_pin_buffer
-        else:
-            cpu_buffer = self.lp_param_buffer.to(device, non_blocking=non_blocking)
+            if pin_memory:
+                if not hasattr(self, "lp_param_contiguous_pin_buffer"):
+                    self.lp_param_contiguous_pin_buffer = get_accelerator().pin_memory(
+                        torch.empty_like(self.lp_param_buffer, device=device))
+                self.lp_param_contiguous_pin_buffer.copy_(self.lp_param_buffer, non_blocking=non_blocking)
+                cpu_buffer = self.lp_param_contiguous_pin_buffer
+            else:
+                cpu_buffer = self.lp_param_buffer.to(device, non_blocking=non_blocking)
 
-        self.lp_param_buffer.data = cpu_buffer
-        for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
-            [p.ds_tensor for p in self.module.parameters()]):
-            tensor.data = cpu_buffer.narrow(0, offset, tensor_numel)
+            self.lp_param_buffer.data = cpu_buffer
+
+
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameters_to_offload):
+                tensor.data = cpu_buffer.narrow(0, offset, tensor_numel)
+
+
+
+        else:
+            if pin_memory:
+                if not hasattr(self, "lp_param_contiguous_pin_buffer"):
+                    self.lp_param_contiguous_pin_buffer = get_accelerator().pin_memory(
+                        torch.empty_like(self.lp_param_buffer, device=device))
+                self.lp_param_contiguous_pin_buffer.copy_(self.lp_param_buffer, non_blocking=non_blocking)
+                cpu_buffer = self.lp_param_contiguous_pin_buffer
+            else:
+                cpu_buffer = self.lp_param_buffer.to(device, non_blocking=non_blocking)
+
+            self.lp_param_buffer.data = cpu_buffer
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
+                [p.ds_tensor for p in self.module.parameters()]):
+                tensor.data = cpu_buffer.narrow(0, offset, tensor_numel)
+
         self.fp16_partitioned_groups_flat.clear()
         self.offloaded_states.add(OffloadStateTypeEnum.lp_params)
-
+       
     # LP grad
     if needs_offload(OffloadStateTypeEnum.lp_grads):
         if pin_memory:
@@ -533,14 +561,23 @@ def patched_reload_states(self, non_blocking: bool = False):
         self.lp_param_buffer.data = cpu_buffer.data.to(device, non_blocking=non_blocking)
         self._set_fp16_partitioned_groups_flat()
 
-        parameter_partitions = [
-            p.ds_tensor
-            for p in self.module.parameters()
-        ]
 
-        for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameter_partitions):
-            tensor.data.copy_(self.lp_param_buffer.narrow(0, offset, tensor_numel))
+        if hasattr(self, "lora_mode") and self.lora_mode:
+            lora_params = self._get_parameter_partitions()
+            parameters_to_offload = [p.ds_tensor for p in self.module.parameters()]
+            parameters_to_offload = [
+                p for p in parameters_to_offload if all(p is not lora_param for lora_param in lora_params)
+            ]
+            parameters_to_offload = lora_params + parameters_to_offload
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameters_to_offload):
+                tensor.data = self.lp_param_buffer.narrow(0, offset, tensor_numel)
+        else:    
+            parameter_partitions = self._get_parameter_partitions()
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameter_partitions):
+                tensor.data = self.lp_param_buffer.narrow(0, offset, tensor_numel)
+
         self.offloaded_states.remove(OffloadStateTypeEnum.lp_params)
+
 
     # LP grad
     if OffloadStateTypeEnum.lp_grads in self.offloaded_states:
