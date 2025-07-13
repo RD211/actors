@@ -21,6 +21,7 @@ from actors.environments.types import EnvironmentOutput, GroupedEnvironmentOutpu
 from actors.losses.base_loss import BaseRLLoss
 from typing import Dict, Any, List, Optional, Union
 from enum import Enum, auto
+from transformers import AutoConfig
 
 from actors.utils.deepspeed import (
     offload_model_and_optimizer,
@@ -39,7 +40,7 @@ from actors.utils.train_utils import disable_dropout_in_model, free_memory
 from actors.utils.wandb import is_wandb_active
 from actors.environments.types import ActorOutput
 from actors.utils.get_logps import _chunked_logp
-
+from peft import prepare_model_for_kbit_training
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Utility functions
@@ -357,6 +358,14 @@ class BaseRLTrainer:
                 )
             )
 
+            # We check if the model has a quantization_config
+            if hasattr(model.config, "quantization_config"):
+                if model.config.quantization_config.bnb_4bit_quant_storage != torch.bfloat16:
+                    raise ValueError(
+                        f"Expected bnb_4bit_quant_storage to be torch.bfloat16, but got {model.config.quantization_config.bnb_4bit_quant_storage}, consider making a custom model factory."
+                    )
+                prepare_model_for_kbit_training(model)
+                
             # Apply PEFT configuration if available
             if actor_obj.training_config.peft_config is not None:
                 model = get_peft_model(model, actor_obj.training_config.peft_config).train()
