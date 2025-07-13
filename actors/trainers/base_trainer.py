@@ -1,12 +1,11 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-import itertools
 import os
 import shutil
 import tempfile
 import time
 import warnings
-import wandb
+import deepspeed
 
 from peft import get_peft_model
 import torch
@@ -30,7 +29,6 @@ from actors.utils.deepspeed import (
 )
 from actors.utils.logger import Palette, colorize, init_logger
 from actors.utils.ipc_utils import gather_and_stream_state_dict
-from actors.utils.softmax import _selective_softmax
 from actors.utils.tracker import (
     start_step_profiling,
     log_step_profiling,
@@ -40,6 +38,7 @@ from actors.utils.tracker import (
 from actors.utils.train_utils import disable_dropout_in_model, free_memory
 from actors.utils.wandb import is_wandb_active
 from actors.environments.types import ActorOutput
+from actors.utils.get_logps import _chunked_logp
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -205,6 +204,7 @@ class InitializedTrainableLLMActor:
     model_config: Dict[str, Any]  # used for stuff like tie_embeddings, etc.
     reference_model: Optional[torch.nn.Module] = None
     sched: Optional[torch.optim.lr_scheduler.LRScheduler] = None
+    beta: float = 0.0001
 
 
 class SaveStrategy(Enum):
@@ -431,6 +431,7 @@ class BaseRLTrainer:
                 reference_model=ref_model,
                 accel=accel,
                 model_config=model_cfg,
+                beta=beta,
             )
 
             # We offload the model and optimizer if requested
@@ -994,50 +995,79 @@ class BaseRLTrainer:
     # ═══════════════════════════════════════════════════════════════════════
     # Others
     # ═══════════════════════════════════════════════════════════════════════
+    
+    @torch.no_grad()
     def _get_logps(
         self,
-        model: Any,
+        model: torch.nn.Module,
         ids: List[List[int]],
         tokenizer: PreTrainedTokenizerBase,
         temperature: float = 1.0,
-        batch_size: int = 1,
+        batch_size: int = 4,
+        max_fused: int = 1 << 15,
     ) -> List[List[float]]:
-        total = len(ids)
-        world = self.number_of_devices
+        """
+        Super memory efficient logp computation and actually faster than standard.
+        """
+        total   = len(ids)
+        world   = self.number_of_devices
         per_rank = (total + world - 1) // world
         start, end = self.rank * per_rank, min((self.rank + 1) * per_rank, total)
         ids_local = ids[start:end]
-        local_logps: List[List[float]] = []
+
+        local_out: List[List[float]] = []
+
         for i in range(0, len(ids_local), batch_size):
             batch_ids = ids_local[i : i + batch_size]
             lengths = [len(seq) for seq in batch_ids]
+            enc = tokenizer.pad({"input_ids": batch_ids},
+                                padding=True,
+                                return_tensors="pt")
+            input_ids = enc.input_ids.to(model.device)         # (B,L)
+            attn_mask = enc.attention_mask.to(model.device)
+            L = input_ids.shape[1]                        # sequence length
+            hidden = model.model(                          # type: ignore[attr-defined]
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+                use_cache=False,
+            ).last_hidden_state                            # (B,L,H)
 
-            padded = tokenizer.pad(
-                {"input_ids": batch_ids}, padding="longest", return_tensors="pt"
+            hidden = hidden[:, :-1]                            # drop last step
+            target = input_ids[:, 1:]                          # predict t from t−1
+
+            non_pad  = torch.tensor(
+                [
+                    [1] * (l-1) + [0] * (L - l)
+                    for l in lengths
+                ]
             )
-            input_ids = padded["input_ids"].to(model.device)
+            # Flatten
+            h_flat = hidden.reshape(-1, hidden.shape[-1])  # (N,L-1,H)
+            tgt_flat = target.reshape(-1)            # (N,)
+            non_pad   = non_pad.reshape(-1).bool()  # (N,)
+            h_flat   = h_flat[non_pad] / temperature # (N,H)
+            tgt_flat = tgt_flat[non_pad]          # (N,)
 
-            L = input_ids.size(1)
-            attn_mask = padded["attention_mask"]
+            with deepspeed.zero.GatheredParameters(
+                [model.lm_head.weight, model.lm_head.bias],
+                modifier_rank=None,
+            ):
+                lp_flat = _chunked_logp(
+                    h_flat, model.lm_head, tgt_flat, max_fused=max_fused
+                ).cpu()
 
-            with torch.no_grad():
-                logits = (
-                    model(
-                        input_ids=input_ids.to(model.device),
-                        attention_mask=attn_mask.to(model.device),
-                        use_cache=False,
-                    ).logits
-                    / temperature
-                )  # (B,L,V)
-            logits = logits[:, :-1, :]  # remove last token logits
-            lp = _selective_softmax(logits, input_ids[:, 1:])  # (B,L-1)
+            pos = 0
+            for l in lengths:
+                row_len = l - 1
+                local_out.append(lp_flat[pos : pos + row_len].tolist())
+                pos += row_len
 
-            for row, ln in zip(lp, lengths):
-                local_logps.append(row[: ln - 1].cpu().tolist())
-            del padded, input_ids, attn_mask, logits, lp  # free memory
-        gathered = self.accel.gather_for_metrics(local_logps)
+            del enc, input_ids, attn_mask, hidden, target
+            del non_pad, h_flat, tgt_flat, lp_flat
+
+        gathered = self.accel.gather_for_metrics(local_out)
         return gathered
-
+    
     @property
     def accel(self) -> Accelerator:
         return next(iter(self.actors.values())).accel

@@ -25,8 +25,8 @@ def length_reward(completion: str) -> float:
 def main():
     # Create LoRA configuration
     lora_config = LoraConfig(
-        r=64,  # LoRA rank
-        lora_alpha=64,  # LoRA scaling parameter
+        r=128,  # LoRA rank
+        lora_alpha=256,  # LoRA scaling parameter
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],  # Target all linear layers
         lora_dropout=0.0,  # LoRA dropout
         bias="none",  # Don't adapt bias parameters
@@ -36,23 +36,23 @@ def main():
     # Create actor with PEFT configuration
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-3B-Instruct",
+        model_path="Qwen/Qwen2.5-0.5B-Instruct",
         engine_kwargs={
             "gpu_memory_utilization": 0.6,
             "max_model_len": 2048,
             "quantization": "fp8"
         },
         # Training configuration now directly in constructor
-        learning_rate=1e-6,  # Higher learning rate for LoRA training
+        learning_rate=4e-6,  # Higher learning rate for LoRA training
         optimizer="adamw_32bit",  # Using string for convenience
         loss="liger_grpo",  # Using string for liger loss
-        loss_kwargs={"beta": 0.04, "temperature": 1.0},
+        loss_kwargs={"beta": 0.0, "temperature": 1.0},
         scheduler="cosine",  # Using string for cosine scheduler
         # PEFT/LoRA configuration
         peft_config=lora_config,
         # Offloading configuration now in actor
-        offload_model=True,
-        offload_optimizer=True,
+        offload_model=False,
+        offload_optimizer=False,
     )
     tokenizer = actor.tokenizer
 
@@ -123,7 +123,7 @@ def main():
         eval_every_n=None,  # No periodic evaluation
         eval_strategy=EvalStrategy.NONE,  # No evaluation
         gradient_checkpointing=True,
-        std_normalization=False,
+        std_normalization=True,
         checkpoint_every_n=30,
     )
     

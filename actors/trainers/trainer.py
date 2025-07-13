@@ -189,7 +189,9 @@ class GRPOTrainer(BaseRLTrainer):
         with _step_profiler.track("get_logps", actor_name=name):
             old_lp = (
                 self._get_logps(
-                    ta.model,
+                    self.accel.unwrap_model(ta.model).base_model.model
+                    if is_peft_model(ta.model) else
+                    self.accel.unwrap_model(ta.model),
                     ids_list,
                     ta.tokenizer,
                     temperature=ta.loss_fn.temperature,
@@ -200,16 +202,16 @@ class GRPOTrainer(BaseRLTrainer):
             )
             if ta.reference_model is not None:
                 ref_lp = self._get_logps(
-                    ta.reference_model,
+                    self.accel.unwrap_model(ta.reference_model),
                     ids_list,
                     ta.tokenizer,
                     temperature=ta.loss_fn.temperature,
                     batch_size=self.reference_batch_size,
                 )
-            elif is_peft_model(ta.model):  # TODO: Beta here check too.
+            elif is_peft_model(ta.model) and ta.beta != 0.0:
                 with ta.model.disable_adapter():
                     ref_lp = self._get_logps(
-                        ta.model,
+                        self.accel.unwrap_model(ta.model).base_model.model,
                         ids_list,
                         ta.tokenizer,
                         temperature=ta.loss_fn.temperature,
