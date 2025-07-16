@@ -1,6 +1,6 @@
 from __future__ import annotations
 import atexit
-from typing import Dict, List, Sequence, Callable
+from typing import Dict, List, Sequence, Callable, Any
 import torch
 from torch import nn
 from vllm import SamplingParams, RequestOutput
@@ -11,6 +11,7 @@ from vllm.platforms import current_platform
 
 from actors.utils.logger import Palette, colorize, init_logger
 from .base import TrainableLLMActor
+from actors.trainers.base_config import ActorTrainCfg
 from transformers import AutoConfig
 
 
@@ -22,80 +23,65 @@ class vLLMActor(TrainableLLMActor):
         model_path: str,
         gpu_groups: List[List[int]] | int | None = None,
         use_v1_engine: bool = True,
-        engine_kwargs: Dict[str, any] | None = None,
-        insomnia: bool = False, # If true all sleep calls will be ignored
-        learning_rate: float = 5e-6,
-        optimizer: str | type | callable = "adamw_32bit",
-        optimizer_kwargs: Dict | None = None,
-        loss: str | type | callable = "liger_grpo",
-        loss_kwargs: Dict | None = None,
-        scheduler: str | type | callable = "cosine",
-        scheduler_kwargs: Dict | None = None,
-        model_factory: Callable[[], nn.Module] | None = None,
-        reference_model_factory: Callable[[], nn.Module] | None = None,
-        # PEFT/LoRA configuration
-        peft_config = None,
-        # Offloading parameters
-        offload_optimizer: bool = False,
-        offload_model: bool = False,
-        offload_reference_to_cpu: bool = False,
-        offload_activations_to_cpu: bool = False,
+        engine_kwargs: Dict[str, Any] | None = None,
+        insomnia: bool = False,  # If true all sleep calls will be ignored
+        training_config: ActorTrainCfg | None = None,
     ):
         self.logger = init_logger(name=name)
         model_config = AutoConfig.from_pretrained(model_path)
 
+        if engine_kwargs is None:
+            engine_kwargs = {}
+
         # We extract num_attention_heads if present and check if it is divisible engine_kwargs["tensor_parallel_size"] if tensor parallel size is set
-        if "tensor_parallel_size" in engine_kwargs and hasattr(model_config, "num_attention_heads"):
+        if "tensor_parallel_size" in engine_kwargs and hasattr(
+            model_config, "num_attention_heads"
+        ):
             num_heads = model_config.num_attention_heads
             tensor_parallel_size = engine_kwargs["tensor_parallel_size"]
             if num_heads % tensor_parallel_size != 0:
                 for pipeline_parallel_size in range(1, tensor_parallel_size + 1):
-                    if tensor_parallel_size % pipeline_parallel_size == 0 and \
-                       num_heads % (tensor_parallel_size // pipeline_parallel_size) == 0:
-                        engine_kwargs["tensor_parallel_size"] = tensor_parallel_size // pipeline_parallel_size
+                    if (
+                        tensor_parallel_size % pipeline_parallel_size == 0
+                        and num_heads % (tensor_parallel_size // pipeline_parallel_size)
+                        == 0
+                    ):
+                        engine_kwargs["tensor_parallel_size"] = (
+                            tensor_parallel_size // pipeline_parallel_size
+                        )
                         engine_kwargs["pipeline_parallel_size"] = pipeline_parallel_size
                         break
                 self.logger.warning(
                     colorize(
-                    f"num_attention_heads ({num_heads}) is not divisible by tensor_parallel_size ({tensor_parallel_size}). "
-                    "In order to keep the model working we will set tensor_parallel_size to "
-                    f"{engine_kwargs['tensor_parallel_size']} and pipeline_parallel_size to {engine_kwargs['pipeline_parallel_size']}."
-                    , Palette.ERROR)
+                        f"num_attention_heads ({num_heads}) is not divisible by tensor_parallel_size ({tensor_parallel_size}). "
+                        "In order to keep the model working we will set tensor_parallel_size to "
+                        f"{engine_kwargs['tensor_parallel_size']} and pipeline_parallel_size to {engine_kwargs['pipeline_parallel_size']}.",
+                        Palette.ERROR,
+                    )
                 )
-            
+
         super().__init__(
-            name, 
+            name,
             model_path,
-            learning_rate=learning_rate,
-            optimizer=optimizer,
-            optimizer_kwargs=optimizer_kwargs,
-            loss=loss,
-            loss_kwargs=loss_kwargs,
-            scheduler=scheduler,
-            scheduler_kwargs=scheduler_kwargs,
-            model_factory=model_factory,
-            reference_model_factory=reference_model_factory,
-            peft_config=peft_config,
-            offload_optimizer=offload_optimizer,
-            offload_model=offload_model,
-            offload_reference_to_cpu=offload_reference_to_cpu,
-            offload_activations_to_cpu=offload_activations_to_cpu,
+            training_config=training_config,
         )
         self.pool = ModelPool()
         if name not in self.pool.list_models():
             # Prepare engine kwargs with LoRA support if PEFT config is present
             final_engine_kwargs = engine_kwargs.copy() if engine_kwargs else {}
-            
+
             # Enable LoRA in vLLM if PEFT config is provided
             if self.training_config.peft_config is not None:
                 final_engine_kwargs["enable_lora"] = True
                 # Set reasonable defaults for LoRA if not already specified
                 if "max_lora_rank" not in final_engine_kwargs:
-                    lora_rank = getattr(self.training_config.peft_config, 'r', 16)  # Default to rank 16
+                    lora_rank = getattr(
+                        self.training_config.peft_config, "r", 16
+                    )  # Default to rank 16
                     final_engine_kwargs["max_lora_rank"] = lora_rank
                 if "max_loras" not in final_engine_kwargs:
                     final_engine_kwargs["max_loras"] = 1  # Default to 1 LoRA adapter
-            
+
             self.pool.load_model(
                 name=name,
                 model_path=model_path,
@@ -115,7 +101,7 @@ class vLLMActor(TrainableLLMActor):
     def _cleanup(self):
         """Clean up resources when the program exits."""
         try:
-            if hasattr(self, 'pool') and self.pool is not None:
+            if hasattr(self, "pool") and self.pool is not None:
                 # Try to unload this model if it exists
                 if self.name in self.pool.list_models():
                     self.pool.unload_model(self.name)
@@ -141,11 +127,11 @@ class vLLMActor(TrainableLLMActor):
         with self._with_wake():
             self.pool.finalize_update(self.name)
             self._sleep_level = 0  # This method specifically sets sleep level to 0
-    
+
     # ═══════════════════════════════════════════════════════════════
     # LoRA/PEFT Support Methods
     # ═══════════════════════════════════════════════════════════════
-    
+
     def update_lora_weights(self):
         """Update LoRA weights in the vLLM worker."""
         with self._with_wake():
@@ -157,32 +143,48 @@ class vLLMActor(TrainableLLMActor):
             self.pool.create_lora_if_not_present(self.name, lora_path)
 
     def generate(
-        self, prompts: Sequence[str], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
+        self,
+        prompts: Sequence[str],
+        sampling_params: SamplingParams | None = None,
+        lora_request=DEFAULT_LORA,
     ) -> List[RequestOutput]:
         sampling = sampling_params or SamplingParams()
         with self._with_wake():
             return self.pool.generate(self.name, list(prompts), sampling, lora_request)
 
     def chat(
-        self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
+        self,
+        dialogs: Sequence[list],
+        sampling_params: SamplingParams | None = None,
+        lora_request=DEFAULT_LORA,
     ) -> List[RequestOutput]:
         sampling = sampling_params or SamplingParams()
         with self._with_wake():
             return self.pool.chat(self.name, list(dialogs), sampling, lora_request)
 
     async def agenerate(
-        self, prompts: Sequence[str], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
+        self,
+        prompts: Sequence[str],
+        sampling_params: SamplingParams | None = None,
+        lora_request=DEFAULT_LORA,
     ) -> List[RequestOutput]:
         sampling = sampling_params or SamplingParams()
         with self._with_wake():
-            return await self.pool.agenerate(self.name, list(prompts), sampling, lora_request)
+            return await self.pool.agenerate(
+                self.name, list(prompts), sampling, lora_request
+            )
 
     async def achat(
-        self, dialogs: Sequence[list], sampling_params: SamplingParams | None = None, lora_request=DEFAULT_LORA
+        self,
+        dialogs: Sequence[list],
+        sampling_params: SamplingParams | None = None,
+        lora_request=DEFAULT_LORA,
     ) -> List[RequestOutput]:
         sampling = sampling_params or SamplingParams()
         with self._with_wake():
-            return await self.pool.achat(self.name, list(dialogs), sampling, lora_request)
+            return await self.pool.achat(
+                self.name, list(dialogs), sampling, lora_request
+            )
 
     def start_weight_update(self):
         self.pool.start_update(self.name)
@@ -221,11 +223,11 @@ class vLLMActor(TrainableLLMActor):
             raise RuntimeError(
                 f"Model {self.name} is sleeping at level 2. While attempting to generate or chat."
             )
-    
+
     def _with_wake(self):
         """Context manager to temporarily wake up and restore previous sleep state."""
         from contextlib import contextmanager
-        
+
         @contextmanager
         def wake_context():
             previous_sleep_level = self._sleep_level
@@ -235,5 +237,5 @@ class vLLMActor(TrainableLLMActor):
             finally:
                 if previous_sleep_level > 0:
                     self.sleep(level=previous_sleep_level)
-        
+
         return wake_context()

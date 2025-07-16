@@ -10,7 +10,8 @@ from torch.utils.data import Dataset, DataLoader, RandomSampler
 import abc, dataclasses
 from typing import Dict, Union, List, Any, Optional
 
-from actors import TrainableLLMActor
+from actors.actors.base import TrainableLLMActor
+    
 from actors.environments.types import EnvironmentOutput, GroupedEnvironmentOutput
 from datasets import Dataset as HFDataset, DatasetDict
 

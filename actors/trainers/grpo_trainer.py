@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import inspect
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 import torch
 from actors.trainers.base_trainer import (
     BaseRLTrainer,
-    EvaluationMetrics,
-    InitializedTrainableLLMActor,
-    TrainerCfg,
+    ActorTrainState,
     TrainingMetrics,
     is_peft_model,
 )
 from actors.environments.types import GroupedEnvironmentOutput, GroupedEnvironmentOutput
+from actors.trainers.grpo_config import GRPOTrainerCfg
 from actors.utils.deepspeed import (
     offload_model_and_optimizer,
     reload_model_and_optimizer,
@@ -24,17 +22,6 @@ from actors.environments.types import ActorOutput
 from actors.utils.tracker import _step_profiler
 from actors.utils.train_utils import _ForwardRedirection, free_memory
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Configuration dataclass
-# ═════════════════════════════════════════════════════════════════════════════
-
-
-@dataclass
-class GRPOTrainerCfg(TrainerCfg):
-    reference_batch_size: int = 1
-    advantage_calculator: Optional[Callable[..., List[float]]] = None
-    std_normalization: bool = True
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -88,42 +75,45 @@ class GRPOTrainer(BaseRLTrainer):
         self.env = env
         self._forward_redirection = _ForwardRedirection()
 
-        if self.cfg.advantage_calculator is not None:
-            self.advantage_calculator = self.cfg.advantage_calculator
-        else:
-            self.advantage_calculator = lambda rewards, group_size, ended_in_eos=None: default_advantage_calculator(
-                rewards, group_size, ended_in_eos, self.cfg.std_normalization
-            )
-
     def _calculate_advantages(
         self,
+        actor_name: str,
         rewards: List[float],
         group_size: int,
         ended_in_eos: Optional[List[bool]] = None,
     ) -> List[float]:
-        try:
-            sig = inspect.signature(self.advantage_calculator)
-            params = list(sig.parameters.keys())
-
-            kwargs = {"rewards": rewards}
-
-            if "group_size" in params:
-                kwargs["group_size"] = group_size
-            if "ended_in_eos" in params and ended_in_eos is not None:
-                kwargs["ended_in_eos"] = ended_in_eos
-
-            return self.advantage_calculator(**kwargs)
-
-        except Exception as e:
+        actor_obj = self.actor_objects[actor_name]
+        advantage_calculator = actor_obj.training_config.advantage_calculator
+        std_normalization = actor_obj.training_config.std_normalization
+        
+        if advantage_calculator is not None:
             try:
-                return self.advantage_calculator(rewards)
-            except:
+                sig = inspect.signature(advantage_calculator)
+                params = list(sig.parameters.keys())
+
+                kwargs = {"rewards": rewards}
+
+                if "group_size" in params:
+                    kwargs["group_size"] = group_size
+                if "ended_in_eos" in params and ended_in_eos is not None:
+                    kwargs["ended_in_eos"] = ended_in_eos
+
+                return advantage_calculator(**kwargs)
+
+            except Exception as e:
                 try:
-                    return self.advantage_calculator(rewards, group_size)
+                    return advantage_calculator(rewards)
                 except:
-                    return default_advantage_calculator(
-                        rewards, group_size, ended_in_eos, True
-                    )
+                    try:
+                        return advantage_calculator(rewards, group_size)
+                    except:
+                        return default_advantage_calculator(
+                            rewards, group_size, ended_in_eos, std_normalization
+                        )
+        else:
+            return default_advantage_calculator(
+                rewards, group_size, ended_in_eos, std_normalization
+            )
 
 
     def train_step(self, env_output: GroupedEnvironmentOutput) -> TrainingMetrics:
@@ -137,7 +127,7 @@ class GRPOTrainer(BaseRLTrainer):
             ta = self.actors[actor_name]
 
             flat_output = env_output.to_environment_output().actors[actor_name]
-            completion_data = self._build_completion_data(ta, flat_output, is_eval=False)
+            completion_data = self._build_completion_data(ta, flat_output, actor_name, is_eval=False)
             result.add_completion_data(actor_name, completion_data)
 
             self._process_actor_step(actor_name, ta, flat_output, result)
@@ -150,21 +140,23 @@ class GRPOTrainer(BaseRLTrainer):
     def _process_actor_step(
         self,
         name: str,
-        ta: InitializedTrainableLLMActor,
+        ta: ActorTrainState,
         actor_output: ActorOutput,
         result: TrainingMetrics,
     ) -> None:
 
-        if ta.actor.offload_optimizer or ta.actor.offload_model:
+        actor_obj = self.actor_objects[name]
+        
+        if actor_obj.training_config.offload_optimizer or actor_obj.training_config.offload_model:
             reload_model_and_optimizer(
                 ta.model,
                 ta.optim,
-                reload_optimizer=ta.actor.offload_optimizer,
-                reload_model=ta.actor.offload_model,
+                reload_optimizer=actor_obj.training_config.offload_optimizer,
+                reload_model=actor_obj.training_config.offload_model,
             )
         total_rewards = actor_output.rewards
         advantages = self._calculate_advantages(
-            total_rewards, self.group_size, actor_output.ended_in_eos
+            name, total_rewards, self.group_size, actor_output.ended_in_eos
         )
 
         ids_list = actor_output.input_ids
@@ -195,27 +187,34 @@ class GRPOTrainer(BaseRLTrainer):
                     ids_list,
                     ta.tokenizer,
                     temperature=ta.loss_fn.temperature,
-                    batch_size=self.reference_batch_size,
+                    batch_size=actor_obj.training_config.reference_batch_size,
                 )
                 if self.num_iterations > 1
                 else None
             )
-            if ta.reference_model is not None:
+            ref_model_factory = actor_obj.training_config.reference_model_factory
+            if ref_model_factory is not None:
+                # Create reference model on demand
+                ref_model = ref_model_factory().eval()
+                ref_model.requires_grad_(False)
+                ref_model.config.use_cache = False
+                ref_model = ref_model.to(dtype=ta.model.dtype)
+                
                 ref_lp = self._get_logps(
-                    self.accel.unwrap_model(ta.reference_model),
+                    ref_model,
                     ids_list,
                     ta.tokenizer,
                     temperature=ta.loss_fn.temperature,
-                    batch_size=self.reference_batch_size,
+                    batch_size=actor_obj.training_config.reference_batch_size,
                 )
-            elif is_peft_model(ta.model) and ta.beta != 0.0:
+            elif is_peft_model(ta.model) and actor_obj.training_config.beta != 0.0:
                 with ta.model.disable_adapter():
                     ref_lp = self._get_logps(
                         self.accel.unwrap_model(ta.model).base_model.model,
                         ids_list,
                         ta.tokenizer,
                         temperature=ta.loss_fn.temperature,
-                        batch_size=self.reference_batch_size,
+                        batch_size=actor_obj.training_config.reference_batch_size,
                     )
             else:
                 ref_lp = None
@@ -258,7 +257,7 @@ class GRPOTrainer(BaseRLTrainer):
                 )
                 free_memory()
 
-            grad_norm = self._clip_gradients(ta, clip_to=self.max_grad_norm)
+            grad_norm = self._clip_gradients(ta, clip_to=actor_obj.training_config.max_grad_norm)
             result.add_substep_metric(name, substep_idx, "grad_norm", grad_norm)
 
             self._optim_step(ta)
@@ -279,22 +278,22 @@ class GRPOTrainer(BaseRLTrainer):
             )
 
         # Offload states after training is complete for this actor
-        if ta.actor.offload_optimizer:
+        if actor_obj.training_config.offload_optimizer:
             offload_model_and_optimizer(
                 ta.model, ta.optim, offload_optimizer=True, offload_model=False
             )
 
         # Track actor weight update
-        self._update_actor_weights(ta)
+        self._update_actor_weights(ta, name)
 
-        if ta.actor.offload_model:
+        if actor_obj.training_config.offload_model:
             offload_model_and_optimizer(
                 ta.model, ta.optim, offload_optimizer=False, offload_model=True
             )
 
     def _backward_one_slice(
         self,
-        ta: InitializedTrainableLLMActor,
+        ta: ActorTrainState,
         ids: List[List[int]],
         masks: List[List[int]],
         advantages: List[float],
@@ -332,7 +331,7 @@ class GRPOTrainer(BaseRLTrainer):
         #     else unwrapped_model              # vanilla model
         # )
 
-        with _step_profiler.track("loss_fn", actor_name=ta.name):
+        with _step_profiler.track("loss_fn", actor_name=actor_name):
             # TODO: Higher VRAM usage here which is undesirable.
             # loss, stats = self._forward_redirection(
             #     ta.model,              # wrapper  (DeepSpeedEngine/FSDP/…)
@@ -360,7 +359,9 @@ class GRPOTrainer(BaseRLTrainer):
                 ref_logps=ref_lp,
                 old_logps=old_lp,
             )
-        ta.accel.backward(loss)
+
+        
+        ta.accel.backward(loss / self.grad_accumulation_steps)
 
         result.add_substep_metric(actor_name, substep_idx, "loss", loss.item())
         if "kl" in stats and getattr(ta.loss_fn, "beta", 0.0) != 0.0:

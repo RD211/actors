@@ -1,9 +1,6 @@
 from __future__ import annotations
-import inspect
-import torch
 from typing import Dict, List, Any, Union, Optional, Sequence, Callable
 from vllm import SamplingParams
-from transformers import PreTrainedTokenizer
 from datasets import Dataset as HFDataset, DatasetDict
 
 from actors.environments.env_base import Environment

@@ -1,25 +1,27 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Literal
 import torch
 
 from actors.utils.softmax import _selective_softmax
 from .base_loss import BaseRLLoss
 
+from actors.trainers.base_config import ActorTrainCfg
+
+AllowedLoss = Literal["grpo", "bnpo", "dr_grpo"]
+
 class GRPOLoss(BaseRLLoss):
     def __init__(
         self,
+        config: 'ActorTrainCfg',
         eps_low: float = 0.2,
         eps_high: float = 0.2,
-        beta: float = 0.04,
-        temperature: float = 1.0,
-        loss_type: str = "grpo",
+        loss_type: AllowedLoss = "grpo",
         delta: Optional[float] = None,
         max_completion_length: Optional[int] = None,
     ):
-        super().__init__()
+        super().__init__(config=config)
+        
         self.eps_l = eps_low
         self.eps_h = eps_high
-        self.beta = beta
-        self.temp = temperature
         self.loss_type = loss_type
         self.delta = delta
         self.max_completion_length = max_completion_length
@@ -36,7 +38,7 @@ class GRPOLoss(BaseRLLoss):
         **kwargs: Dict[str, Any],
     ) -> tuple[torch.Tensor, Dict[str, Any]]:
         L = input_ids.size(1)
-        logits = policy(input_ids, attention_mask=attention_mask).logits / self.temp # shape (B, L, V)
+        logits = policy(input_ids, attention_mask=attention_mask).logits / self.temperature # shape (B, L, V)
         new_lp = _selective_softmax(logits[:,:-1,:], input_ids[:, 1:]) # shape (B, L-1)
         if old_logps is None:
             old_logps = new_lp.detach()
