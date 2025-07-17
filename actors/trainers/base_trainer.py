@@ -490,6 +490,9 @@ class BaseRLTrainer:
         if self.accel.is_main_process:
             os.makedirs(run_checkpoint_path, exist_ok=True)
 
+        # Log configuration to wandb
+        self._log_config_to_wandb()
+
         start_time = time.time()
         total_steps = 0
         
@@ -1115,6 +1118,42 @@ class BaseRLTrainer:
                 {f"{prefix}/step_{self._step}": table},
                 step=self._substep,
             )
+
+    def _log_config_to_wandb(self):
+        """Log configuration to wandb at the start of training."""
+        if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
+            import wandb
+
+            trainer_config = self.cfg.to_dict()
+            wandb.config.update({"trainer": trainer_config})
+
+            actor_configs = {}
+            for actor_name, actor_obj in self.actor_objects.items():
+                if hasattr(actor_obj, 'training_config'):
+                    actor_configs[actor_name] = actor_obj.training_config.to_dict()
+                    actor_configs[actor_name].update({
+                        "actor_class": actor_obj.__class__.__name__,
+                    })
+
+                    # We also add all config attributes of the actor object
+                    for attr_name, attr_value in actor_obj.__dict__.items():
+                        if type(attr_value) in [int, float, str, bool, list, dict]:
+                            actor_configs[actor_name][attr_name] = attr_value
+            if actor_configs:
+                wandb.config.update({"actors": actor_configs})
+
+            env_info = {
+                "type": type(self.env).__name__,
+            }
+            
+            if hasattr(self.env, 'to_dict'):
+                try:
+                    env_config = self.env.to_dict()
+                    env_info.update(env_config)
+                except:
+                    pass
+            
+            wandb.config.update({"environment": env_info})
 
     def log_training_metrics(self, metrics: Dict[str, List[Dict[str, float]]]):
         if self.accel.is_main_process and self._step % self.log_every_n == 0:

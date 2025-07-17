@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Callable, Dict, List, Optional, Union, Iterable, TYPE_CHECKING
 from enum import Enum, auto
 import inspect
@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
 from peft import PeftConfig
+from peft.tuners.lora.config import LoraConfig
 
 # ═══════════════════════════════════════════════════════════════════════
 # Trainer configuration
@@ -62,6 +63,17 @@ class TrainerCfg:
     max_checkpoints_to_keep: int = 3
     checkpoint_path: str = "checkpoints"
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts the config to a dictionary for logging."""
+        result = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, Enum):
+                result[f.name] = value.name
+            else:
+                result[f.name] = value
+        return result
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Actor configuration
@@ -95,7 +107,7 @@ class ActorTrainCfg:
     _reference_model_factory: Optional[Callable[[], nn.Module]] = field(default=None, repr=False, init=False)
     
     # PEFT/LoRA configuration
-    peft_config: Optional[PeftConfig] = None
+    peft_config: Optional[LoraConfig] = None
     
     # Offloading parameters
     offload_optimizer: bool = False
@@ -135,7 +147,7 @@ class ActorTrainCfg:
         reference_model_factory: Optional[Callable[[], nn.Module]] = None,
         
         # PEFT/LoRA configuration
-        peft_config: Optional[PeftConfig] = None,
+        peft_config: Optional[LoraConfig] = None,
         
         # Offloading parameters
         offload_optimizer: bool = False,
@@ -165,10 +177,17 @@ class ActorTrainCfg:
             model_factory: Factory function to create the model
             tokenizer_factory: Factory function to create the tokenizer
             reference_model_factory: Factory function to create reference model
-            peft_config: PEFT configuration for LoRA/QLoRA training
+            peft_config: PEFT configuration for LoRA/QLoRA training (only LoraConfig supported)
             offload_optimizer: Whether to offload optimizer to CPU
             offload_model: Whether to offload model to CPU
         """
+        # Validate PEFT config
+        if peft_config is not None and not isinstance(peft_config, LoraConfig):
+            raise ValueError(
+                f"Only LoraConfig is supported for peft_config, got {type(peft_config)}. "
+                f"Expected type: peft.tuners.lora.config.LoraConfig"
+            )
+        
         # Set basic parameters
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
@@ -331,8 +350,13 @@ class ActorTrainCfg:
         Set the PEFT configuration for LoRA/QLoRA training.
         
         Args:
-            peft_config: PEFT configuration object
+            peft_config: PEFT configuration object (only LoraConfig supported)
         """
+        if peft_config is not None and not isinstance(peft_config, LoraConfig):
+            raise ValueError(
+                f"Only LoraConfig is supported for peft_config, got {type(peft_config)}. "
+                f"Expected type: peft.tuners.lora.config.LoraConfig"
+            )
         self.peft_config = peft_config
         return self
 
@@ -489,6 +513,98 @@ class ActorTrainCfg:
         else:
             available = 'cosine, linear, constant, exponential, step'
             raise ValueError(f"Unknown scheduler '{name}'. Available: {available}")
+
+    def to_dict(self, model_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Converts the config to a dictionary for logging.
+        Handles functions, classes, and complex objects intelligently.
+        
+        Args:
+            model_path: Model path from the actor (optional)
+        """
+        result = {}
+        factory_fields = {}
+        
+        if model_path is not None:
+            result["model_path"] = model_path
+        
+        for f in fields(self):
+            value = getattr(self, f.name)
+            
+            # Skip None values for private fields to reduce noise
+            if f.name.startswith('_') and value is None:
+                continue
+                
+            # For private fields, use a cleaner name (remove leading underscore)
+            field_name = f.name[1:] if f.name.startswith('_') else f.name
+            serialized_value = self._serialize_value(value)
+            
+            if f.name.startswith('_'):
+                factory_fields[field_name] = serialized_value
+            else:
+                result[field_name] = serialized_value
+        
+        result.update(factory_fields)
+        
+        return result
+    
+    def _serialize_value(self, value: Any) -> Any:
+        """
+        Serialize a value for logging, handling different types.
+        """
+        if value is None:
+            return None
+        elif isinstance(value, (str, int, float, bool)):
+            return value
+        elif isinstance(value, Enum):
+            return value.name
+        elif isinstance(value, (list, tuple)):
+            return [self._serialize_value(item) for item in value]
+        elif isinstance(value, dict):
+            return {k: self._serialize_value(v) for k, v in value.items()}
+        elif isinstance(value, LoraConfig):
+            return {
+                "r": value.r,
+                "lora_alpha": value.lora_alpha,
+                "target_modules": value.target_modules,
+                "lora_dropout": value.lora_dropout,
+                "bias": value.bias,
+                "task_type": value.task_type.value if hasattr(value.task_type, 'value') else str(value.task_type),
+            }
+        elif inspect.isclass(value):
+            return value.__name__
+        elif callable(value):
+            if hasattr(value, '__name__'):
+                name = value.__name__
+                if name == '<lambda>':
+                    try:
+                        source = inspect.getsource(value).strip()
+                        return f"{source}"
+                    except (OSError, TypeError):
+                        return "lambda: <source_unavailable>"
+                else:
+                    return name
+            else:
+                return str(type(value).__name__)
+        elif hasattr(value, '__dict__'):
+            try:
+                obj_dict = {}
+                for attr_name in dir(value):
+                    if not attr_name.startswith('_'):
+                        try:
+                            attr_value = getattr(value, attr_name)
+                            if not callable(attr_value):
+                                obj_dict[attr_name] = self._serialize_value(attr_value)
+                        except:
+                            continue
+                return {
+                    'type': type(value).__name__,
+                    'attributes': obj_dict
+                }
+            except:
+                return f"<{type(value).__name__}>"
+        else:
+            return str(value)
 
 # ═══════════════════════════════════════════════════════════════════════
 # Initialized actor state
