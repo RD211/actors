@@ -192,16 +192,10 @@ class GRPOTrainer(BaseRLTrainer):
                 if self.num_iterations > 1
                 else None
             )
-            ref_model_factory = actor_obj.training_config.reference_model_factory
-            if ref_model_factory is not None:
-                # Create reference model on demand
-                ref_model = ref_model_factory().eval()
-                ref_model.requires_grad_(False)
-                ref_model.config.use_cache = False
-                ref_model = ref_model.to(dtype=ta.model.dtype)
+            if ta.ref_model is not None:
                 
                 ref_lp = self._get_logps(
-                    ref_model,
+                    ta.ref_model,
                     ids_list,
                     ta.tokenizer,
                     temperature=ta.loss_fn.temperature,

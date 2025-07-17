@@ -41,10 +41,10 @@ def main():
         learning_rate=2e-6,
         optimizer="adamw_8bit",
         loss="liger_grpo",
-        loss_kwargs={"beta": 0.04, "temperature": 1.0},
         scheduler=get_lr_scheduler,
         offload_model=True,
         offload_optimizer=True,
+        beta=0.04,
     )
     
     # Create actor with improved configuration API

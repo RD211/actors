@@ -355,6 +355,7 @@ class BaseRLTrainer:
 
             train_state = ActorTrainState(
                 model=model,
+                ref_model=ref_model,
                 tokenizer=actor_obj.training_config.tokenizer_factory(),
                 loss_fn=loss_fn,
                 optim=optim,
@@ -523,7 +524,11 @@ class BaseRLTrainer:
                 "full_train_step", no_memory_measurement=True
             ):
                 try:
-                    env_output = self.env(batch_size=self.batch_size // self.group_size, group_size=self.group_size)
+                    env_output = self.env(batch_size=self.batch_size // self.group_size, group_size=self.group_size) 
+                    # We sleep all trainable actors.
+                    for actor_name, ta in self.actors.items():
+                        actor_obj = self.actor_objects[actor_name]
+                        actor_obj.sleep()
                     result = self.train_step(env_output)
                 except StopIteration:
                     break

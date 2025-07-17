@@ -1,10 +1,11 @@
-from typing import Any, Dict, Optional, Literal
+from typing import Any, Dict, Optional, Literal, TYPE_CHECKING
 import torch
 
 from actors.utils.softmax import _selective_softmax
 from .base_loss import BaseRLLoss
 
-from actors.trainers.base_config import ActorTrainCfg
+if TYPE_CHECKING:
+    from actors.trainers.base_config import ActorTrainCfg
 
 AllowedLoss = Literal["grpo", "bnpo", "dr_grpo"]
 

@@ -40,12 +40,12 @@ def main():
         learning_rate=4e-6,
         optimizer="adamw_32bit",
         loss="liger_grpo",
-        loss_kwargs={"beta": 0.0001, "temperature": 1.0},
         scheduler="cosine",
         peft_config=lora_config,
         quantization_config=quantization_config,
         offload_model=True,
         offload_optimizer=True,
+        beta=0.001,
     )
     
     # Create actor with PEFT and quantization configuration

@@ -45,7 +45,7 @@ class TrainerCfg:
     max_steps: Optional[int] = None
     grad_accumulation_steps: int = 1
     num_iterations: int = 1
-    group_size: int = 1
+    group_size: int = 8
     
 
     # Logging
@@ -502,4 +502,5 @@ class ActorTrainState:
     optim: torch.optim.Optimizer
     accel: accelerate.Accelerator
     model_config: PretrainedConfig
+    ref_model: Optional[PreTrainedModel] = None
     sched: Optional[torch.optim.lr_scheduler.LRScheduler] = None
