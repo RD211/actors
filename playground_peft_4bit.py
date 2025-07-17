@@ -1,18 +1,11 @@
 import torch
-from actors.environments.env_base import Environment
-from actors.environments.types import GroupedEnvironmentOutput, ActorOutput
 from actors.actors import vLLMActor
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from liger_kernel.transformers import AutoLigerKernelForCausalLM
-from actors.losses.grpo_loss import GRPOLoss
-from actors.losses.liger_grpo_loss import LigerLoss
-from torch.optim.lr_scheduler import LinearLR, ConstantLR
+from transformers import BitsAndBytesConfig
 from vllm import SamplingParams
-from actors.trainers.trainer import GRPOTrainer, GRPOTrainerCfg
-from actors.trainers.base_trainer import EvalStrategy
-import bitsandbytes as bnb
+from actors.trainers.grpo_trainer import GRPOTrainer
+from actors.trainers.grpo_config import GRPOTrainerCfg
+from actors.trainers.base_config import SaveStrategy, EvalStrategy, ActorTrainCfg
 from actors.environments import SimpleSingleTurnEnvironment
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from datasets import Dataset
 
 # Import PEFT for LoRA configuration
@@ -22,20 +15,16 @@ def length_reward(completion: str) -> float:
     """Rewards shorter responses."""
     return -min(len(completion) / 500, 5.0)  # Negative reward for length, capped at -5.0
 
-def get_model():
-    print("A"*100)
-    return AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct", 
-                                                      trust_remote_code=True, 
-                                                      quantization_config=BitsAndBytesConfig(
-                                                          load_in_4bit=True,
-                                                          bnb_4bit_compute_dtype=torch.bfloat16,
-                                                          bnb_4bit_use_double_quant=True,
-                                                          bnb_4bit_quant_type="nf4",
-                                                          bnb_4bit_quant_storage=torch.bfloat16,
-                                                      ),
-                                                      attn_implementation="flash_attention_2")
-
 def main():
+    # Create quantization configuration
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_quant_storage=torch.bfloat16,
+    )
+    
     # Create LoRA configuration
     lora_config = LoraConfig(
         r=256,  # LoRA rank
@@ -46,7 +35,20 @@ def main():
         task_type=TaskType.CAUSAL_LM,  # Task type for causal language modeling
     )
     
-    # Create actor with PEFT configuration
+    # Create training configuration
+    training_config = ActorTrainCfg(
+        learning_rate=4e-6,
+        optimizer="adamw_32bit",
+        loss="liger_grpo",
+        scheduler="cosine",
+        peft_config=lora_config,
+        quantization_config=quantization_config,
+        offload_model=True,
+        offload_optimizer=True,
+        beta=0.001,
+    )
+    
+    # Create actor with PEFT and quantization configuration
     actor = vLLMActor(
         name="main",
         model_path="Qwen/Qwen2.5-0.5B-Instruct",
@@ -55,18 +57,7 @@ def main():
             "max_model_len": 2048,
             "quantization": "bitsandbytes"
         },
-        model_factory=get_model,
-        # Training configuration now directly in constructor
-        learning_rate=4e-6,  # Higher learning rate for LoRA training
-        optimizer="adamw_32bit",  # Using string for convenience
-        loss="liger_grpo",  # Using string for liger loss
-        loss_kwargs={"beta": 0.0001, "temperature": 1.0},
-        scheduler="cosine",  # Using string for cosine scheduler
-        # PEFT/LoRA configuration
-        peft_config=lora_config,
-        # Offloading configuration now in actor
-        offload_model=True,
-        offload_optimizer=True,
+        training_config=training_config,
     )
     tokenizer = actor.tokenizer
 
@@ -132,13 +123,11 @@ def main():
         batch_size=64,
         grad_accumulation_steps=4,
         num_iterations=2,
-        reference_batch_size=4,
         log_every_n=1,
         eval_every_n=None,  # No periodic evaluation
         eval_strategy=EvalStrategy.NONE,  # No evaluation
-        gradient_checkpointing=True,
-        std_normalization=True,
         checkpoint_every_n=30,
+        save_strategy=SaveStrategy.ALL,
     )
     
     # Create trainer with environment

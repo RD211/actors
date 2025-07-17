@@ -1,9 +1,6 @@
 from __future__ import annotations
-import inspect
-import torch
 from typing import Dict, List, Any, Union, Optional, Sequence, Callable
 from vllm import SamplingParams
-from transformers import PreTrainedTokenizer
 from datasets import Dataset as HFDataset, DatasetDict
 
 from actors.environments.env_base import Environment
@@ -36,6 +33,9 @@ class SimpleSingleTurnEnvironment(Environment):
         self.prompt_column = prompt_column
         self.tokenizer = actor.training_config.tokenizer_factory()
         self.mask_prompt_for_loss = mask_prompt_for_loss
+
+        # Set actor.loss_temp to sampling_params.temperature
+        actor.training_config.loss_temp = sampling_params.temperature
         
         self.sampling_params = sampling_params
         
@@ -65,9 +65,9 @@ class SimpleSingleTurnEnvironment(Environment):
             raise ValueError(f"Reward function names must be unique, got: {names}")
     
     async def generate(self, batch: Dict[str, Any]) -> EnvironmentOutput:
-        
-        # We awake the actor.
+
         self.actor.wake()
+        
         prompts = batch[self.prompt_column]        
         generations = await self.actor.agenerate(prompts, sampling_params=self.sampling_params)
         
@@ -134,7 +134,6 @@ class SimpleSingleTurnEnvironment(Environment):
             reward_components=rewards_by_function,
         )
         
-        self.actor.sleep()
         return EnvironmentOutput(
             actors={self.actor.name: actor_output},
         )

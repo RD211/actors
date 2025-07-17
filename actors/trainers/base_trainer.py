@@ -10,19 +10,15 @@ import deepspeed
 from peft import get_peft_model
 import torch
 
-from torch.utils.data import Dataset, DataLoader, RandomSampler
 from accelerate import Accelerator, InitProcessGroupKwargs
 from transformers import PreTrainedTokenizerBase
-from datasets import Dataset as HFDataset, DatasetDict
 from accelerate.utils import DeepSpeedPlugin, DistributedType
 from actors.actors.base import TrainableLLMActor
 from actors.environments.env_base import Environment
-from actors.environments.types import EnvironmentOutput, GroupedEnvironmentOutput
-from actors.losses.base_loss import BaseRLLoss
+from actors.environments.types import GroupedEnvironmentOutput
 from typing import Dict, Any, List, Optional, Union
-from enum import Enum, auto
-from transformers import AutoConfig
 
+from actors.trainers.base_config import TrainerCfg, ActorTrainState, SaveStrategy, EvalStrategy
 from actors.utils.deepspeed import (
     offload_model_and_optimizer,
     prepare_deepspeed,
@@ -34,9 +30,8 @@ from actors.utils.tracker import (
     start_step_profiling,
     log_step_profiling,
     _step_profiler,
-    gpu_profiler,
 )
-from actors.utils.train_utils import disable_dropout_in_model, free_memory
+from actors.utils.train_utils import disable_dropout_in_model
 from actors.utils.wandb import is_wandb_active
 from actors.environments.types import ActorOutput
 from actors.utils.get_logps import _chunked_logp
@@ -186,79 +181,6 @@ class EvaluationMetrics:
         """Add completion data for an actor."""
         self.completions[actor_name] = data
 
-
-@dataclass
-class InitializedTrainableLLMActor:
-    """
-    The initialized state of a TrainableLLMActor.
-    The TrainableLLMActor contains mostly factories and methods to create these objects.
-    This dataclass holds the initialized objects that are ready to be used for training.
-    """
-
-    name: str
-    actor: TrainableLLMActor
-    model: torch.nn.Module
-    tokenizer: PreTrainedTokenizerBase
-    loss_fn: BaseRLLoss
-    optim: torch.optim.Optimizer
-    accel: Accelerator
-    model_config: Dict[str, Any]  # used for stuff like tie_embeddings, etc.
-    reference_model: Optional[torch.nn.Module] = None
-    sched: Optional[torch.optim.lr_scheduler.LRScheduler] = None
-    beta: float = 0.0001
-
-
-class SaveStrategy(Enum):
-    NONE = auto()  # never save
-    STEPS = auto()  # checkpoint_every_n only
-    FINAL = auto()  # one model save at the very end
-    ALL = auto()  # both periodic + final
-
-
-class EvalStrategy(Enum):
-    NONE = auto()  # never evaluate
-    STEPS = auto()  # evaluate every eval_every_n steps
-    FINAL = auto()  # evaluate only at the end
-    ALL = auto()  # evaluate both periodically and at the end
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# Trainer configuration
-# ═══════════════════════════════════════════════════════════════════════
-
-
-@dataclass
-class TrainerCfg:
-
-    # Training
-    epochs: int = 1
-    batch_size: int = 8
-    max_steps: Optional[int] = None
-    grad_accumulation_steps: int = 1
-    max_grad_norm: float = 1.0
-    gradient_checkpointing: bool = True
-    num_iterations: int = 1
-    group_size: int = 1 
-
-    # Logging
-    log_every_n: int = 1
-    use_wandb: bool = True
-
-    # Eval
-    eval_every_n: int = 1000
-    eval_strategy: EvalStrategy = EvalStrategy.ALL
-
-    # Checkpointing
-    save_strategy: SaveStrategy = SaveStrategy.ALL
-    checkpoint_every_n: int = 1000
-    max_checkpoints_to_keep: int = 3
-    checkpoint_path: str = "checkpoints"
-
-
-    # TODO: Implement this.
-    sync_ref_model: bool = False
-    sync_ref_model_every_n: int = 1000
-
 # ═══════════════════════════════════════════════════════════════════════
 # Base RLTrainer class
 # ═══════════════════════════════════════════════════════════════════════
@@ -284,6 +206,7 @@ class BaseRLTrainer:
                 "Please ensure the environment has registered actors."
             )
         self.actors = self._setup_actors(trainable_actors)
+        self.actor_objects = trainable_actors
         self._setup_loras()
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -292,7 +215,7 @@ class BaseRLTrainer:
 
     def _setup_actors(
         self, trainable_actors: Dict[str, TrainableLLMActor]
-    ) -> Dict[str, InitializedTrainableLLMActor]:
+    ) -> Dict[str, ActorTrainState]:
         """
         Initializes the trainable actors and returns a dictionary of initialized actors.
         """
@@ -301,8 +224,9 @@ class BaseRLTrainer:
         }
 
         for name, plug in self.ds_plugins.items():
+            actor = trainable_actors[name]
             cfg = plug.deepspeed_config
-            cfg["max_grad_norm"] = self.cfg.max_grad_norm
+            cfg["max_grad_norm"] = actor.training_config.max_grad_norm
             cfg["train_batch_size"] = self.cfg.batch_size
             cfg["gradient_accumulation_steps"] = self.cfg.grad_accumulation_steps
             cfg["train_micro_batch_size_per_gpu"] = (
@@ -314,7 +238,7 @@ class BaseRLTrainer:
         actors_with_offloading = {
             name: actor
             for name, actor in trainable_actors.items()
-            if actor.offload_optimizer or actor.offload_model
+            if actor.training_config.offload_optimizer or actor.training_config.offload_model
         }
 
         if actors_with_offloading:
@@ -333,8 +257,8 @@ class BaseRLTrainer:
 
                 # Disable offloading since it won't work
                 for actor in actors_with_offloading.values():
-                    actor.offload_optimizer = False
-                    actor.offload_model = False
+                    actor.training_config.offload_optimizer = False
+                    actor.training_config.offload_model = False
 
         accelerators: Dict[str, Accelerator] = {
             actor: Accelerator(
@@ -345,11 +269,11 @@ class BaseRLTrainer:
             for actor in self.ds_plugins
         }
 
-        actors: Dict[str, InitializedTrainableLLMActor] = {}
+        actors: Dict[str, ActorTrainState] = {}
 
         for name, actor_obj in trainable_actors.items():
             accel = accelerators[name]
-            model = actor_obj.model_factory().train()
+            model = actor_obj.training_config.model_factory().train()
 
             self.logger.normal(
                 colorize(
@@ -367,10 +291,10 @@ class BaseRLTrainer:
                 prepare_model_for_kbit_training(model)
                 
             # Apply PEFT configuration if available
-            if actor_obj.training_config.peft_config is not None:
+            if actor_obj.training_config.has_peft_config:
                 model = get_peft_model(model, actor_obj.training_config.peft_config).train()
 
-            if self.cfg.gradient_checkpointing:
+            if actor_obj.training_config.gradient_checkpointing:
                 if is_peft_model(model):
 
                     model.base_model.gradient_checkpointing_enable(
@@ -400,13 +324,13 @@ class BaseRLTrainer:
 
             disable_dropout_in_model(model)
             model.train()
-            model_cfg = model.config.to_dict()
+            model_cfg = model.config
 
             optim = actor_obj.training_config.optim_factory(model.parameters())
             model, optim = accel.prepare(model, optim)
 
             loss_fn = actor_obj.training_config.loss_factory()
-            beta = getattr(loss_fn, "beta", 0.0)
+            beta = actor_obj.training_config.beta
 
             if (
                 beta == 0.0
@@ -429,27 +353,28 @@ class BaseRLTrainer:
             )
             sched = accel.prepare(sched)
 
-            actors[name] = InitializedTrainableLLMActor(
-                name=name,
-                actor=actor_obj,
+            train_state = ActorTrainState(
                 model=model,
-                tokenizer=actor_obj.tokenizer,
+                ref_model=ref_model,
+                tokenizer=actor_obj.training_config.tokenizer_factory(),
                 loss_fn=loss_fn,
                 optim=optim,
-                sched=sched,
-                reference_model=ref_model,
                 accel=accel,
                 model_config=model_cfg,
-                beta=beta,
+                sched=sched,
             )
+            
+            # Set the train_state on the actor
+            actor_obj.train_state = train_state
+            actors[name] = train_state
 
             # We offload the model and optimizer if requested
-            if actor_obj.offload_optimizer or actor_obj.offload_model:
+            if actor_obj.training_config.offload_optimizer or actor_obj.training_config.offload_model:
                 offload_model_and_optimizer(
-                    actors[name].model,
-                    actors[name].optim,
-                    offload_optimizer=actor_obj.offload_optimizer,
-                    offload_model=actor_obj.offload_model,
+                    train_state.model,
+                    train_state.optim,
+                    offload_optimizer=actor_obj.training_config.offload_optimizer,
+                    offload_model=actor_obj.training_config.offload_model,
                 )
 
         return actors
@@ -476,8 +401,9 @@ class BaseRLTrainer:
         multiple_actors = len(self.actors) > 1
         if self.accel.is_local_main_process:
             for name, ta in self.actors.items():
-                if ta.actor.has_peft_config:
-                    ta.actor.create_lora_if_not_present(
+                actor_obj = self.actor_objects[name]
+                if actor_obj.has_peft_config:
+                    actor_obj.create_lora_if_not_present(
                         os.path.join(temp_dir, name) if multiple_actors else temp_dir
                     )
         self.accel.wait_for_everyone()
@@ -490,28 +416,29 @@ class BaseRLTrainer:
     # Training parts
     # ═══════════════════════════════════════════════════════════════════════
 
-    def _update_actor_weights(self, ta: InitializedTrainableLLMActor) -> None:
-
-        with _step_profiler.track("update_weights", actor_name=ta.name):
+    def _update_actor_weights(self, ta: ActorTrainState, actor_name: str) -> None:
+        actor_obj = self.actor_objects[actor_name]
+        
+        with _step_profiler.track("update_weights", actor_name=actor_name):
 
             if ta.accel.is_local_main_process:
-                ta.actor.start_weight_update()
+                actor_obj.start_weight_update()
 
             def stream_batch_callback(batch_state_dict):
                 if ta.accel.is_local_main_process:
-                    ta.actor.update_weights_batch(batch_state_dict)
+                    actor_obj.update_weights_batch(batch_state_dict)
 
             gather_and_stream_state_dict(
                 ta.accel,
                 self.logger,
                 ta.model,
                 stream_batch_callback,
-                tie_word_embeddings=ta.model_config["tie_word_embeddings"],
+                tie_word_embeddings=ta.model_config.tie_word_embeddings,
                 lora_only=is_peft_model(ta.model),
             )
 
-        if ta.actor.offload_model:
-            with _step_profiler.track("offload_model", actor_name=ta.name):
+        if actor_obj.training_config.offload_model:
+            with _step_profiler.track("offload_model", actor_name=actor_name):
                 offload_info = offload_model_and_optimizer(
                     ta.model, ta.optim, offload_optimizer=False, offload_model=True
                 )
@@ -523,13 +450,13 @@ class BaseRLTrainer:
 
         if self.accel.is_local_main_process:
             if is_peft_model(ta.model):
-                ta.actor.update_lora_weights()
+                actor_obj.update_lora_weights()
             else:
-                ta.actor.finalize_weight_update()
+                actor_obj.finalize_weight_update()
 
     def _clip_gradients(
         self,
-        ta: InitializedTrainableLLMActor,
+        ta: ActorTrainState,
         clip_to: float | None = None,
     ) -> float:
         ta.accel.gradient_state._set_sync_gradients(True)
@@ -551,7 +478,7 @@ class BaseRLTrainer:
 
         return grad_norm
 
-    def _optim_step(self, ta: InitializedTrainableLLMActor) -> None:
+    def _optim_step(self, ta: ActorTrainState) -> None:
         ta.optim.step()
         ta.sched.step()
         ta.optim.zero_grad()
@@ -562,6 +489,9 @@ class BaseRLTrainer:
         run_checkpoint_path = os.path.join(self.cfg.checkpoint_path, f"run_{timestamp}")
         if self.accel.is_main_process:
             os.makedirs(run_checkpoint_path, exist_ok=True)
+
+        # Log configuration to wandb
+        self._log_config_to_wandb()
 
         start_time = time.time()
         total_steps = 0
@@ -597,7 +527,11 @@ class BaseRLTrainer:
                 "full_train_step", no_memory_measurement=True
             ):
                 try:
-                    env_output = self.env(batch_size=self.batch_size // self.group_size, group_size=self.group_size)
+                    env_output = self.env(batch_size=self.batch_size // self.group_size, group_size=self.group_size) 
+                    # We sleep all trainable actors.
+                    for actor_name, ta in self.actors.items():
+                        actor_obj = self.actor_objects[actor_name]
+                        actor_obj.sleep()
                     result = self.train_step(env_output)
                 except StopIteration:
                     break
@@ -753,7 +687,7 @@ class BaseRLTrainer:
             metrics = self._compute_actor_eval_metrics(actor_output)
             result.add_actor_metrics(actor_name, metrics)
 
-            completion_data = self._build_completion_data(ta, actor_output, is_eval=True)
+            completion_data = self._build_completion_data(ta, actor_output, actor_name, is_eval=True)
             result.add_completion_data(actor_name, completion_data)
 
         return result
@@ -800,8 +734,9 @@ class BaseRLTrainer:
 
     def _build_completion_data(
         self,
-        ta: InitializedTrainableLLMActor,
+        ta: ActorTrainState,
         actor_output: "ActorOutput",
+        actor_name: str,
         is_eval: bool = False,
     ) -> Dict[str, List[Any]]:
         """Build completion data for logging. Works for both training and eval."""
@@ -817,6 +752,7 @@ class BaseRLTrainer:
         # Add advantages only for training
         if not is_eval and hasattr(self, "_calculate_advantages"):
             advantages = self._calculate_advantages(
+                actor_name,
                 actor_output.rewards,
                 self.group_size,
                 actor_output.ended_in_eos,
@@ -880,14 +816,15 @@ class BaseRLTrainer:
                 colorize("🔄 Updating actor weights from checkpoint…", Palette.INFO)
             )
 
-        for ta in self.actors.values():
-            self._update_actor_weights(ta)
+        for actor_name, ta in self.actors.items():
+            self._update_actor_weights(ta, actor_name)
             if self.accel.is_local_main_process:
-                ta.actor.sleep()
+                actor_obj = self.actor_objects[actor_name]
+                actor_obj.sleep()
                 if self.accel.is_main_process:
                     self.logger.normal(
                         colorize(
-                            f"😴 Actor '{ta.name}' put to sleep after resume",
+                            f"😴 Actor '{actor_name}' put to sleep after resume",
                             Palette.INFO,
                         )
                     )
@@ -898,7 +835,8 @@ class BaseRLTrainer:
 
         for name, ta in self.actors.items():
             # reload if offloaded
-            if ta.actor.offload_model:
+            actor_obj = self.actor_objects[name]
+            if actor_obj.training_config.offload_model:
                 self.logger.normal(
                     colorize(f"🔄 Reloading model for actor LORA", Palette.INFO)
                 )
@@ -927,7 +865,8 @@ class BaseRLTrainer:
                 warnings.warn(f"Actor '{name}' has no tokenizer - skipped.")
 
             # offload.
-            if ta.actor.offload_model:
+            actor_obj = self.actor_objects[name]
+            if actor_obj.training_config.offload_model:
                 offload_model_and_optimizer(
                     ta.model, ta.optim, offload_optimizer=False, offload_model=True
                 )
@@ -980,7 +919,7 @@ class BaseRLTrainer:
 
     def _push_single_actor(
         self,
-        ta: TrainableLLMActor,
+        ta: ActorTrainState,
         repo_id: str,
         *,
         private: bool,
@@ -1123,20 +1062,12 @@ class BaseRLTrainer:
         return self.cfg.grad_accumulation_steps
 
     @property
-    def max_grad_norm(self) -> float:
-        return self.cfg.max_grad_norm
-
-    @property
     def number_of_devices(self) -> int:
         return self.accel.num_processes
 
     @property
     def rank(self) -> int:
         return self.accel.process_index
-
-    @property
-    def reference_batch_size(self) -> int:
-        return self.cfg.reference_batch_size
 
     @property
     def eval_strategy(self) -> EvalStrategy:
@@ -1187,6 +1118,42 @@ class BaseRLTrainer:
                 {f"{prefix}/step_{self._step}": table},
                 step=self._substep,
             )
+
+    def _log_config_to_wandb(self):
+        """Log configuration to wandb at the start of training."""
+        if self.use_wandb and is_wandb_active() and self.accel.is_main_process:
+            import wandb
+
+            trainer_config = self.cfg.to_dict()
+            wandb.config.update({"trainer": trainer_config})
+
+            actor_configs = {}
+            for actor_name, actor_obj in self.actor_objects.items():
+                if hasattr(actor_obj, 'training_config'):
+                    actor_configs[actor_name] = actor_obj.training_config.to_dict()
+                    actor_configs[actor_name].update({
+                        "actor_class": actor_obj.__class__.__name__,
+                    })
+
+                    # We also add all config attributes of the actor object
+                    for attr_name, attr_value in actor_obj.__dict__.items():
+                        if type(attr_value) in [int, float, str, bool, list, dict]:
+                            actor_configs[actor_name][attr_name] = attr_value
+            if actor_configs:
+                wandb.config.update({"actors": actor_configs})
+
+            env_info = {
+                "type": type(self.env).__name__,
+            }
+            
+            if hasattr(self.env, 'to_dict'):
+                try:
+                    env_config = self.env.to_dict()
+                    env_info.update(env_config)
+                except:
+                    pass
+            
+            wandb.config.update({"environment": env_info})
 
     def log_training_metrics(self, metrics: Dict[str, List[Dict[str, float]]]):
         if self.accel.is_main_process and self._step % self.log_every_n == 0:

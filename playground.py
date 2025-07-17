@@ -1,16 +1,9 @@
 import torch
-from actors.environments.env_base import Environment
-from actors.environments.types import GroupedEnvironmentOutput, ActorOutput
 from actors.actors import vLLMActor
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from liger_kernel.transformers import AutoLigerKernelForCausalLM
-from actors.losses.grpo_loss import GRPOLoss
-from actors.losses.liger_grpo_loss import LigerLoss
-from torch.optim.lr_scheduler import LinearLR, ConstantLR
 from vllm import SamplingParams
-from actors.trainers.trainer import GRPOTrainer, GRPOTrainerCfg
-from actors.trainers.base_trainer import EvalStrategy
-import bitsandbytes as bnb
+from actors.trainers.grpo_trainer import GRPOTrainer
+from actors.trainers.grpo_config import GRPOTrainerCfg
+from actors.trainers.base_config import SaveStrategy, EvalStrategy, ActorTrainCfg
 from actors.environments import SimpleSingleTurnEnvironment
 from datasets import Dataset
 
@@ -43,6 +36,17 @@ def get_lr_scheduler(optimizer, max_step):
     return scheduler
 
 def main():
+    # Create training configuration
+    training_config = ActorTrainCfg(
+        learning_rate=2e-6,
+        optimizer="adamw_8bit",
+        loss="liger_grpo",
+        scheduler=get_lr_scheduler,
+        offload_model=True,
+        offload_optimizer=True,
+        beta=0.04,
+    )
+    
     # Create actor with improved configuration API
     actor = vLLMActor(
         name="main",
@@ -52,15 +56,7 @@ def main():
             "max_model_len": 2048,
             "quantization": "fp8"
         },
-        # Training configuration now directly in constructor
-        learning_rate=2e-6,
-        optimizer="adamw_8bit",  # Using string for convenience
-        loss="liger_grpo",  # Using string for liger loss
-        loss_kwargs={"beta": 0.04, "temperature": 1.0},
-        scheduler=get_lr_scheduler,
-        # Offloading configuration now in actor
-        offload_model=True,
-        offload_optimizer=True,
+        training_config=training_config,
     )
     tokenizer = actor.tokenizer
 
@@ -126,13 +122,11 @@ def main():
         batch_size=64,
         grad_accumulation_steps=8,
         num_iterations=2,
-        reference_batch_size=64,
         log_every_n=1,
         eval_every_n=50,  # Run evaluation every 50 steps
         eval_strategy=EvalStrategy.ALL,  # Run evaluation both periodically and at the end
-        gradient_checkpointing=True,
-        std_normalization=True,
         checkpoint_every_n=30,
+        save_strategy=SaveStrategy.ALL,
     )
     
     # Create trainer with environment

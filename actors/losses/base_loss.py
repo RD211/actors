@@ -1,11 +1,23 @@
 from __future__ import annotations
 import abc, torch
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from actors.trainers.base_config import ActorTrainCfg
 
 class BaseRLLoss(abc.ABC):
     """Every loss must return (scalar_loss, metrics:dict[str,float])."""
     beta: float = 0.4 
     temperature: float = 1.0 
+
+    def __init__(self, config: 'ActorTrainCfg'):
+        """Initialize loss with actor training configuration.
+        
+        Args:
+            config: Full actor training configuration
+        """
+        self.beta = config.beta
+        self.temperature = config.loss_temp 
 
     @abc.abstractmethod
     def forward(

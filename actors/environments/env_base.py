@@ -1,24 +1,16 @@
 from __future__ import annotations
 import asyncio
 import torch
-from torch import nn
-from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
-from transformers import PreTrainedTokenizer
-from torch.utils.data import Dataset, DataLoader, RandomSampler
+from torch.utils.data import DataLoader, RandomSampler
 
-import abc, dataclasses
+import abc
 from typing import Dict, Union, List, Any, Optional
 
-from actors import TrainableLLMActor
+from actors.actors.base import TrainableLLMActor
+    
 from actors.environments.types import EnvironmentOutput, GroupedEnvironmentOutput
 from datasets import Dataset as HFDataset, DatasetDict
 
-from dataclasses import dataclass
-from typing import Callable, Iterable
-
-
-from actors.losses.base_loss import BaseRLLoss
 
 
 class Environment(abc.ABC):
@@ -204,6 +196,8 @@ class Environment(abc.ABC):
     def register(self, actor: TrainableLLMActor) -> None:
         if actor.name in self._reg:
             raise ValueError(f"duplicate actor {actor.name}")
+        if actor.training_config is None:
+            raise ValueError(f"actor {actor.name} has no training config. Please set training_config before registering.")
         self._reg[actor.name] = actor
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Literal, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple, TYPE_CHECKING
 
 import deepspeed
 import torch
@@ -9,45 +9,31 @@ from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
 
 from .base_loss import BaseRLLoss
 
+if TYPE_CHECKING:
+    from actors.trainers.base_config import ActorTrainCfg
 
 AllowedLoss = Literal["grpo", "bnpo", "dr_grpo"]
 
-
-class LigerLoss(BaseRLLoss):
-    """
-    Liger token-level GRPO / BNPO / DR-GRPO loss.
-
-    Parameters
-    ----------
-    beta : float
-    loss_type : {"grpo", "bnpo", "dr_grpo"}
-    use_ref_model : bool
-    temperature : float
-    """
+class LigerGRPOLoss(BaseRLLoss):
 
     def __init__(
         self,
-        *,
-        beta: float,
-        temperature: float = 1.0,
+        config: 'ActorTrainCfg',
         loss_type: AllowedLoss = "bnpo",
     ) -> None:
-        super().__init__()
+        super().__init__(config=config)
 
         if loss_type not in ("grpo", "bnpo", "dr_grpo"):
             raise ValueError(f"invalid loss_type '{loss_type}'")
 
         self.core: LigerFusedLinearGRPOLoss = LigerFusedLinearGRPOLoss(
-            beta=beta,
-            use_ref_model=beta > 0.0,
+            beta=self.beta,
+            use_ref_model=self.beta > 0.0,
             loss_type=loss_type,
-            temperature=temperature,
+            temperature=self.temperature,
         )
-        self.beta: float = beta
         self.loss_type: AllowedLoss = loss_type
 
-
-    # ---------------------------------------------------------------- forward
 
     def forward(
         self,
