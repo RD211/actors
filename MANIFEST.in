@@ -1,0 +1,12 @@
+include README.md
+include LICENSE
+include pyproject.toml
+include requirements.txt
+include config.yaml
+include zero3.yaml
+recursive-include actors *.py
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
+recursive-exclude * .DS_Store
+prune checkpoints
+prune wandb

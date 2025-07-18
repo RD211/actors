@@ -1,16 +1,19 @@
 from __future__ import annotations
+
 import asyncio
 import atexit
-import math, time, threading, uuid
+import math
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any
 
+import ray
 import torch
 from vllm import RequestOutput, SamplingParams
-import ray
 
+from actors.inference.worker import DEFAULT_LORA, ModelWorker
 from actors.utils.logger import Palette, colorize, logger
-from actors.inference.worker import ModelWorker, DEFAULT_LORA
 
 
 @dataclass
@@ -29,36 +32,31 @@ class ModelRecord:
     name: str
     path: str
     is_v1: bool
-    gpu_groups: List[List[int]]
-    kwargs: Dict[str, Any]
-    workers: List[Any] = field(default_factory=list)
+    gpu_groups: list[list[int]]
+    kwargs: dict[str, Any]
+    workers: list[Any] = field(default_factory=list)
     stats: ModelStats = field(default_factory=ModelStats)
 
 
 class ModelPool:
     """RPC façade combining many ModelWorker processes."""
 
-    DASH_INTERVAL = 60  # seconds
+    _singleton: ModelPool | None = None
+    _lock = threading.Lock()  # guard first construction
 
-    _singleton: "ModelPool" | None = None
-    _lock = threading.Lock()            # guard first construction
-
-    DASH_INTERVAL = 60  # seconds
-
-    # ---------- Pythonic singleton hook ----------------------------
     def __new__(cls, *args, **kwargs):
         with cls._lock:
             if cls._singleton is None:
                 cls._singleton = super().__new__(cls)
         return cls._singleton
 
-    # ---------- normal initialisation (runs once) ------------------
     _init_done = False
+
     def __init__(self) -> None:
-        if self._init_done:   # prevent second-pass re-initialisation
+        if self._init_done:  # prevent second-pass re-initialisation
             return
         self.total_gpus = torch.cuda.device_count()
-        self.models: Dict[str, ModelRecord] = {}
+        self.models: dict[str, ModelRecord] = {}
         ray.init(ignore_reinit_error=True)
         self._init_done = True
         # Register cleanup on exit
@@ -75,7 +73,7 @@ class ModelPool:
                 except Exception:
                     # Silently ignore individual model cleanup errors
                     pass
-            
+
             # Shutdown Ray
             try:
                 ray.shutdown()
@@ -85,8 +83,11 @@ class ModelPool:
         except Exception:
             # Silently ignore all cleanup errors to prevent segfaults
             pass
-    # ------------- dashboard --------------------------------------
-    def _render_dashboard(self) -> str:
+
+    def list_models(self) -> list[str]:
+        return list(self.models)
+
+    def print_models(self) -> str:
         if not self.models:
             return "(no models loaded)"
 
@@ -115,24 +116,17 @@ class ModelPool:
             )
 
         header_line = colorize(pad(header), Palette.SUCCESS)
-        separator    = "  ".join("-" * w for w in col_w)
+        separator = "  ".join("-" * w for w in col_w)
 
-        prettified = [header_line, separator]
+        lines = [header_line, separator]
 
         for idx, row in enumerate(rows[1:], 1):
             shade = Palette.INFO if idx % 2 else Palette.MUTED
-            prettified.append(pad(row, shade))
+            lines.append(pad(row, shade))
 
-        return "\n".join(prettified)
-
-    # ------------- RPC helpers ------------------------------------
-    def list_models(self) -> List[str]:
-        return list(self.models)
-
-    def print_models(self) -> str:
-        board = self._render_dashboard()
-        logger.verbose("\n" + board)
-        return board
+        table = "\n".join(lines)
+        logger.verbose("\n" + table)
+        return table
 
     # ------------- model lifecycle --------------------------------
     def load_model(
@@ -140,9 +134,9 @@ class ModelPool:
         *,
         name: str,
         model_path: str,
-        gpu_groups: List[List[int]] | int | None = None,
+        gpu_groups: list[list[int]] | int | None = None,
         use_v1_engine: bool = True,
-        engine_kwargs: Dict[str, Any] | None = None,
+        engine_kwargs: dict[str, Any] | None = None,
     ) -> None:
         if name in self.models:
             raise RuntimeError("Model already loaded")
@@ -156,7 +150,11 @@ class ModelPool:
             size = math.ceil(len(ids) / gpu_groups)
             gpu_groups = [ids[i * size : (i + 1) * size] for i in range(gpu_groups)]
 
-        logger.normal(colorize(f"⏳  Loading {name} on {len(gpu_groups)} GPU groups", Palette.INFO))
+        logger.normal(
+            colorize(
+                f"⏳  Loading {name} on {len(gpu_groups)} GPU groups", Palette.INFO
+            )
+        )
         start = time.monotonic()
         workers = [
             ModelWorker.remote(name, model_path, grp, use_v1_engine, engine_kwargs)
@@ -167,7 +165,7 @@ class ModelPool:
         ray.get([w.ready.remote() for w in workers])
         logger.normal(
             colorize(
-                f"✅  Ready {name} in {time.monotonic()-start:.1f}s", Palette.SUCCESS
+                f"✅  Ready {name} in {time.monotonic() - start:.1f}s", Palette.SUCCESS
             )
         )
 
@@ -189,7 +187,9 @@ class ModelPool:
             logger.quiet(colorize(f"✖️   Unloaded {name}", Palette.WARNING))
         except Exception:
             # Ignore overall unload errors but still log success
-            logger.quiet(colorize(f"✖️   Unloaded {name} (with warnings)", Palette.WARNING))
+            logger.quiet(
+                colorize(f"✖️   Unloaded {name} (with warnings)", Palette.WARNING)
+            )
 
     # ------------- sleep / wake -----------------------------------
     def sleep(self, name: str, level: int = 1) -> None:
@@ -244,18 +244,20 @@ class ModelPool:
         for status, msg in results:
             if status == "ERROR":
                 raise RuntimeError(msg)
-        logger.normal(colorize(f"🔧 Created/initialized LoRA for {name}", Palette.SUCCESS))
+        logger.normal(
+            colorize(f"🔧 Created/initialized LoRA for {name}", Palette.SUCCESS)
+        )
 
     # ------------- inference internal -----------------------------
     @staticmethod
-    def _scatter(batch: List[Any], workers: List[Any]) -> List[list]:
-        shards: List[list] = [[] for _ in workers]
+    def _scatter(batch: list[Any], workers: list[Any]) -> list[list]:
+        shards: list[list] = [[] for _ in workers]
         for idx, item in enumerate(batch):
             shards[idx % len(workers)].append((idx, item))
         return shards
 
     @staticmethod
-    def _gather(shards: List[list]) -> List[Any]:
+    def _gather(shards: list[list]) -> list[Any]:
         flat = [p for shard in shards for p in shard]
         flat.sort(key=lambda pair: pair[0])
         return [output for _, output in flat]
@@ -263,36 +265,39 @@ class ModelPool:
     def _infer(
         self,
         name: str,
-        payload: List[Any],
+        payload: list[Any],
         sampling_params: SamplingParams,
         msg_type: str,
         lora_request=DEFAULT_LORA,
-    ) -> List[RequestOutput]:
+    ) -> list[RequestOutput]:
         rec = self.models[name]
-        
+
         # Handle LoRA request logic at pool level
         # Convert DEFAULT_LORA to actual LoRARequest if model has LoRA enabled
         if lora_request is DEFAULT_LORA and rec.kwargs.get("enable_lora", False):
             from vllm.lora.request import LoRARequest
+
             lora_request = LoRARequest(
-                lora_name='lora',
-                lora_int_id=1,
-                lora_local_path='placeholder'
+                lora_name="lora", lora_int_id=1, lora_local_path="placeholder"
             )
         if lora_request is DEFAULT_LORA:
             lora_request = None
-        
+
         shards = self._scatter(payload, rec.workers)
 
         start = time.monotonic()
 
         futures = []
         infer_fn_name = "generate" if msg_type == "GENERATE" else "chat"
-        for worker, shard in zip(rec.workers, shards):
+        for worker, shard in zip(rec.workers, shards, strict=False):
             if shard:
-                futures.append(getattr(worker, infer_fn_name).remote(shard, sampling_params, lora_request))
+                futures.append(
+                    getattr(worker, infer_fn_name).remote(
+                        shard, sampling_params, lora_request
+                    )
+                )
 
-        collected: List[list] = ray.get(futures)
+        collected: list[list] = ray.get(futures)
 
         duration = time.monotonic() - start
         merged = self._gather(collected)
@@ -315,37 +320,40 @@ class ModelPool:
     async def _ainfer(
         self,
         name: str,
-        payload: List[Any],
+        payload: list[Any],
         sampling_params: SamplingParams,
         msg_type: str,
         lora_request=DEFAULT_LORA,
-    ) -> List[RequestOutput]:
+    ) -> list[RequestOutput]:
         rec = self.models[name]
-        
+
         # Handle LoRA request logic at pool level
         # Convert DEFAULT_LORA to actual LoRARequest if model has LoRA enabled
         if lora_request is DEFAULT_LORA and rec.kwargs.get("enable_lora", False):
             from vllm.lora.request import LoRARequest
+
             lora_request = LoRARequest(
-                lora_name='lora',
-                lora_int_id=1,
-                lora_local_path='placeholder'
+                lora_name="lora", lora_int_id=1, lora_local_path="placeholder"
             )
         if lora_request is DEFAULT_LORA:
             lora_request = None
-        
+
         shards = self._scatter(payload, rec.workers)
 
         start = time.monotonic()
 
         futures = []
         infer_fn_name = "generate" if msg_type == "GENERATE" else "chat"
-        for worker, shard in zip(rec.workers, shards):
+        for worker, shard in zip(rec.workers, shards, strict=False):
             if shard:
-                futures.append(getattr(worker, infer_fn_name).remote(shard, sampling_params, lora_request))
+                futures.append(
+                    getattr(worker, infer_fn_name).remote(
+                        shard, sampling_params, lora_request
+                    )
+                )
 
         # Use asyncio.to_thread to run ray.get in a thread pool
-        collected: List[list] = await asyncio.to_thread(ray.get, futures)
+        collected: list[list] = await asyncio.to_thread(ray.get, futures)
 
         duration = time.monotonic() - start
         merged = self._gather(collected)
@@ -367,21 +375,39 @@ class ModelPool:
 
     # ---------- RPC methods for clients ----------------------------
     def generate(
-        self, name: str, prompts: List[str], sampling_params: SamplingParams, lora_request=DEFAULT_LORA
-    ) -> List[RequestOutput]:
+        self,
+        name: str,
+        prompts: list[str],
+        sampling_params: SamplingParams,
+        lora_request=DEFAULT_LORA,
+    ) -> list[RequestOutput]:
         return self._infer(name, prompts, sampling_params, "GENERATE", lora_request)
 
     def chat(
-        self, name: str, dialogs: List[list], sampling_params: SamplingParams, lora_request=DEFAULT_LORA
-    ) -> List[RequestOutput]:
+        self,
+        name: str,
+        dialogs: list[list],
+        sampling_params: SamplingParams,
+        lora_request=DEFAULT_LORA,
+    ) -> list[RequestOutput]:
         return self._infer(name, dialogs, sampling_params, "CHAT", lora_request)
 
     async def agenerate(
-        self, name: str, prompts: List[str], sampling_params: SamplingParams, lora_request=DEFAULT_LORA
-    ) -> List[RequestOutput]:
-        return await self._ainfer(name, prompts, sampling_params, "GENERATE", lora_request)
+        self,
+        name: str,
+        prompts: list[str],
+        sampling_params: SamplingParams,
+        lora_request=DEFAULT_LORA,
+    ) -> list[RequestOutput]:
+        return await self._ainfer(
+            name, prompts, sampling_params, "GENERATE", lora_request
+        )
 
     async def achat(
-        self, name: str, dialogs: List[list], sampling_params: SamplingParams, lora_request=DEFAULT_LORA
-    ) -> List[RequestOutput]:
+        self,
+        name: str,
+        dialogs: list[list],
+        sampling_params: SamplingParams,
+        lora_request=DEFAULT_LORA,
+    ) -> list[RequestOutput]:
         return await self._ainfer(name, dialogs, sampling_params, "CHAT", lora_request)

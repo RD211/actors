@@ -4,7 +4,7 @@ def is_wandb_active() -> bool:
     False → otherwise (package missing, or no active run yet).
     """
     try:
-        import wandb 
+        import wandb
 
         return wandb.run is not None
     except ModuleNotFoundError:

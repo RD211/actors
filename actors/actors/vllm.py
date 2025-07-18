@@ -1,18 +1,21 @@
 from __future__ import annotations
+
 import atexit
-from typing import Dict, List, Sequence, Callable, Any
+from collections.abc import Sequence
+from typing import Any
+
 import torch
-from torch import nn
-from vllm import SamplingParams, RequestOutput
-from actors.inference.pool import ModelPool
-from actors.inference.worker import DEFAULT_LORA
 from torch.multiprocessing.reductions import reduce_tensor
+from transformers import AutoConfig
+from vllm import RequestOutput, SamplingParams
 from vllm.platforms import current_platform
 
-from actors.utils.logger import Palette, colorize, init_logger
-from .base import TrainableLLMActor
+from actors.inference.pool import ModelPool
+from actors.inference.worker import DEFAULT_LORA
 from actors.trainers.base_config import ActorTrainCfg
-from transformers import AutoConfig
+from actors.utils.logger import Palette, colorize, init_logger
+
+from .base import TrainableLLMActor
 
 
 class vLLMActor(TrainableLLMActor):
@@ -21,9 +24,9 @@ class vLLMActor(TrainableLLMActor):
         *,
         name: str,
         model_path: str,
-        gpu_groups: List[List[int]] | int | None = None,
+        gpu_groups: list[list[int]] | int | None = None,
         use_v1_engine: bool = True,
-        engine_kwargs: Dict[str, Any] | None = None,
+        engine_kwargs: dict[str, Any] | None = None,
         insomnia: bool = False,  # If true all sleep calls will be ignored
         training_config: ActorTrainCfg | None = None,
     ):
@@ -33,7 +36,8 @@ class vLLMActor(TrainableLLMActor):
         if engine_kwargs is None:
             engine_kwargs = {}
 
-        # We extract num_attention_heads if present and check if it is divisible engine_kwargs["tensor_parallel_size"] if tensor parallel size is set
+        # We extract num_attention_heads if present and check
+        # if it is divisible engine_kwargs["tensor_parallel_size"] if tensor parallel size is set
         if "tensor_parallel_size" in engine_kwargs and hasattr(
             model_config, "num_attention_heads"
         ):
@@ -147,7 +151,7 @@ class vLLMActor(TrainableLLMActor):
         prompts: Sequence[str],
         sampling_params: SamplingParams | None = None,
         lora_request=DEFAULT_LORA,
-    ) -> List[RequestOutput]:
+    ) -> list[RequestOutput]:
         sampling = sampling_params or SamplingParams()
         with self._with_wake():
             return self.pool.generate(self.name, list(prompts), sampling, lora_request)
@@ -157,7 +161,7 @@ class vLLMActor(TrainableLLMActor):
         dialogs: Sequence[list],
         sampling_params: SamplingParams | None = None,
         lora_request=DEFAULT_LORA,
-    ) -> List[RequestOutput]:
+    ) -> list[RequestOutput]:
         sampling = sampling_params or SamplingParams()
         with self._with_wake():
             return self.pool.chat(self.name, list(dialogs), sampling, lora_request)
@@ -167,7 +171,7 @@ class vLLMActor(TrainableLLMActor):
         prompts: Sequence[str],
         sampling_params: SamplingParams | None = None,
         lora_request=DEFAULT_LORA,
-    ) -> List[RequestOutput]:
+    ) -> list[RequestOutput]:
         sampling = sampling_params or SamplingParams()
         with self._with_wake():
             return await self.pool.agenerate(
@@ -179,7 +183,7 @@ class vLLMActor(TrainableLLMActor):
         dialogs: Sequence[list],
         sampling_params: SamplingParams | None = None,
         lora_request=DEFAULT_LORA,
-    ) -> List[RequestOutput]:
+    ) -> list[RequestOutput]:
         sampling = sampling_params or SamplingParams()
         with self._with_wake():
             return await self.pool.achat(
@@ -189,11 +193,11 @@ class vLLMActor(TrainableLLMActor):
     def start_weight_update(self):
         self.pool.start_update(self.name)
 
-    def update_weights_batch(self, state_dict: Dict[str, torch.Tensor]):
+    def update_weights_batch(self, state_dict: dict[str, torch.Tensor]):
         if not state_dict:
             return
 
-        tensors_by_device: Dict[torch.device, Dict[str, torch.Tensor]] = {}
+        tensors_by_device: dict[torch.device, dict[str, torch.Tensor]] = {}
         for name, tensor in state_dict.items():
             device = tensor.device
             if device not in tensors_by_device:

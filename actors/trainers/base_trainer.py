@@ -1,41 +1,43 @@
-from dataclasses import dataclass
-from datetime import datetime, timedelta
 import os
 import shutil
 import tempfile
 import time
 import warnings
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any
+
 import deepspeed
-
-from peft import get_peft_model
 import torch
-
 from accelerate import Accelerator, InitProcessGroupKwargs
-from transformers import PreTrainedTokenizerBase
 from accelerate.utils import DeepSpeedPlugin, DistributedType
+from peft import get_peft_model, prepare_model_for_kbit_training
+from transformers import PreTrainedTokenizerBase
+
 from actors.actors.base import TrainableLLMActor
 from actors.environments.env_base import Environment
-from actors.environments.types import GroupedEnvironmentOutput
-from typing import Dict, Any, List, Optional, Union
-
-from actors.trainers.base_config import TrainerCfg, ActorTrainState, SaveStrategy, EvalStrategy
+from actors.environments.types import ActorOutput, GroupedEnvironmentOutput
+from actors.trainers.base_config import (
+    ActorTrainState,
+    EvalStrategy,
+    SaveStrategy,
+    TrainerCfg,
+)
 from actors.utils.deepspeed import (
     offload_model_and_optimizer,
     prepare_deepspeed,
     reload_model_and_optimizer,
 )
-from actors.utils.logger import Palette, colorize, init_logger
+from actors.utils.get_logps import _chunked_logp
 from actors.utils.ipc_utils import gather_and_stream_state_dict
+from actors.utils.logger import Palette, colorize, init_logger
 from actors.utils.tracker import (
-    start_step_profiling,
-    log_step_profiling,
     _step_profiler,
+    log_step_profiling,
+    start_step_profiling,
 )
 from actors.utils.train_utils import disable_dropout_in_model
 from actors.utils.wandb import is_wandb_active
-from actors.environments.types import ActorOutput
-from actors.utils.get_logps import _chunked_logp
-from peft import prepare_model_for_kbit_training
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Utility functions
@@ -63,11 +65,11 @@ class TrainingMetrics:
     - completions: Dict[actor_name -> Dict[column_name -> List[values]]] (once per step)
     """
 
-    substep_metrics: Dict[str, List[Dict[str, float]]] = (
+    substep_metrics: dict[str, list[dict[str, float]]] = (
         None  # actor -> [substep_metrics]
     )
-    step_metrics: Dict[str, Dict[str, float]] = None  # actor -> step_metrics
-    completions: Dict[str, Dict[str, List[Any]]] = None  # actor -> completion_data
+    step_metrics: dict[str, dict[str, float]] = None  # actor -> step_metrics
+    completions: dict[str, dict[str, list[Any]]] = None  # actor -> completion_data
 
     def __post_init__(self):
         if self.substep_metrics is None:
@@ -97,7 +99,7 @@ class TrainingMetrics:
 
         self.step_metrics[actor_name][metric_name] = value
 
-    def add_actor_rewards(self, actor_name: str, rewards: List[float]):
+    def add_actor_rewards(self, actor_name: str, rewards: list[float]):
         """Helper to add reward statistics for an actor."""
         if rewards:
             mean_value = sum(rewards) / len(rewards)
@@ -110,7 +112,7 @@ class TrainingMetrics:
             self.add_step_metric(actor_name, "reward_std", std_value)
 
     def add_actor_reward_component(
-        self, actor_name: str, component_name: str, rewards: List[float]
+        self, actor_name: str, component_name: str, rewards: list[float]
     ):
         """Helper to add reward component statistics for an actor."""
         if rewards:
@@ -123,11 +125,11 @@ class TrainingMetrics:
             self.add_step_metric(actor_name, f"{component_name}_mean", mean_value)
             self.add_step_metric(actor_name, f"{component_name}_std", std_value)
 
-    def add_completion_data(self, actor_name: str, data: Dict[str, List[Any]]):
+    def add_completion_data(self, actor_name: str, data: dict[str, list[Any]]):
         """Add completion data for an actor."""
         self.completions[actor_name] = data
 
-    def get_combined_metrics(self) -> Dict[str, List[Dict[str, float]]]:
+    def get_combined_metrics(self) -> dict[str, list[dict[str, float]]]:
         """Combine step and substep metrics for logging."""
         result = {}
 
@@ -164,8 +166,8 @@ class EvaluationMetrics:
     - completions: Dict[actor_name -> Dict[column_name -> List[values]]] (completion data)
     """
 
-    metrics: Dict[str, Dict[str, float]] = None
-    completions: Dict[str, Dict[str, List[Any]]] = None
+    metrics: dict[str, dict[str, float]] = None
+    completions: dict[str, dict[str, list[Any]]] = None
 
     def __post_init__(self):
         if self.metrics is None:
@@ -173,13 +175,14 @@ class EvaluationMetrics:
         if self.completions is None:
             self.completions = {}
 
-    def add_actor_metrics(self, actor_name: str, metrics: Dict[str, float]):
+    def add_actor_metrics(self, actor_name: str, metrics: dict[str, float]):
         """Add evaluation metrics for an actor."""
         self.metrics[actor_name] = metrics
 
-    def add_completion_data(self, actor_name: str, data: Dict[str, List[Any]]):
+    def add_completion_data(self, actor_name: str, data: dict[str, list[Any]]):
         """Add completion data for an actor."""
         self.completions[actor_name] = data
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Base RLTrainer class
@@ -191,7 +194,7 @@ class BaseRLTrainer:
         self,
         cfg: TrainerCfg,
         env: Environment,
-        actors: List[TrainableLLMActor],
+        actors: list[TrainableLLMActor],
     ):
         self.cfg = cfg
         self.env = env
@@ -202,16 +205,18 @@ class BaseRLTrainer:
         # Validate actors
         if not actors:
             raise ValueError("No trainable actors provided.")
-        
+
         # Convert list to dict using actor names
         actors_dict = {}
         for actor in actors:
             if actor.training_config is None:
-                raise ValueError(f"Actor {actor.name} has no training config. Please set training_config before passing to trainer.")
+                raise ValueError(
+                    f"Actor {actor.name} has no training config. Please set training_config before passing to trainer."
+                )
             if actor.name in actors_dict:
                 raise ValueError(f"Duplicate actor name: {actor.name}")
             actors_dict[actor.name] = actor
-        
+
         self.actors = self._setup_actors(actors_dict)
         self.actor_objects = actors_dict
         self._setup_loras()
@@ -221,13 +226,13 @@ class BaseRLTrainer:
     # ═══════════════════════════════════════════════════════════════════════
 
     def _setup_actors(
-        self, trainable_actors: Dict[str, TrainableLLMActor]
-    ) -> Dict[str, ActorTrainState]:
+        self, trainable_actors: dict[str, TrainableLLMActor]
+    ) -> dict[str, ActorTrainState]:
         """
         Initializes the trainable actors and returns a dictionary of initialized actors.
         """
-        self.ds_plugins: Dict[str, DeepSpeedPlugin] = {
-            name: DeepSpeedPlugin() for name in trainable_actors.keys()
+        self.ds_plugins: dict[str, DeepSpeedPlugin] = {
+            name: DeepSpeedPlugin() for name in trainable_actors
         }
 
         for name, plug in self.ds_plugins.items():
@@ -245,7 +250,8 @@ class BaseRLTrainer:
         actors_with_offloading = {
             name: actor
             for name, actor in trainable_actors.items()
-            if actor.training_config.offload_optimizer or actor.training_config.offload_model
+            if actor.training_config.offload_optimizer
+            or actor.training_config.offload_model
         }
 
         if actors_with_offloading:
@@ -267,7 +273,7 @@ class BaseRLTrainer:
                     actor.training_config.offload_optimizer = False
                     actor.training_config.offload_model = False
 
-        accelerators: Dict[str, Accelerator] = {
+        accelerators: dict[str, Accelerator] = {
             actor: Accelerator(
                 mixed_precision="bf16",
                 deepspeed_plugin=self.ds_plugins[actor],
@@ -276,7 +282,7 @@ class BaseRLTrainer:
             for actor in self.ds_plugins
         }
 
-        actors: Dict[str, ActorTrainState] = {}
+        actors: dict[str, ActorTrainState] = {}
 
         for name, actor_obj in trainable_actors.items():
             accel = accelerators[name]
@@ -291,19 +297,23 @@ class BaseRLTrainer:
 
             # We check if the model has a quantization_config
             if hasattr(model.config, "quantization_config"):
-                if model.config.quantization_config.bnb_4bit_quant_storage != torch.bfloat16:
+                if (
+                    model.config.quantization_config.bnb_4bit_quant_storage
+                    != torch.bfloat16
+                ):
                     raise ValueError(
                         f"Expected bnb_4bit_quant_storage to be torch.bfloat16, but got {model.config.quantization_config.bnb_4bit_quant_storage}, consider making a custom model factory."
                     )
                 prepare_model_for_kbit_training(model)
-                
+
             # Apply PEFT configuration if available
             if actor_obj.training_config.has_peft_config:
-                model = get_peft_model(model, actor_obj.training_config.peft_config).train()
+                model = get_peft_model(
+                    model, actor_obj.training_config.peft_config
+                ).train()
 
             if actor_obj.training_config.gradient_checkpointing:
                 if is_peft_model(model):
-
                     model.base_model.gradient_checkpointing_enable(
                         gradient_checkpointing_kwargs={
                             "use_reentrant": True,
@@ -370,13 +380,16 @@ class BaseRLTrainer:
                 model_config=model_cfg,
                 sched=sched,
             )
-            
+
             # Set the train_state on the actor
             actor_obj.train_state = train_state
             actors[name] = train_state
 
             # We offload the model and optimizer if requested
-            if actor_obj.training_config.offload_optimizer or actor_obj.training_config.offload_model:
+            if (
+                actor_obj.training_config.offload_optimizer
+                or actor_obj.training_config.offload_model
+            ):
                 offload_model_and_optimizer(
                     train_state.model,
                     train_state.optim,
@@ -387,7 +400,7 @@ class BaseRLTrainer:
         return actors
 
     def _setup_loras(self) -> str:
-        #TODO: If not loras. there is no need to do all of this.
+        # TODO: If not loras. there is no need to do all of this.
         os.makedirs(self.cfg.checkpoint_path, exist_ok=True)
 
         if self.accel.is_main_process:
@@ -407,7 +420,7 @@ class BaseRLTrainer:
 
         multiple_actors = len(self.actors) > 1
         if self.accel.is_local_main_process:
-            for name, ta in self.actors.items():
+            for name, _ in self.actors.items():
                 actor_obj = self.actor_objects[name]
                 if actor_obj.has_peft_config:
                     actor_obj.create_lora_if_not_present(
@@ -425,9 +438,8 @@ class BaseRLTrainer:
 
     def _update_actor_weights(self, ta: ActorTrainState, actor_name: str) -> None:
         actor_obj = self.actor_objects[actor_name]
-        
-        with _step_profiler.track("update_weights", actor_name=actor_name):
 
+        with _step_profiler.track("update_weights", actor_name=actor_name):
             if ta.accel.is_local_main_process:
                 actor_obj.start_weight_update()
 
@@ -451,9 +463,7 @@ class BaseRLTrainer:
                 )
                 if self.accel.is_main_process:
                     if offload_info["model_offloaded"]:
-                        self.logger.normal(
-                            colorize(f"💤 Offloaded model", Palette.INFO)
-                        )
+                        self.logger.normal(colorize("💤 Offloaded model", Palette.INFO))
 
         if self.accel.is_local_main_process:
             if is_peft_model(ta.model):
@@ -502,13 +512,13 @@ class BaseRLTrainer:
 
         start_time = time.time()
         total_steps = 0
-        
+
         dataloader = self.env.get_dataloader(self.batch_size // self.group_size)
         if dataloader is None:
             raise ValueError("Environment has no training data")
-        
+
         steps_per_epoch = len(dataloader)
-        
+
         while True:
             if self.cfg.max_steps is not None and self._step >= self.cfg.max_steps:
                 self.logger.normal(
@@ -518,57 +528,59 @@ class BaseRLTrainer:
                     )
                 )
                 break
-                
+
             if self.cfg.max_steps is None:
                 current_epoch = self.env.get_data_state()["epoch"]
                 if current_epoch >= self.cfg.epochs:
                     break
-                    
+
                 if self.env.batches_left(self.batch_size // self.group_size) == 0:
                     break
 
             self._step += 1
 
             start_step_profiling()
-            with _step_profiler.track(
-                "full_train_step", no_memory_measurement=True
-            ):
+            with _step_profiler.track("full_train_step", no_memory_measurement=True):
                 try:
                     env_output = self.env(
-                        batch_size=self.batch_size // self.group_size, 
-                        group_size=self.group_size
-                    ) 
+                        batch_size=self.batch_size // self.group_size,
+                        group_size=self.group_size,
+                    )
                     # We sleep all trainable actors.
-                    for actor_name, ta in self.actors.items():
+                    for actor_name, _ in self.actors.items():
                         actor_obj = self.actor_objects[actor_name]
                         actor_obj.sleep()
                     result = self.train_step(env_output)
                 except StopIteration:
                     break
-                    
-            log_step_profiling(
-                self._substep, self.accel, use_wandb=self.cfg.use_wandb
-            )
+
+            log_step_profiling(self._substep, self.accel, use_wandb=self.cfg.use_wandb)
 
             metrics = result.get_combined_metrics()
-            
+
             if self._step % self.log_every_n == 0:
                 self.log_training_metrics(metrics)
                 for actor_name, completion_data in result.completions.items():
                     if completion_data:
                         enhanced_completion_data = {}
-                        
+
                         if env_output.problems:
-                            completion_length = len(next(iter(completion_data.values())))
-                            
+                            completion_length = len(
+                                next(iter(completion_data.values()))
+                            )
+
                             for key in env_output.problems[0].keys():
                                 enhanced_completion_data[key] = []
                                 for problem in env_output.problems:
-                                    for _ in range(completion_length // len(env_output.problems)):
-                                        enhanced_completion_data[key].append(problem[key])
-                        
+                                    for _ in range(
+                                        completion_length // len(env_output.problems)
+                                    ):
+                                        enhanced_completion_data[key].append(
+                                            problem[key]
+                                        )
+
                         enhanced_completion_data.update(completion_data)
-                        
+
                         self.log_completions(
                             enhanced_completion_data, prefix=f"completions/{actor_name}"
                         )
@@ -618,7 +630,9 @@ class BaseRLTrainer:
                     eta_str = str(timedelta(seconds=int(eta_seconds)))
 
                 current_data_state = self.env.get_data_state()
-                fractional_epoch = current_data_state["epoch"] + (current_data_state["step_in_epoch"] / steps_per_epoch)
+                fractional_epoch = current_data_state["epoch"] + (
+                    current_data_state["step_in_epoch"] / steps_per_epoch
+                )
                 header = (
                     f"STEP {self._step:,}/{self.cfg.max_steps:,} ({progress:.1f}%) • ETA: {eta_str}"
                     if self.cfg.max_steps
@@ -634,7 +648,7 @@ class BaseRLTrainer:
                 and self._step % self.eval_every_n == 0
             ):
                 self.evaluate(is_final=False)
-            
+
             total_steps += 1
 
         if self.env.eval_datasets and self.eval_strategy in {
@@ -661,7 +675,7 @@ class BaseRLTrainer:
     # Eval
     # ═══════════════════════════════════════════════════════════════════════
 
-    def evaluate(self, is_final: bool = False) -> Optional[Dict[str, Any]]:
+    def evaluate(self, is_final: bool = False) -> dict[str, Any] | None:
         if not self.env.eval_datasets:
             return None
 
@@ -670,7 +684,7 @@ class BaseRLTrainer:
 
         # Use environment's eval method to get all eval results
         eval_outputs = self.env.eval(group_size=1)
-        
+
         all_eval_metrics = {}
         for eval_name, env_output in eval_outputs.items():
             result = self.eval_step(env_output)
@@ -697,12 +711,16 @@ class BaseRLTrainer:
             metrics = self._compute_actor_eval_metrics(actor_output)
             result.add_actor_metrics(actor_name, metrics)
 
-            completion_data = self._build_completion_data(ta, actor_output, actor_name, is_eval=True)
+            completion_data = self._build_completion_data(
+                ta, actor_output, actor_name, is_eval=True
+            )
             result.add_completion_data(actor_name, completion_data)
 
         return result
 
-    def _compute_actor_eval_metrics(self, actor_output: "ActorOutput") -> Dict[str, float]:
+    def _compute_actor_eval_metrics(
+        self, actor_output: "ActorOutput"
+    ) -> dict[str, float]:
         """Compute evaluation metrics for an actor output."""
         rewards = actor_output.rewards
         reward_mean = sum(rewards) / len(rewards) if rewards else 0.0
@@ -748,10 +766,10 @@ class BaseRLTrainer:
         actor_output: "ActorOutput",
         actor_name: str,
         is_eval: bool = False,
-    ) -> Dict[str, List[Any]]:
+    ) -> dict[str, list[Any]]:
         """Build completion data for logging. Works for both training and eval."""
         data = {}
-        
+
         data["completion"] = [
             ta.tokenizer.decode(completion_ids, skip_special_tokens=False)
             for completion_ids in actor_output.input_ids
@@ -810,9 +828,11 @@ class BaseRLTrainer:
         state = torch.load(os.path.join(path, "trainer_state.pt"), map_location="cpu")
         self._step = state["step"]
         self._substep = state["substep"]
-        
+
         # Restore environment state
-        self.env.set_data_state(state["env_data_state"], self.batch_size // self.group_size)
+        self.env.set_data_state(
+            state["env_data_state"], self.batch_size // self.group_size
+        )
         self.env.set_rng_state(state["env_rng_state"])
 
         for name, ta in self.actors.items():
@@ -848,19 +868,19 @@ class BaseRLTrainer:
             actor_obj = self.actor_objects[name]
             if actor_obj.training_config.offload_model:
                 self.logger.normal(
-                    colorize(f"🔄 Reloading model for actor LORA", Palette.INFO)
+                    colorize("🔄 Reloading model for actor LORA", Palette.INFO)
                 )
                 reload_model_and_optimizer(
                     ta.model, ta.optim, reload_model=True, reload_optimizer=False
                 )
                 self.logger.normal(
-                    colorize(f"🔄 Model reloaded for actor LORA", Palette.INFO)
+                    colorize("🔄 Model reloaded for actor LORA", Palette.INFO)
                 )
             tgt = os.path.join(output_dir, name) if multi else output_dir
             os.makedirs(tgt, exist_ok=True)
 
             state_dict = ta.accel.get_state_dict(ta.model)
-            self.logger.normal(colorize(f"Gathered a state dict", Palette.INFO))
+            self.logger.normal(colorize("Gathered a state dict", Palette.INFO))
 
             ta.accel.unwrap_model(ta.model, keep_torch_compile=False).save_pretrained(
                 tgt,
@@ -872,7 +892,9 @@ class BaseRLTrainer:
             if ta.tokenizer is not None:
                 ta.tokenizer.save_pretrained(tgt)
             else:
-                warnings.warn(f"Actor '{name}' has no tokenizer - skipped.")
+                warnings.warn(
+                    f"Actor '{name}' has no tokenizer - skipped.", stacklevel=2
+                )
 
             # offload.
             actor_obj = self.actor_objects[name]
@@ -886,7 +908,7 @@ class BaseRLTrainer:
 
     def push_to_hub(
         self,
-        repo_map: Union[str, Dict[str, str]],
+        repo_map: str | dict[str, str],
         *,
         private: bool = False,
         commit_message: str | None = None,
@@ -950,61 +972,59 @@ class BaseRLTrainer:
                 commit_message=commit_message,
                 **push_kwargs,
             )
+
     # ═══════════════════════════════════════════════════════════════════════
     # Others
     # ═══════════════════════════════════════════════════════════════════════
-    
+
     @torch.no_grad()
     def _get_logps(
         self,
         model: torch.nn.Module,
-        ids: List[List[int]],
+        ids: list[list[int]],
         tokenizer: PreTrainedTokenizerBase,
         temperature: float = 1.0,
         batch_size: int = 4,
         max_fused: int = 1 << 15,
-    ) -> List[List[float]]:
+    ) -> list[list[float]]:
         """
         Super memory efficient logp computation and actually faster than standard.
         """
-        total   = len(ids)
-        world   = self.number_of_devices
+        total = len(ids)
+        world = self.number_of_devices
         per_rank = (total + world - 1) // world
         start, end = self.rank * per_rank, min((self.rank + 1) * per_rank, total)
         ids_local = ids[start:end]
 
-        local_out: List[List[float]] = []
+        local_out: list[list[float]] = []
 
         for i in range(0, len(ids_local), batch_size):
             batch_ids = ids_local[i : i + batch_size]
             lengths = [len(seq) for seq in batch_ids]
-            enc = tokenizer.pad({"input_ids": batch_ids},
-                                padding=True,
-                                return_tensors="pt")
-            input_ids = enc.input_ids.to(model.device)         # (B,L)
+            enc = tokenizer.pad(
+                {"input_ids": batch_ids}, padding=True, return_tensors="pt"
+            )
+            input_ids = enc.input_ids.to(model.device)  # (B,L)
             attn_mask = enc.attention_mask.to(model.device)
-            L = input_ids.shape[1]                        # sequence length
-            hidden = model.model(                          # type: ignore[attr-defined]
+            L = input_ids.shape[1]  # sequence length
+            hidden = model.model(  # type: ignore[attr-defined]
                 input_ids=input_ids,
                 attention_mask=attn_mask,
                 use_cache=False,
-            ).last_hidden_state                            # (B,L,H)
+            ).last_hidden_state  # (B,L,H)
 
-            hidden = hidden[:, :-1]                            # drop last step
-            target = input_ids[:, 1:]                          # predict t from t−1
+            hidden = hidden[:, :-1]  # drop last step
+            target = input_ids[:, 1:]  # predict t from t−1
 
-            non_pad  = torch.tensor(
-                [
-                    [1] * (l-1) + [0] * (L - l)
-                    for l in lengths
-                ]
+            non_pad = torch.tensor(
+                [[1] * (length - 1) + [0] * (L - length) for length in lengths]
             )
             # Flatten
             h_flat = hidden.reshape(-1, hidden.shape[-1])  # (N,L-1,H)
-            tgt_flat = target.reshape(-1)            # (N,)
-            non_pad   = non_pad.reshape(-1).bool()  # (N,)
-            h_flat   = h_flat[non_pad] / temperature # (N,H)
-            tgt_flat = tgt_flat[non_pad]          # (N,)
+            tgt_flat = target.reshape(-1)  # (N,)
+            non_pad = non_pad.reshape(-1).bool()  # (N,)
+            h_flat = h_flat[non_pad] / temperature  # (N,H)
+            tgt_flat = tgt_flat[non_pad]  # (N,)
 
             with deepspeed.zero.GatheredParameters(
                 [model.lm_head.weight, model.lm_head.bias],
@@ -1015,8 +1035,8 @@ class BaseRLTrainer:
                 ).cpu()
 
             pos = 0
-            for l in lengths:
-                row_len = l - 1
+            for length in lengths:
+                row_len = length - 1
                 local_out.append(lp_flat[pos : pos + row_len].tolist())
                 pos += row_len
 
@@ -1025,7 +1045,7 @@ class BaseRLTrainer:
 
         gathered = self.accel.gather_for_metrics(local_out)
         return gathered
-    
+
     @property
     def accel(self) -> Accelerator:
         return next(iter(self.actors.values())).accel
@@ -1054,7 +1074,7 @@ class BaseRLTrainer:
         dataloader = self.env.get_dataloader(self.batch_size // self.group_size)
         if dataloader is None:
             return 0
-            
+
         steps_per_epoch = len(dataloader)
         total_expected_steps = (
             self.cfg.max_steps
@@ -1065,7 +1085,7 @@ class BaseRLTrainer:
 
     @property
     def group_size(self) -> int:
-        return getattr(self.cfg, 'group_size', 1)
+        return getattr(self.cfg, "group_size", 1)
 
     @property
     def grad_accumulation_steps(self) -> int:
@@ -1087,7 +1107,7 @@ class BaseRLTrainer:
     def eval_every_n(self) -> int:
         return self.cfg.eval_every_n
 
-    def log_completions(self, data: Dict[str, List[Any]], prefix: str = "completions"):
+    def log_completions(self, data: dict[str, list[Any]], prefix: str = "completions"):
         """
         Log arbitrary data as wandb tables.
 
@@ -1139,11 +1159,13 @@ class BaseRLTrainer:
 
             actor_configs = {}
             for actor_name, actor_obj in self.actor_objects.items():
-                if hasattr(actor_obj, 'training_config'):
+                if hasattr(actor_obj, "training_config"):
                     actor_configs[actor_name] = actor_obj.training_config.to_dict()
-                    actor_configs[actor_name].update({
-                        "actor_class": actor_obj.__class__.__name__,
-                    })
+                    actor_configs[actor_name].update(
+                        {
+                            "actor_class": actor_obj.__class__.__name__,
+                        }
+                    )
 
                     # We also add all config attributes of the actor object
                     for attr_name, attr_value in actor_obj.__dict__.items():
@@ -1155,17 +1177,17 @@ class BaseRLTrainer:
             env_info = {
                 "type": type(self.env).__name__,
             }
-            
-            if hasattr(self.env, 'to_dict'):
+
+            if hasattr(self.env, "to_dict"):
                 try:
                     env_config = self.env.to_dict()
                     env_info.update(env_config)
                 except:
                     pass
-            
+
             wandb.config.update({"environment": env_info})
 
-    def log_training_metrics(self, metrics: Dict[str, List[Dict[str, float]]]):
+    def log_training_metrics(self, metrics: dict[str, list[dict[str, float]]]):
         if self.accel.is_main_process and self._step % self.log_every_n == 0:
             for actor_name, actor_metrics_list in metrics.items():
                 if not actor_metrics_list or not any(actor_metrics_list):
@@ -1178,7 +1200,7 @@ class BaseRLTrainer:
                     if self.num_iterations > 1:
                         self.logger.quiet(
                             colorize(
-                                f"      📊 Iter {iteration_idx+1}:",
+                                f"      📊 Iter {iteration_idx + 1}:",
                                 Palette.YELLOW,
                             )
                         )
@@ -1235,7 +1257,11 @@ class BaseRLTrainer:
                         )
 
     def log_evaluation_metrics(
-        self, eval_name: str, metrics: "EvaluationMetrics", env_output: GroupedEnvironmentOutput, is_final: bool = False
+        self,
+        eval_name: str,
+        metrics: "EvaluationMetrics",
+        env_output: GroupedEnvironmentOutput,
+        is_final: bool = False,
     ):
         if self.accel.is_main_process:
             self.logger.quiet(
@@ -1262,18 +1288,20 @@ class BaseRLTrainer:
             for actor_name, completion_data in metrics.completions.items():
                 if completion_data:
                     enhanced_completion_data = {}
-                    
+
                     if env_output.problems:
                         completion_length = len(next(iter(completion_data.values())))
-                        
+
                         for key in env_output.problems[0].keys():
                             enhanced_completion_data[key] = []
                             for problem in env_output.problems:
-                                for _ in range(completion_length // len(env_output.problems)):
+                                for _ in range(
+                                    completion_length // len(env_output.problems)
+                                ):
                                     enhanced_completion_data[key].append(problem[key])
-                    
+
                     enhanced_completion_data.update(completion_data)
-                    
+
                     columns = list(enhanced_completion_data.keys())
                     table = wandb.Table(columns=columns)
 

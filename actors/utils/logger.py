@@ -4,7 +4,6 @@ import datetime
 import logging
 import os
 import re
-from typing import Dict
 import warnings
 
 import colorama
@@ -17,10 +16,10 @@ colorama.init(autoreset=True)
 pynvml.nvmlInit()
 
 # Custom logging levels
-VERBOSE = 5      # Very detailed debug info with timing and extra details
-NORMAL = 20      # Standard operation logs (same as INFO)
-QUIET = 30       # Only important operations (same as WARNING)
-SILENT = 50      # Only critical errors
+VERBOSE = 5  # Very detailed debug info with timing and extra details
+NORMAL = 20  # Standard operation logs (same as INFO)
+QUIET = 30  # Only important operations (same as WARNING)
+SILENT = 50  # Only critical errors
 
 # Add custom levels to logging module
 logging.addLevelName(VERBOSE, "VERBOSE")
@@ -48,7 +47,7 @@ def colorize(text: str, style: str) -> str:
 
 
 # ─────────────────────── GPU + RAM formatter ───────────────────────────
-_LEVEL_COLOURS: Dict[int, str] = {
+_LEVEL_COLOURS: dict[int, str] = {
     VERBOSE: colorama.Fore.LIGHTBLACK_EX,
     logging.DEBUG: colorama.Fore.CYAN,
     logging.INFO: colorama.Fore.GREEN,
@@ -66,9 +65,11 @@ class GPUFormatter(logging.Formatter):
         super().__init__()
         self.show_rank = show_rank
         self.show_date = show_date
-        
+
         # Check if we should show system stats based on environment variable
-        self.show_system_stats = os.getenv("ACTORS_LOGGING_LEVEL", "").lower() == "verbose"
+        self.show_system_stats = (
+            os.getenv("ACTORS_LOGGING_LEVEL", "").lower() == "verbose"
+        )
 
     # ----------------------------------------- helpers
     @staticmethod
@@ -103,7 +104,7 @@ class GPUFormatter(logging.Formatter):
         # Only add GPU/RAM stats if environment flag is set
         if self.show_system_stats:
             parts += [self._gpu_summary(), self._ram_summary()]
-        
+
         parts.append(record.getMessage())
         return " | ".join(parts)
 
@@ -114,32 +115,45 @@ def verbose(logger: logging.Logger, message: str, *args, **kwargs):
     if logger.isEnabledFor(VERBOSE):
         logger._log(VERBOSE, message, args, **kwargs)
 
+
 def normal(logger: logging.Logger, message: str, *args, **kwargs):
     """Log a message with severity 'NORMAL' (standard operation logs)."""
     if logger.isEnabledFor(NORMAL):
         logger._log(NORMAL, message, args, **kwargs)
+
 
 def quiet(logger: logging.Logger, message: str, *args, **kwargs):
     """Log a message with severity 'QUIET' (only important operations)."""
     if logger.isEnabledFor(QUIET):
         logger._log(QUIET, message, args, **kwargs)
 
+
 def silent(logger: logging.Logger, message: str, *args, **kwargs):
     """Log a message with severity 'SILENT' (only critical errors)."""
     if logger.isEnabledFor(SILENT):
         logger._log(SILENT, message, args, **kwargs)
 
+
 # Add methods to Logger class
-logging.Logger.verbose = lambda self, message, *args, **kwargs: verbose(self, message, *args, **kwargs)
-logging.Logger.normal = lambda self, message, *args, **kwargs: normal(self, message, *args, **kwargs)
-logging.Logger.quiet = lambda self, message, *args, **kwargs: quiet(self, message, *args, **kwargs)
-logging.Logger.silent = lambda self, message, *args, **kwargs: silent(self, message, *args, **kwargs)
+logging.Logger.verbose = lambda self, message, *args, **kwargs: verbose(
+    self, message, *args, **kwargs
+)
+logging.Logger.normal = lambda self, message, *args, **kwargs: normal(
+    self, message, *args, **kwargs
+)
+logging.Logger.quiet = lambda self, message, *args, **kwargs: quiet(
+    self, message, *args, **kwargs
+)
+logging.Logger.silent = lambda self, message, *args, **kwargs: silent(
+    self, message, *args, **kwargs
+)
 
 
 # ───────────────────────────── utility functions ─────────────────────────────
 def should_use_tqdm() -> bool:
     """Check if tqdm should be enabled based on logging level."""
     return os.getenv("ACTORS_LOGGING_LEVEL", "normal").lower() == "verbose"
+
 
 def get_logging_level() -> str:
     """Get the current logging level from environment."""
@@ -167,13 +181,13 @@ def init_logger(
         If True, show full date; otherwise time only.
     level:
         Logging level threshold.
-        
+
     Logging Levels:
     - VERBOSE (5): Very detailed debug info with timing, GPU/RAM stats, tqdm enabled
     - NORMAL (20): Standard operation logs including training metrics
     - QUIET (30): Only important operations (checkpoints, epochs, errors)
     - SILENT (50): Only critical errors
-    
+
     Environment Variables:
     - ACTORS_LOGGING_LEVEL: "verbose", "normal" (default), "quiet", "silent"
     """
@@ -194,11 +208,10 @@ def init_logger(
         # Suppress vLLM logs in silent mode
         os.environ["VLLM_LOGGING_LEVEL"] = "CRITICAL"
         os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
-    
+
     # Mutes the logs when sleeping/waking up the model
     # Especially annoying since we offload and onload the model frequently
     if level > VERBOSE:
-
         for vllm_logger_name in (
             "vllm.executor.executor_base",
             "vllm.v1.core.block_pool",
@@ -217,7 +230,7 @@ def init_logger(
             "None of the inputs have requires_grad=True. Gradients will be None"
         ),
         category=UserWarning,
-        module=r"torch\.utils\.checkpoint"
+        module=r"torch\.utils\.checkpoint",
     )
     logger = logging.getLogger(name)
     logger.setLevel(level)
@@ -229,6 +242,7 @@ def init_logger(
 
     logger.propagate = False
     return logger
+
 
 # ────────────────────────────── global logger ───────────────────────────
 logger = init_logger(

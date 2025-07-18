@@ -1,21 +1,24 @@
 import gc
 from typing import Any
+
 import torch
 from torch import nn
 
 
 def disable_dropout_in_model(model: torch.nn.Module) -> None:
-  # taken from: https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L847
-  for module in model.modules():
-      if isinstance(module, torch.nn.Dropout):
-          module.p = 0
+    # taken from: https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L847
+    for module in model.modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0
+
 
 def free_memory() -> None:
-  torch.cuda.empty_cache()
-  torch.cuda.ipc_collect()
-  gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.ipc_collect()
+    gc.collect()
 
-#from: https://github.com/huggingface/trl/blob/main/trl/models/utils.py#L376
+
+# from: https://github.com/huggingface/trl/blob/main/trl/models/utils.py#L376
 class _ForwardRedirection:
     """Implements the `forward-redirection`.
 
@@ -27,7 +30,12 @@ class _ForwardRedirection:
     """
 
     def __call__(
-        self, wrapper_module: nn.Module, original_module: nn.Module, method: callable, *args: Any, **kwargs: Any
+        self,
+        wrapper_module: nn.Module,
+        original_module: nn.Module,
+        method: callable,
+        *args: Any,
+        **kwargs: Any,
     ):
         """Reroutes a method call through the `wrapper_module`'s `forward` method.
 
@@ -60,8 +68,12 @@ class _ForwardRedirection:
         self.on_after_outer_forward(wrapper_module, original_module)
         return wrapper_output
 
-    def on_after_inner_forward(self, wrapper_module: nn.Module, original_module: nn.Module) -> None:
+    def on_after_inner_forward(
+        self, wrapper_module: nn.Module, original_module: nn.Module
+    ) -> None:
         pass
 
-    def on_after_outer_forward(self, wrapper_module: nn.Module, original_module: nn.Module) -> None:
+    def on_after_outer_forward(
+        self, wrapper_module: nn.Module, original_module: nn.Module
+    ) -> None:
         pass

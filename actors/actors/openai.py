@@ -1,11 +1,16 @@
 from __future__ import annotations
-import asyncio
-import logging, random, time
-from typing import Sequence
-import openai
-from actors.utils.logger import init_logger
-from .base import LLMActor
 
+import asyncio
+import logging
+import random
+import time
+from collections.abc import Sequence
+
+import openai
+
+from actors.utils.logger import init_logger
+
+from .base import LLMActor
 
 logger = init_logger(__name__, level=logging.INFO)
 

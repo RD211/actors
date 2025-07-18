@@ -1,15 +1,23 @@
 from __future__ import annotations
-import os, traceback, torch
-from typing import Any, Dict, List
+
+import os
+import traceback
+from typing import Any
+
 import ray
+import torch
 from vllm import LLM, SamplingParams
+
 from actors.utils.logger import should_use_tqdm
+
 
 # Sentinel value for default LoRA behavior (use LoRA if enabled, otherwise None)
 class DefaultLoRA:
     """Sentinel class representing default LoRA behavior based on model configuration."""
+
     def __repr__(self):
         return "DefaultLoRA"
+
 
 DEFAULT_LORA = DefaultLoRA()
 
@@ -22,18 +30,18 @@ class ModelWorker:
         self,
         model_name: str,
         model_path: str,
-        gpus: List[int],
+        gpus: list[int],
         use_v1_engine: bool,
-        engine_kwargs: Dict[str, Any],
+        engine_kwargs: dict[str, Any],
     ) -> None:
         os.environ["VLLM_USE_V1"] = "1" if use_v1_engine else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
-        os.environ['CUDA_VISIBLE_DEVICES'] = ",".join(map(str, gpus))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
 
         # This is for the new weight update mechanism
-        engine_kwargs[
-            "worker_extension_cls"
-        ] = "actors.inference.rlhf_utils.ColocateWorkerExtension"
+        engine_kwargs["worker_extension_cls"] = (
+            "actors.inference.rlhf_utils.ColocateWorkerExtension"
+        )
 
         self.engine = LLM(
             model=model_path,
@@ -70,9 +78,7 @@ class ModelWorker:
 
     def update_weights_batch(self, ipc_handles: dict) -> tuple[str, str | None]:
         try:
-            self.engine.collective_rpc(
-                "receive_and_cache_weights", args=(ipc_handles,)
-            )
+            self.engine.collective_rpc("receive_and_cache_weights", args=(ipc_handles,))
             return "OK", None
         except Exception:
             return "ERROR", traceback.format_exc()
@@ -88,9 +94,7 @@ class ModelWorker:
     def create_lora_if_not_present(self, lora_path: str) -> tuple[str, str | None]:
         """Create and initialize LoRA adapter if not already present."""
         try:
-            self.engine.collective_rpc(
-                "_create_lora_if_not_present", args=(lora_path,)
-            )
+            self.engine.collective_rpc("_create_lora_if_not_present", args=(lora_path,))
             return "OK", None
         except Exception:
             return "ERROR", traceback.format_exc()
@@ -103,26 +107,40 @@ class ModelWorker:
         except Exception:
             return "ERROR", traceback.format_exc()
 
-    def generate(self, shard: list, sampling_params: SamplingParams, lora_request=None) -> list:
+    def generate(
+        self, shard: list, sampling_params: SamplingParams, lora_request=None
+    ) -> list:
         if self.is_sleeping:
             raise RuntimeError(f"Model {self.model_name} is sleeping. Cannot generate.")
         if not shard:
             return []
 
-        indices, inputs = zip(*shard)
-        
-        # Pool has already handled DEFAULT_LORA conversion, so we just use what we received
-        outputs = self.engine.generate(list(inputs), sampling_params, lora_request=lora_request, use_tqdm=should_use_tqdm())
-        return list(zip(indices, outputs))
+        indices, inputs = zip(*shard, strict=False)
 
-    def chat(self, shard: list, sampling_params: SamplingParams, lora_request=None) -> list:
+        # Pool has already handled DEFAULT_LORA conversion, so we just use what we received
+        outputs = self.engine.generate(
+            list(inputs),
+            sampling_params,
+            lora_request=lora_request,
+            use_tqdm=should_use_tqdm(),
+        )
+        return list(zip(indices, outputs, strict=False))
+
+    def chat(
+        self, shard: list, sampling_params: SamplingParams, lora_request=None
+    ) -> list:
         if self.is_sleeping:
             raise RuntimeError(f"ModelWorker is asleep at level {self.sleep_level}")
         if not shard:
             return []
 
-        indices, inputs = zip(*shard)
-        
+        indices, inputs = zip(*shard, strict=False)
+
         # Pool has already handled DEFAULT_LORA conversion, so we just use what we received
-        outputs = self.engine.chat(list(inputs), sampling_params, lora_request=lora_request, use_tqdm=should_use_tqdm())
-        return list(zip(indices, outputs))
+        outputs = self.engine.chat(
+            list(inputs),
+            sampling_params,
+            lora_request=lora_request,
+            use_tqdm=should_use_tqdm(),
+        )
+        return list(zip(indices, outputs, strict=False))

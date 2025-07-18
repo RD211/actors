@@ -1,28 +1,35 @@
-from dataclasses import dataclass, field, fields
-from typing import Any, Callable, Dict, List, Optional, Union, Iterable, TYPE_CHECKING
-from enum import Enum, auto
 import inspect
-from transformers import PretrainedConfig, PreTrainedTokenizerBase, PreTrainedModel, PreTrainedTokenizer, AutoTokenizer, AutoModelForCausalLM
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field, fields
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Any
+
 import accelerate
 import torch
-from torch import nn
+from torch import nn, optim
 from torch.optim import Optimizer
-import torch.optim as optim
-from torch.optim.lr_scheduler import LRScheduler, CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PretrainedConfig,
+    PreTrainedModel,
+    PreTrainedTokenizer,
+    PreTrainedTokenizerBase,
+)
 
 from actors.losses.base_loss import BaseRLLoss
 
 if TYPE_CHECKING:
-    from actors.losses import GRPOLoss, LigerGRPOLoss
-    
-from liger_kernel.transformers import AutoLigerKernelForCausalLM
+    pass
 
-from peft import PeftConfig
+from liger_kernel.transformers import AutoLigerKernelForCausalLM
 from peft.tuners.lora.config import LoraConfig
 
 # ═══════════════════════════════════════════════════════════════════════
 # Trainer configuration
 # ═══════════════════════════════════════════════════════════════════════
+
 
 class SaveStrategy(Enum):
     NONE = auto()  # never save
@@ -37,17 +44,16 @@ class EvalStrategy(Enum):
     FINAL = auto()  # evaluate only at the end
     ALL = auto()  # evaluate both periodically and at the end
 
+
 @dataclass
 class TrainerCfg:
-
     # Training
     epochs: int = 1
     batch_size: int = 8
-    max_steps: Optional[int] = None
+    max_steps: int | None = None
     grad_accumulation_steps: int = 1
     num_iterations: int = 1
     group_size: int = 8
-    
 
     # Logging
     log_every_n: int = 1
@@ -63,7 +69,7 @@ class TrainerCfg:
     max_checkpoints_to_keep: int = 3
     checkpoint_path: str = "checkpoints"
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Converts the config to a dictionary for logging."""
         result = {}
         for f in fields(self):
@@ -79,6 +85,7 @@ class TrainerCfg:
 # Actor configuration
 # ═══════════════════════════════════════════════════════════════════════
 
+
 @dataclass
 class ActorTrainCfg:
     # Basic training parameters
@@ -86,33 +93,52 @@ class ActorTrainCfg:
     max_grad_norm: float = 1.0
     gradient_checkpointing: bool = True
     reference_batch_size: int = 4
-    
+
     # Advantage calculation and normalization
-    advantage_calculator: Optional[Callable[..., List[float]]] = None
+    advantage_calculator: Callable[..., list[float]] | None = None
     std_normalization: bool = True
     beta: float = 0.1
     loss_temp: float = 1.0
-    
+
     # Model configuration
     use_liger_model: bool = True
-    model_kwargs: Dict[str, Any] = field(default_factory=dict)
-    quantization_config: Optional[Any] = None
-    
+    model_kwargs: dict[str, Any] = field(default_factory=dict)
+    quantization_config: Any | None = None
+
     # Factory functions (private)
-    _tokenizer_factory: Optional[Callable[[], PreTrainedTokenizer]] = field(default=None, repr=False, init=False)
-    _model_factory: Optional[Callable[[], nn.Module]] = field(default=None, repr=False, init=False)
-    _loss_factory: Callable[[], BaseRLLoss] = field(default=None, repr=False, init=False)
-    _optim_factory: Optional[Callable[[Iterable[nn.Parameter]], Optimizer]] = field(default=None, repr=False, init=False)
-    _scheduler_factory: Union[Callable[[Optimizer], LRScheduler], Callable[[Optimizer, Optional[int]], LRScheduler]] = field(default=lambda opt, steps: CosineAnnealingLR(opt, T_max=steps if steps else 1000), repr=False, init=False)
-    _reference_model_factory: Optional[Callable[[], nn.Module]] = field(default=None, repr=False, init=False)
-    
+    _tokenizer_factory: Callable[[], PreTrainedTokenizer] | None = field(
+        default=None, repr=False, init=False
+    )
+    _model_factory: Callable[[], nn.Module] | None = field(
+        default=None, repr=False, init=False
+    )
+    _loss_factory: Callable[[], BaseRLLoss] = field(
+        default=None, repr=False, init=False
+    )
+    _optim_factory: Callable[[Iterable[nn.Parameter]], Optimizer] | None = field(
+        default=None, repr=False, init=False
+    )
+    _scheduler_factory: (
+        Callable[[Optimizer], LRScheduler]
+        | Callable[[Optimizer, int | None], LRScheduler]
+    ) = field(
+        default=lambda opt, steps: CosineAnnealingLR(
+            opt, T_max=steps if steps else 1000
+        ),
+        repr=False,
+        init=False,
+    )
+    _reference_model_factory: Callable[[], nn.Module] | None = field(
+        default=None, repr=False, init=False
+    )
+
     # PEFT/LoRA configuration
-    peft_config: Optional[LoraConfig] = None
-    
+    peft_config: LoraConfig | None = None
+
     # Offloading parameters
     offload_optimizer: bool = False
     offload_model: bool = False
-    
+
     def __init__(
         self,
         *,
@@ -121,41 +147,35 @@ class ActorTrainCfg:
         max_grad_norm: float = 1.0,
         gradient_checkpointing: bool = True,
         reference_batch_size: int = 4,
-        
         # Advantage calculation and normalization
-        advantage_calculator: Optional[Callable[..., List[float]]] = None,
+        advantage_calculator: Callable[..., list[float]] | None = None,
         std_normalization: bool = True,
         beta: float = 0.1,
         loss_temp: float = 1.0,
-        
         # Model configuration
         use_liger_model: bool = True,
-        model_kwargs: Optional[Dict[str, Any]] = None,
-        quantization_config: Optional[Any] = None,
-        
+        model_kwargs: dict[str, Any] | None = None,
+        quantization_config: Any | None = None,
         # Training components
-        optimizer: Optional[Union[str, type, Callable]] = None,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        loss: Optional[Union[str, type, Callable]] = None,
-        loss_kwargs: Optional[Dict[str, Any]] = None,
-        scheduler: Optional[Union[str, type, Callable]] = None,
-        scheduler_kwargs: Optional[Dict[str, Any]] = None,
-        
+        optimizer: str | type | Callable | None = None,
+        optimizer_kwargs: dict[str, Any] | None = None,
+        loss: str | type | Callable | None = None,
+        loss_kwargs: dict[str, Any] | None = None,
+        scheduler: str | type | Callable | None = None,
+        scheduler_kwargs: dict[str, Any] | None = None,
         # Factory functions
-        model_factory: Optional[Callable[[], nn.Module]] = None,
-        tokenizer_factory: Optional[Callable[[], PreTrainedTokenizer]] = None,
-        reference_model_factory: Optional[Callable[[], nn.Module]] = None,
-        
+        model_factory: Callable[[], nn.Module] | None = None,
+        tokenizer_factory: Callable[[], PreTrainedTokenizer] | None = None,
+        reference_model_factory: Callable[[], nn.Module] | None = None,
         # PEFT/LoRA configuration
-        peft_config: Optional[LoraConfig] = None,
-        
+        peft_config: LoraConfig | None = None,
         # Offloading parameters
         offload_optimizer: bool = False,
         offload_model: bool = False,
     ):
         """
         Initialize ActorTrainCfg with all configuration options.
-        
+
         Args:
             learning_rate: Learning rate for training
             max_grad_norm: Maximum gradient norm for clipping
@@ -187,7 +207,7 @@ class ActorTrainCfg:
                 f"Only LoraConfig is supported for peft_config, got {type(peft_config)}. "
                 f"Expected type: peft.tuners.lora.config.LoraConfig"
             )
-        
+
         # Set basic parameters
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
@@ -203,7 +223,7 @@ class ActorTrainCfg:
         self.peft_config = peft_config
         self.offload_optimizer = offload_optimizer
         self.offload_model = offload_model
-        
+
         # Set factories if provided, otherwise keep the dataclass defaults
         if model_factory is not None:
             self._model_factory = model_factory
@@ -211,28 +231,28 @@ class ActorTrainCfg:
             self._tokenizer_factory = tokenizer_factory
         if reference_model_factory is not None:
             self._reference_model_factory = reference_model_factory
-            
+
         # Configure optimizer
         if optimizer is not None:
             kwargs = optimizer_kwargs or {}
             if isinstance(optimizer, str):
                 optimizer = self._get_optimizer_by_name(optimizer)
             self._optim_factory = self._as_factory(optimizer, **kwargs)
-        
+
         # Configure loss
         if loss is not None:
             kwargs = loss_kwargs or {}
             if isinstance(loss, str):
                 loss = self._get_loss_by_name(loss)
             self._loss_factory = self._as_factory(loss, **kwargs)
-            
+
         # Configure scheduler
         if scheduler is not None:
             kwargs = scheduler_kwargs or {}
             if isinstance(scheduler, str):
                 scheduler = self._get_scheduler_by_name(scheduler, **kwargs)
             self.set_scheduler(scheduler)
-        
+
         # Call post_init for default setup
         if self._optim_factory is None:
             self._optim_factory = lambda p: optim.AdamW(p)
@@ -240,8 +260,8 @@ class ActorTrainCfg:
             # Set default loss factory with loss_kwargs if provided
             kwargs = loss_kwargs or {}
             from actors.losses import LigerGRPOLoss
-            self._loss_factory = lambda: LigerGRPOLoss(config=self, **kwargs)    
 
+            self._loss_factory = lambda: LigerGRPOLoss(config=self, **kwargs)
 
     def _as_factory(self, obj, **kwargs):
         if isinstance(obj, BaseRLLoss):
@@ -254,15 +274,13 @@ class ActorTrainCfg:
                 return lambda: obj(config=self, **kwargs)
         if callable(obj):
             return obj
-        raise TypeError(
-            f"Expected a class or callable, got {type(obj)}. "
-        )
+        raise TypeError(f"Expected a class or callable, got {type(obj)}. ")
 
     def create_default_factories(self, model_path: str):
         """
         Create default model and tokenizer factories based on model path.
         This should be called by the actor when it has a model_path.
-        
+
         Args:
             model_path: Path to the model for creating factories
         """
@@ -272,26 +290,38 @@ class ActorTrainCfg:
                 "trust_remote_code": True,
             }
             merged_kwargs = {**default_kwargs, **self.model_kwargs}
-            
+
             # Add quantization config if provided
             if self.quantization_config is not None:
                 merged_kwargs["quantization_config"] = self.quantization_config
-            
+
             if self.use_liger_model:
-                self._model_factory = lambda: AutoLigerKernelForCausalLM.from_pretrained(model_path, **merged_kwargs)
+                self._model_factory = (
+                    lambda: AutoLigerKernelForCausalLM.from_pretrained(
+                        model_path, **merged_kwargs
+                    )
+                )
             else:
-                self._model_factory = lambda: AutoModelForCausalLM.from_pretrained(model_path, **merged_kwargs)
-        
+                self._model_factory = lambda: AutoModelForCausalLM.from_pretrained(
+                    model_path, **merged_kwargs
+                )
+
         # When using PEFT, reference model factory should be None since we'll use adapter disabling
         if self._reference_model_factory is None and self.peft_config is None:
             self._reference_model_factory = self._model_factory
-            
+
         if self._tokenizer_factory is None:
             # Extract tokenizer-specific kwargs (if any)
-            tokenizer_kwargs = {k: v for k, v in self.model_kwargs.items() if k in ["trust_remote_code", "use_fast"]}
+            tokenizer_kwargs = {
+                k: v
+                for k, v in self.model_kwargs.items()
+                if k in ["trust_remote_code", "use_fast"]
+            }
             if "trust_remote_code" not in tokenizer_kwargs:
                 tokenizer_kwargs["trust_remote_code"] = True
-            self._tokenizer_factory = lambda: AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
+            self._tokenizer_factory = lambda: AutoTokenizer.from_pretrained(
+                model_path, **tokenizer_kwargs
+            )
 
     def set_learning_rate(self, lr: float):
         """Set the learning rate."""
@@ -322,12 +352,13 @@ class ActorTrainCfg:
             def class_factory(optimizer, total_steps):
                 sig = inspect.signature(factory.__init__)
                 params = list(sig.parameters.keys())[2:]  # Skip self, optimizer
-                if 'T_max' in params and total_steps is not None:
+                if "T_max" in params and total_steps is not None:
                     return factory(optimizer, T_max=total_steps)
-                elif 'total_iters' in params and total_steps is not None:
+                elif "total_iters" in params and total_steps is not None:
                     return factory(optimizer, total_iters=total_steps)
                 else:
                     return factory(optimizer)
+
             self._scheduler_factory = class_factory
         elif callable(factory):
             # Handle lambda functions
@@ -340,15 +371,17 @@ class ActorTrainCfg:
                 # Lambda with optimizer and total_steps
                 self._scheduler_factory = factory
             else:
-                raise ValueError(f"Scheduler factory must accept 1 or 2 parameters, got {param_count}")
+                raise ValueError(
+                    f"Scheduler factory must accept 1 or 2 parameters, got {param_count}"
+                )
         else:
             raise TypeError(f"Expected a class or callable, got {type(factory)}")
         return self
-    
+
     def set_peft_config(self, peft_config):
         """
         Set the PEFT configuration for LoRA/QLoRA training.
-        
+
         Args:
             peft_config: PEFT configuration object (only LoraConfig supported)
         """
@@ -396,7 +429,7 @@ class ActorTrainCfg:
         """Set whether to use Liger kernel models."""
         self.use_liger_model = use_liger
         return self
-    
+
     def set_quantization_config(self, quantization_config):
         """Set the quantization configuration for model loading."""
         self.quantization_config = quantization_config
@@ -421,11 +454,13 @@ class ActorTrainCfg:
     def optim_factory(self):
         """Get the optimizer factory with learning rate applied."""
         prev_factory = self._optim_factory
+
         def _patched_factory(p):
             opt = prev_factory(p)
             for g in opt.param_groups:
                 g["lr"] = self.learning_rate
             return opt
+
         return _patched_factory
 
     @property
@@ -441,124 +476,141 @@ class ActorTrainCfg:
     # ═══════════════════════════════════════════════════════════════
     # Helper Methods
     # ═══════════════════════════════════════════════════════════════
-    
+
     def _get_optimizer_by_name(self, name: str):
         """Get optimizer class by string name."""
         optimizers = {
-            'adamw': optim.AdamW,
-            'adam': optim.Adam,
-            'sgd': optim.SGD,
-            'rmsprop': optim.RMSprop,
+            "adamw": optim.AdamW,
+            "adam": optim.Adam,
+            "sgd": optim.SGD,
+            "rmsprop": optim.RMSprop,
         }
-        
+
         # Try to import and add bitsandbytes optimizers if available
         try:
             import bitsandbytes as bnb
-            optimizers.update({
-                'paged_adamw_32bit': bnb.optim.PagedAdamW32bit,
-                'paged_adamw_8bit': bnb.optim.PagedAdamW8bit,
-                'adamw_32bit': bnb.optim.AdamW32bit,
-                'adamw_8bit': bnb.optim.AdamW8bit,
-            })
+
+            optimizers.update(
+                {
+                    "paged_adamw_32bit": bnb.optim.PagedAdamW32bit,
+                    "paged_adamw_8bit": bnb.optim.PagedAdamW8bit,
+                    "adamw_32bit": bnb.optim.AdamW32bit,
+                    "adamw_8bit": bnb.optim.AdamW8bit,
+                }
+            )
         except ImportError:
             pass
-            
+
         if name.lower() not in optimizers:
-            available = ', '.join(optimizers.keys())
+            available = ", ".join(optimizers.keys())
             raise ValueError(f"Unknown optimizer '{name}'. Available: {available}")
-            
+
         return optimizers[name.lower()]
-    
+
     def _get_loss_by_name(self, name: str):
         """Get loss class by string name."""
         # Import loss classes at runtime to avoid circular imports
         from actors.losses import GRPOLoss, LigerGRPOLoss
-        
+
         losses = {
-            'grpo': GRPOLoss,
-            'liger_grpo': LigerGRPOLoss,
+            "grpo": GRPOLoss,
+            "liger_grpo": LigerGRPOLoss,
         }
-            
+
         if name.lower() not in losses:
-            available = ', '.join(losses.keys())
+            available = ", ".join(losses.keys())
             raise ValueError(f"Unknown loss '{name}'. Available: {available}")
-            
+
         return losses[name.lower()]
-    
+
     def _get_scheduler_by_name(self, name: str, **kwargs):
         """Get scheduler factory by string name."""
-        if name.lower() == 'cosine':
+        if name.lower() == "cosine":
             from torch.optim.lr_scheduler import CosineAnnealingLR
-            T_max = kwargs.get('T_max', 1000)
-            eta_min = kwargs.get('eta_min', 0)
-            return lambda opt, steps: CosineAnnealingLR(opt, T_max=T_max if T_max else (steps if steps else 1000), eta_min=eta_min)
-        elif name.lower() == 'linear':
+
+            T_max = kwargs.get("T_max", 1000)
+            eta_min = kwargs.get("eta_min", 0)
+            return lambda opt, steps: CosineAnnealingLR(
+                opt,
+                T_max=T_max if T_max else (steps if steps else 1000),
+                eta_min=eta_min,
+            )
+        elif name.lower() == "linear":
             from torch.optim.lr_scheduler import LinearLR
-            start_factor = kwargs.get('start_factor', 1.0)
-            end_factor = kwargs.get('end_factor', 0.0)
-            total_iters = kwargs.get('total_iters', 1000)
-            return lambda opt, steps: LinearLR(opt, start_factor=start_factor, end_factor=end_factor, total_iters=total_iters if total_iters else (steps if steps else 1000))
-        elif name.lower() == 'constant':
+
+            start_factor = kwargs.get("start_factor", 1.0)
+            end_factor = kwargs.get("end_factor", 0.0)
+            total_iters = kwargs.get("total_iters", 1000)
+            return lambda opt, steps: LinearLR(
+                opt,
+                start_factor=start_factor,
+                end_factor=end_factor,
+                total_iters=total_iters if total_iters else (steps if steps else 1000),
+            )
+        elif name.lower() == "constant":
             from torch.optim.lr_scheduler import ConstantLR
+
             return lambda opt, steps: ConstantLR(opt, **kwargs)
-        elif name.lower() == 'exponential':
+        elif name.lower() == "exponential":
             from torch.optim.lr_scheduler import ExponentialLR
-            gamma = kwargs.get('gamma', 0.95)
+
+            gamma = kwargs.get("gamma", 0.95)
             return lambda opt, steps: ExponentialLR(opt, gamma=gamma)
-        elif name.lower() == 'step':
+        elif name.lower() == "step":
             from torch.optim.lr_scheduler import StepLR
-            step_size = kwargs.get('step_size', 30)
-            gamma = kwargs.get('gamma', 0.1)
+
+            step_size = kwargs.get("step_size", 30)
+            gamma = kwargs.get("gamma", 0.1)
             return lambda opt, steps: StepLR(opt, step_size=step_size, gamma=gamma)
         else:
-            available = 'cosine, linear, constant, exponential, step'
+            available = "cosine, linear, constant, exponential, step"
             raise ValueError(f"Unknown scheduler '{name}'. Available: {available}")
 
-    def to_dict(self, model_path: Optional[str] = None) -> Dict[str, Any]:
+    def to_dict(self, model_path: str | None = None) -> dict[str, Any]:
         """
         Converts the config to a dictionary for logging.
         Handles functions, classes, and complex objects intelligently.
-        
+
         Args:
             model_path: Model path from the actor (optional)
         """
         result = {}
         factory_fields = {}
-        
+
         if model_path is not None:
             result["model_path"] = model_path
-        
+
         for f in fields(self):
             value = getattr(self, f.name)
-            
+
             # Skip None values for private fields to reduce noise
-            if f.name.startswith('_') and value is None:
+            if f.name.startswith("_") and value is None:
                 continue
-                
+
             # For private fields, use a cleaner name (remove leading underscore)
-            field_name = f.name[1:] if f.name.startswith('_') else f.name
+            field_name = f.name[1:] if f.name.startswith("_") else f.name
             serialized_value = self._serialize_value(value)
-            
-            if f.name.startswith('_'):
+
+            if f.name.startswith("_"):
                 factory_fields[field_name] = serialized_value
             else:
                 result[field_name] = serialized_value
-        
+
         result.update(factory_fields)
-        
+
         return result
-    
+
     def _serialize_value(self, value: Any) -> Any:
         """
         Serialize a value for logging, handling different types.
         """
         if value is None:
             return None
-        elif isinstance(value, (str, int, float, bool)):
+        elif isinstance(value, str | int | float | bool):
             return value
         elif isinstance(value, Enum):
             return value.name
-        elif isinstance(value, (list, tuple)):
+        elif isinstance(value, list | tuple):
             return [self._serialize_value(item) for item in value]
         elif isinstance(value, dict):
             return {k: self._serialize_value(v) for k, v in value.items()}
@@ -569,14 +621,18 @@ class ActorTrainCfg:
                 "target_modules": value.target_modules,
                 "lora_dropout": value.lora_dropout,
                 "bias": value.bias,
-                "task_type": value.task_type.value if hasattr(value.task_type, 'value') else str(value.task_type),
+                "task_type": (
+                    value.task_type.value
+                    if hasattr(value.task_type, "value")
+                    else str(value.task_type)
+                ),
             }
         elif inspect.isclass(value):
             return value.__name__
         elif callable(value):
-            if hasattr(value, '__name__'):
+            if hasattr(value, "__name__"):
                 name = value.__name__
-                if name == '<lambda>':
+                if name == "<lambda>":
                     try:
                         source = inspect.getsource(value).strip()
                         return f"{source}"
@@ -586,29 +642,28 @@ class ActorTrainCfg:
                     return name
             else:
                 return str(type(value).__name__)
-        elif hasattr(value, '__dict__'):
+        elif hasattr(value, "__dict__"):
             try:
                 obj_dict = {}
                 for attr_name in dir(value):
-                    if not attr_name.startswith('_'):
+                    if not attr_name.startswith("_"):
                         try:
                             attr_value = getattr(value, attr_name)
                             if not callable(attr_value):
                                 obj_dict[attr_name] = self._serialize_value(attr_value)
                         except:
                             continue
-                return {
-                    'type': type(value).__name__,
-                    'attributes': obj_dict
-                }
+                return {"type": type(value).__name__, "attributes": obj_dict}
             except:
                 return f"<{type(value).__name__}>"
         else:
             return str(value)
 
+
 # ═══════════════════════════════════════════════════════════════════════
 # Initialized actor state
 # ═══════════════════════════════════════════════════════════════════════
+
 
 @dataclass
 class ActorTrainState:
@@ -618,5 +673,5 @@ class ActorTrainState:
     optim: torch.optim.Optimizer
     accel: accelerate.Accelerator
     model_config: PretrainedConfig
-    ref_model: Optional[PreTrainedModel] = None
-    sched: Optional[torch.optim.lr_scheduler.LRScheduler] = None
+    ref_model: PreTrainedModel | None = None
+    sched: torch.optim.lr_scheduler.LRScheduler | None = None

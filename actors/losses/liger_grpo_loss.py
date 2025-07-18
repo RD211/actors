@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict, Literal, Optional, Tuple, TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import deepspeed
 import torch
-from torch import Tensor, nn
 from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
+from torch import Tensor, nn
 
 from .base_loss import BaseRLLoss
 
@@ -14,11 +14,11 @@ if TYPE_CHECKING:
 
 AllowedLoss = Literal["grpo", "bnpo", "dr_grpo"]
 
-class LigerGRPOLoss(BaseRLLoss):
 
+class LigerGRPOLoss(BaseRLLoss):
     def __init__(
         self,
-        config: 'ActorTrainCfg',
+        config: ActorTrainCfg,
         loss_type: AllowedLoss = "bnpo",
     ) -> None:
         super().__init__(config=config)
@@ -34,18 +34,17 @@ class LigerGRPOLoss(BaseRLLoss):
         )
         self.loss_type: AllowedLoss = loss_type
 
-
     def forward(
         self,
         policy: nn.Module,
-        input_ids: Tensor, # (B, L)
-        attention_mask: Tensor, # (B, L)
-        loss_attention_mask: Tensor, # (B, L-1)
-        advantages: Tensor, # (B,)
-        ref_logps: Optional[Tensor] = None, # (B, L-1)
-        old_logps: Optional[Tensor] = None, # (B, L-1)
-        **_: Dict,
-    ) -> Tuple[Tensor, Dict[str, float]]:
+        input_ids: Tensor,  # (B, L)
+        attention_mask: Tensor,  # (B, L)
+        loss_attention_mask: Tensor,  # (B, L-1)
+        advantages: Tensor,  # (B,)
+        ref_logps: Tensor | None = None,  # (B, L-1)
+        old_logps: Tensor | None = None,  # (B, L-1)
+        **_: dict,
+    ) -> tuple[Tensor, dict[str, float]]:
         hidden: Tensor = policy.model(
             input_ids, attention_mask=attention_mask
         ).last_hidden_state[:, :-1, :]
@@ -74,4 +73,3 @@ class LigerGRPOLoss(BaseRLLoss):
             kl = torch.tensor(0.0, device=loss.device, dtype=loss.dtype)
 
         return loss, {"kl": kl.item()}
-

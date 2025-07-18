@@ -3,8 +3,10 @@ Type definitions for environment outputs with support for multiple reward types.
 """
 
 from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Dict, List, Any, Optional, Union
+from typing import Any
+
 import torch
 
 
@@ -22,18 +24,18 @@ class ActorOutput:
         metadata: Optional metadata about the generation
     """
 
-    input_ids: List[List[int]]
-    attention_mask: List[List[int]]
-    rewards: List[float]
-    reward_components: Optional[Dict[str, List[float]]] = None
-    ended_in_eos: List[bool] = None
-    metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
+    input_ids: list[list[int]]
+    attention_mask: list[list[int]]
+    rewards: list[float]
+    reward_components: dict[str, list[float]] | None = None
+    ended_in_eos: list[bool] = None
+    metadata: dict[str, Any] | None = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate that all lists have consistent lengths."""
         lengths = [len(self.input_ids), len(self.attention_mask), len(self.rewards)]
         if self.reward_components:
-            for name, values in self.reward_components.items():
+            for _, values in self.reward_components.items():
                 lengths.append(len(values))
 
         if not all(length == lengths[0] for length in lengths):
@@ -63,9 +65,7 @@ class ActorOutput:
         if any(len(seq) == 0 for seq in self.attention_mask):
             raise ValueError("attention_mask contains an empty sequence")
 
-    def get_total_reward(
-        self, weights: Optional[Dict[str, float]] = None
-    ) -> List[float]:
+    def get_total_reward(self, weights: dict[str, float] | None = None) -> list[float]:
         """
         Compute total reward as weighted sum of components.
 
@@ -89,7 +89,7 @@ class ActorOutput:
 
         return total_rewards
 
-    def get_reward_stats(self) -> Dict[str, Dict[str, float]]:
+    def get_reward_stats(self) -> dict[str, dict[str, float]]:
         """
         Get statistics for all reward types.
 
@@ -97,7 +97,7 @@ class ActorOutput:
             Dictionary mapping reward names to their statistics (mean, std, min, max)
         """
 
-        def compute_stats(values: List[float]) -> Dict[str, float]:
+        def compute_stats(values: list[float]) -> dict[str, float]:
             if not values:
                 return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
 
@@ -128,8 +128,8 @@ class EnvironmentOutput:
         global_metadata: Optional metadata about the environment step
     """
 
-    actors: Dict[str, ActorOutput]
-    global_metadata: Optional[Dict[str, Any]] = field(default_factory=dict)
+    actors: dict[str, ActorOutput]
+    global_metadata: dict[str, Any] | None = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate that all actor outputs have consistent structure."""
@@ -145,20 +145,19 @@ class EnvironmentOutput:
                     "attention_mask": len(actor_output.attention_mask),
                     "rewards": len(actor_output.rewards),
                 }
-            else:
-                if (
-                    len(actor_output.input_ids) != lengths["input_ids"]
-                    or len(actor_output.attention_mask) != lengths["attention_mask"]
-                    or len(actor_output.rewards) != lengths["rewards"]
-                ):
-                    raise ValueError(
-                        f"Inconsistent lengths in actor '{actor_name}': "
-                        f"input_ids={len(actor_output.input_ids)}, "
-                        f"attention_mask={len(actor_output.attention_mask)}, "
-                        f"rewards={len(actor_output.rewards)}"
-                    )
+            elif (
+                len(actor_output.input_ids) != lengths["input_ids"]
+                or len(actor_output.attention_mask) != lengths["attention_mask"]
+                or len(actor_output.rewards) != lengths["rewards"]
+            ):
+                raise ValueError(
+                    f"Inconsistent lengths in actor '{actor_name}': "
+                    f"input_ids={len(actor_output.input_ids)}, "
+                    f"attention_mask={len(actor_output.attention_mask)}, "
+                    f"rewards={len(actor_output.rewards)}"
+                )
 
-    def to_dict(self) -> Dict[str, Dict[str, Any]]:
+    def to_dict(self) -> dict[str, dict[str, Any]]:
         """
         Convert to dictionary format for backward compatibility.
 
@@ -180,7 +179,7 @@ class EnvironmentOutput:
         return result
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Dict[str, Any]]) -> EnvironmentOutput:
+    def from_dict(cls, data: dict[str, dict[str, Any]]) -> EnvironmentOutput:
         """
         Create EnvironmentOutput from dictionary format.
 
@@ -226,17 +225,17 @@ class GroupedEnvironmentOutput:
         group_size: Number of generations per problem
     """
 
-    problems: List[Dict[str, Any]]
-    groups: Dict[str, List[List[ActorOutput]]]
+    problems: list[dict[str, Any]]
+    groups: dict[str, list[list[ActorOutput]]]
     group_size: int
 
     @classmethod
     def from_environment_output(
         cls,
         env_output: EnvironmentOutput,
-        original_batch: List[Dict[str, Any]],
+        original_batch: list[dict[str, Any]],
         group_size: int,
-    ) -> "GroupedEnvironmentOutput":
+    ) -> GroupedEnvironmentOutput:
         """
         Create GroupedEnvironmentOutput from regular EnvironmentOutput.
 
@@ -337,5 +336,5 @@ class GroupedEnvironmentOutput:
 
 
 # Type aliases for convenience
-RewardComponents = Dict[str, List[float]]
-ActorOutputDict = Dict[str, ActorOutput]
+RewardComponents = dict[str, list[float]]
+ActorOutputDict = dict[str, ActorOutput]
