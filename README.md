@@ -1,11 +1,12 @@
 # Actors: Multi-(Agent, Turn) RL
 
-<div style="text-align: center;">
-  <img src="https://i.imgur.com/Mk0fSSa.png" alt="Long Banner" style="max-width: 100%; width: 500px;">
+<p align="center">
+  <img src="https://i.imgur.com/Mk0fSSa.png" alt="Long Banner" width="500">
+</p>
 
-### A hackable library for doing **Multi-Turn Multi-Agent RL** with LLMs for the **GPU poor** and **middle class**.  Supports some fun environments and makes it very easy to add new ones.
-</div>
-
+<p align="center">
+ A hackable library for doing <strong>Multi-Turn Multi-Agent RL</strong> with LLMs for the <strong>GPU poor</strong> and <strong>middle class</strong>.  Supports some fun environments and makes it very easy to add new ones.
+</p>
 
 <p align="center">
   <a href="https://huggingface.co/rl-actors">
