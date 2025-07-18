@@ -102,7 +102,7 @@ def main():
         "creative": Dataset.from_list([{'conversation': tokenizer.apply_chat_template([{'role': 'user', 'content': item['text']}], tokenize=False, add_generation_prompt=True)} for item in creative_qa]),
     }
 
-    # Create environment with data
+    # Create environment with data and actor
     env = SimpleSingleTurnEnvironment(
         actor=actor,
         train_data=train_dataset,
@@ -115,7 +115,7 @@ def main():
         prompt_column='conversation',
         mask_prompt_for_loss=True,
     )
-
+    
     # Create trainer configuration
     cfg = GRPOTrainerCfg(
         group_size=16,
@@ -129,8 +129,8 @@ def main():
         save_strategy=SaveStrategy.ALL,
     )
     
-    # Create trainer with environment
-    trainer = GRPOTrainer(cfg=cfg, env=env)
+    # Create trainer with environment and actors
+    trainer = GRPOTrainer(cfg=cfg, env=env, actors=[actor])
 
     import wandb
 

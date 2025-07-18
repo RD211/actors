@@ -6,8 +6,6 @@ from torch.utils.data import DataLoader, RandomSampler
 import abc
 from typing import Dict, Union, List, Any, Optional
 
-from actors.actors.base import TrainableLLMActor
-    
 from actors.environments.types import EnvironmentOutput, GroupedEnvironmentOutput
 from datasets import Dataset as HFDataset, DatasetDict
 
@@ -20,7 +18,6 @@ class Environment(abc.ABC):
         train_data: Optional[Union[HFDataset, DatasetDict]] = None,
         eval_data: Optional[Union[HFDataset, DatasetDict, Dict[str, Union[HFDataset, DatasetDict]]]] = None,
     ) -> None:
-        self._reg: Dict[str, TrainableLLMActor] = {}
         
         self.train_data = self._normalise_hf_splits(train_data) if train_data is not None else None
         
@@ -193,18 +190,7 @@ class Environment(abc.ABC):
         
         return expanded
 
-    def register(self, actor: TrainableLLMActor) -> None:
-        if actor.name in self._reg:
-            raise ValueError(f"duplicate actor {actor.name}")
-        if actor.training_config is None:
-            raise ValueError(f"actor {actor.name} has no training config. Please set training_config before registering.")
-        self._reg[actor.name] = actor
 
-
-    # ------------------------------------------------------------------
-    def get_trainable_actors(self) -> Dict[str, TrainableLLMActor]:
-        return self._reg
-    # ------------------------------------------------------------------
     
     def __call__(
         self, 

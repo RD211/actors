@@ -30,12 +30,12 @@ class SimpleSingleTurnEnvironment(Environment):
             raise ValueError("At least one reward function must be provided")
         
         self.actor = actor
+        self.tokenizer = self.actor.training_config.tokenizer_factory()
         self.prompt_column = prompt_column
-        self.tokenizer = actor.training_config.tokenizer_factory()
         self.mask_prompt_for_loss = mask_prompt_for_loss
-
+        
         # Set actor.loss_temp to sampling_params.temperature
-        actor.training_config.loss_temp = sampling_params.temperature
+        self.actor.training_config.loss_temp = sampling_params.temperature
         
         self.sampling_params = sampling_params
         
@@ -58,14 +58,12 @@ class SimpleSingleTurnEnvironment(Environment):
                     f"got {type(rf)}"
                 )
         
-        self.register(actor)
-        
         names = [rf.name for rf in self.reward_functions]
         if len(names) != len(set(names)):
             raise ValueError(f"Reward function names must be unique, got: {names}")
     
     async def generate(self, batch: Dict[str, Any]) -> EnvironmentOutput:
-
+        
         self.actor.wake()
         
         prompts = batch[self.prompt_column]        

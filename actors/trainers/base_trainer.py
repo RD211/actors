@@ -191,6 +191,7 @@ class BaseRLTrainer:
         self,
         cfg: TrainerCfg,
         env: Environment,
+        actors: List[TrainableLLMActor],
     ):
         self.cfg = cfg
         self.env = env
@@ -198,15 +199,21 @@ class BaseRLTrainer:
         self._step = 0
         self._substep = 0  # Will be incremented before first use
 
-        # Get actors from environment if not provided
-        trainable_actors = env.get_trainable_actors()
-        if not trainable_actors:
-            raise ValueError(
-                "No trainable actors found in the environment. "
-                "Please ensure the environment has registered actors."
-            )
-        self.actors = self._setup_actors(trainable_actors)
-        self.actor_objects = trainable_actors
+        # Validate actors
+        if not actors:
+            raise ValueError("No trainable actors provided.")
+        
+        # Convert list to dict using actor names
+        actors_dict = {}
+        for actor in actors:
+            if actor.training_config is None:
+                raise ValueError(f"Actor {actor.name} has no training config. Please set training_config before passing to trainer.")
+            if actor.name in actors_dict:
+                raise ValueError(f"Duplicate actor name: {actor.name}")
+            actors_dict[actor.name] = actor
+        
+        self.actors = self._setup_actors(actors_dict)
+        self.actor_objects = actors_dict
         self._setup_loras()
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -527,7 +534,10 @@ class BaseRLTrainer:
                 "full_train_step", no_memory_measurement=True
             ):
                 try:
-                    env_output = self.env(batch_size=self.batch_size // self.group_size, group_size=self.group_size) 
+                    env_output = self.env(
+                        batch_size=self.batch_size // self.group_size, 
+                        group_size=self.group_size
+                    ) 
                     # We sleep all trainable actors.
                     for actor_name, ta in self.actors.items():
                         actor_obj = self.actor_objects[actor_name]

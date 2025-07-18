@@ -120,8 +120,8 @@ def main():
         save_strategy=SaveStrategy.ALL,
     )
     
-    # Create trainer with environment
-    trainer = GRPOTrainer(cfg=cfg, env=env)
+    # Create trainer with environment and actors
+    trainer = GRPOTrainer(cfg=cfg, env=env, actors=[actor])
 
     import wandb
 
