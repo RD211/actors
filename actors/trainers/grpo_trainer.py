@@ -10,6 +10,7 @@ from actors.trainers.base_trainer import (
     TrainingMetrics,
     is_peft_model,
 )
+from actors.actors.base import TrainableLLMActor
 from actors.environments.types import GroupedEnvironmentOutput, GroupedEnvironmentOutput
 from actors.trainers.grpo_config import GRPOTrainerCfg
 from actors.utils.deepspeed import (
@@ -61,6 +62,7 @@ class GRPOTrainer(BaseRLTrainer):
         self,
         cfg: GRPOTrainerCfg,
         env: Environment,
+        actors: List[TrainableLLMActor],
     ):
         self.cfg: GRPOTrainerCfg = cfg
 
@@ -70,6 +72,7 @@ class GRPOTrainer(BaseRLTrainer):
         super().__init__(
             cfg,
             env=env,
+            actors=actors,
         )
 
         self.env = env
