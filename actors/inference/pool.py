@@ -91,6 +91,7 @@ class ModelPool:
         
         self.total_gpus = torch.cuda.device_count()
         self.models: dict[str, ModelRecord] = {}
+        os.environ['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = "1"
         ray.init(ignore_reinit_error=True)
         self._init_done = True
         # Register cleanup on exit
@@ -191,7 +192,17 @@ class ModelPool:
         )
         start = time.monotonic()
         workers = [
-            ModelWorker.remote(name, model_path, grp, use_v1_engine, engine_kwargs)
+            ModelWorker.options(
+                num_gpus=0,
+                runtime_env={
+                    "env_vars": {
+                        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                        "CUDA_VISIBLE_DEVICES": ",".join(map(str, grp)),
+                        # All environment variables that we have.
+                        # **os.environ,
+                    }
+                }
+            ).remote(name, model_path, grp, use_v1_engine, engine_kwargs)
             for grp in gpu_groups
         ]
 

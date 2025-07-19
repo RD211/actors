@@ -1,6 +1,8 @@
 import torch
 from datasets import Dataset
 from vllm import SamplingParams
+import os
+from peft import LoraConfig, TaskType
 
 from actors import (
     ActorTrainCfg,
@@ -43,6 +45,22 @@ def get_lr_scheduler(optimizer, max_step):
 
 
 def main():
+    lora_config = LoraConfig(
+        r=256,  # LoRA rank
+        lora_alpha=512,  # LoRA scaling parameter
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],  # Target all linear layers
+        lora_dropout=0.0,  # LoRA dropout
+        bias="none",  # Don't adapt bias parameters
+        task_type=TaskType.CAUSAL_LM,  # Task type for causal language modeling
+    )
     # Create training configuration
     training_config = ActorTrainCfg(
         learning_rate=2e-6,
@@ -52,6 +70,7 @@ def main():
         offload_model=True,
         offload_optimizer=True,
         beta=0.04,
+        peft_config=lora_config,
     )
 
     # Create actor with improved configuration API
@@ -81,7 +100,7 @@ def main():
         {"text": "Who wrote 'To Kill a Mockingbird'?"},
         {"text": "What is the speed of light?"},
         {"text": "How do you make a cake?"},
-    ] * 50
+    ] * 5
 
     train_data = [
         {
@@ -172,7 +191,7 @@ def main():
     cfg = GRPOTrainerCfg(
         group_size=16,
         batch_size=64,
-        grad_accumulation_steps=8,
+        grad_accumulation_steps=1,
         num_iterations=2,
         log_every_n=1,
         eval_every_n=50,  # Run evaluation every 50 steps
@@ -186,7 +205,8 @@ def main():
 
     import wandb
 
-    wandb.init(project="test_actors-2", entity="rd211", name="0.5B")
+    if os.getenv("RANK") == "0":
+        wandb.init(project="test_actors-2", entity="rd211", name="0.5B")
     trainer.train()
     trainer.push_to_hub(
         "rd211/test_actors_main",

@@ -241,6 +241,14 @@ def init_logger(
         logger.addHandler(handler)
 
     logger.propagate = False
+
+    # Only local main process should log
+    if os.getenv('LOCAL_RANK', "0") != "0":
+        logger = logging.getLogger(name)
+        logger.handlers.clear()
+        logger.addHandler(logging.NullHandler())
+        logger.propagate = False
+        return logger
     return logger
 
 

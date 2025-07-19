@@ -30,12 +30,11 @@ class ColocateWorkerExtension:
         if not hasattr(self, "device_uuid"):
             self.report_device_id()
 
-        # The ipc_handles_batch is a dictionary mapping device_uuid to
-        # another dictionary of tensor_name: ipc_handle.
-        if self.device_uuid not in ipc_handles_batch:
+        # On lora we dont care about the IPC handles
+        if self.device_uuid not in ipc_handles_batch: #and not (hasattr(self, "initialized_lora") and self.initialized_lora):
             return
 
-        handles = ipc_handles_batch[self.device_uuid]
+        handles = ipc_handles_batch[self.device_uuid] if self.device_uuid in ipc_handles_batch else ipc_handles_batch[list(ipc_handles_batch.keys())[0]]
         device_id = self.device.index
 
         # Use a dedicated stream to allow for asynchronous H2D transfers.
@@ -63,21 +62,62 @@ class ColocateWorkerExtension:
         on the GPU.
         """
         if not hasattr(self, "cpu_cache") or not self.cpu_cache:
-            logger.warning(
-                colorize(
-                    "No weights in CPU cache to load. Ensure that `receive_and_cache_weights` was called.",
-                    Palette.WARNING,
-                )
-            )
             return
 
         # If vllm has any fp8 weights, we do something special.
         if any(
             "weight_scale" in k for k in self.model_runner.model.state_dict().keys()
         ):
+
+            # This currently only works on Qwen2 models and no tensor parallelism.
+            # Also fails if the gpu does not support fp8 :)
+            # Very experimental and hacky.
+            # TODO: Make this not hacky.
             self.cpu_cache = to_vllm_state_dict(self.cpu_cache)
             self.cpu_cache = fp8_quantize_state_dict(self.cpu_cache)
             self.model_runner.model.load_state_dict(self.cpu_cache)
+            # We get the model class.
+            # from inspect import unwrap
+            # model_class = unwrap(self.model_runner.model.model.__class__)
+            # big_class = self.model_runner.model.__class__
+            # big_class.Qwen2Model = model_class
+            # print(self.model_runner.vllm_config)
+            # #copy of vllm_config
+            # v_config = self.model_runner.vllm_config
+            # level_before = v_config.compilation_config.level
+            # v_config.compilation_config.level = 1
+            # new_model = big_class(
+            #     vllm_config=self.model_runner.vllm_config,
+            # )
+            # to_convert_weights = list(self.cpu_cache.items())
+            # # move everything to gpu
+            # for k, v in to_convert_weights:
+            #     self.cpu_cache[k] = v.to(device="cuda", non_blocking=True)
+            # torch.cuda.empty_cache()
+            # torch.cuda.synchronize()
+            # self.model_runner.model.load_weights(weights=list(self.cpu_cache.items()))
+
+            # state_dict = new_model.state_dict()
+            # with open("fp8_weights.txt", "w") as f:
+            #     for k, v in state_dict.items():
+            #         f.write(f"{k}: {v.shape} {v.dtype} {v.device}\n")
+
+            # with open("model_weights.txt", "w") as f:
+            #     for k, v in self.model_runner.model.state_dict().items():
+            #         f.write(f"{k}: {v.shape} {v.dtype} {v.device}\n")
+            # print("A"*100)
+            # self.model_runner.model.load_state_dict(state_dict)
+            # print("A"*100)
+            # v_config.compilation_config.level = level_before
+
+            # # Output all keys and shapes to file.
+            # with open("fp8_weights.txt", "w") as f:
+            #     for k, v in self.cpu_cache.items():
+            #         f.write(f"{k}: {v.shape} {v.dtype} {v.device}\n")
+
+            # with open("model_weights.txt", "w") as f:
+            #     for k, v in self.model_runner.model.state_dict().items():
+            #         f.write(f"{k}: {v.shape} {v.dtype} {v.device}\n")
         else:
             weights = list(self.cpu_cache.items())
             self.model_runner.model.load_weights(weights=weights)
@@ -124,6 +164,20 @@ class ColocateWorkerExtension:
         lora_A_keys = [k for k in self.cpu_cache.keys() if "lora_A" in k]
         lora_B_keys = [k for k in self.cpu_cache.keys() if "lora_B" in k]
         loras = adapter_manager.modules
+
+        # Save all to a file to see shapes.
+        with open("lora_cache.txt", "w") as f:
+            for k, v in self.cpu_cache.items():
+                if type(v) is not list:
+                    f.write(f"{k}: {v.shape}\n")
+                else:
+                    f.write(f"{k}: {[x.shape for x in v]}\n")
+
+        with open("lora_weights.txt", 'w') as f:
+            for lora_key in loras.keys():
+                f.write(f"{lora_key}: {[x.shape for x in loras[lora_key].lora_a_stacked]}\n")
+                f.write(f"{lora_key}: {[x.shape for x in loras[lora_key].lora_b_stacked]}\n")
+
         for lora_key in loras.keys():
             lora_a_key = next(
                 k for k in lora_A_keys if lora_key.split("model.layers")[1] in k

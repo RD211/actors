@@ -92,7 +92,7 @@ class ActorTrainCfg:
     learning_rate: float = 1e-6
     max_grad_norm: float = 1.0
     gradient_checkpointing: bool = True
-    reference_batch_size: int = 4
+    reference_batch_size: int = -1 # -1 is full batch size
 
     # Advantage calculation and normalization
     advantage_calculator: Callable[..., list[float]] | None = None
@@ -146,7 +146,7 @@ class ActorTrainCfg:
         learning_rate: float = 1e-6,
         max_grad_norm: float = 1.0,
         gradient_checkpointing: bool = True,
-        reference_batch_size: int = 4,
+        reference_batch_size: int = -1,
         # Advantage calculation and normalization
         advantage_calculator: Callable[..., list[float]] | None = None,
         std_normalization: bool = True,

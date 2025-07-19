@@ -223,12 +223,7 @@ class vLLMActor(TrainableLLMActor):
         self.pool.update_weights_batch(self.name, all_ipc_handles)
 
     def _handle_sleep_state(self):
-        if self._sleep_level == 1:
-            self.wake()
-        elif self._sleep_level == 2:
-            raise RuntimeError(
-                f"Model {self.name} is sleeping at level 2. While attempting to generate or chat."
-            )
+        self.wake()
 
     def _with_wake(self):
         """Context manager to temporarily wake up and restore previous sleep state."""

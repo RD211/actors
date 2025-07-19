@@ -196,9 +196,30 @@ class Environment(abc.ABC):
 
         return expanded
 
+    def split_batch_in_parts(
+        self, batch: dict[str, list[Any]], number_of_parts: int
+    ) -> list[dict[str, list[Any]]]:
+        """Split a batch into a specified number of parts."""
+        if not isinstance(batch, dict):
+            raise ValueError("batch must be a dictionary")
+
+        if number_of_parts <= 0:
+            raise ValueError("number_of_parts must be greater than 0")
+
+        part_size = len(next(iter(batch.values()))) // number_of_parts
+        if part_size == 0:
+            return [batch] * number_of_parts
+
+        parts = []
+        for i in range(number_of_parts):
+            part = {k: v[i * part_size : (i + 1) * part_size] for k, v in batch.items()}
+            parts.append(part)
+
+        return parts
+
     def __call__(
-        self, batch_size: int, group_size: int = 1
-    ) -> GroupedEnvironmentOutput:
+        self, batch_size: int, group_size: int = 1, accelerator = None
+    ) -> GroupedEnvironmentOutput | None:
         """
         Get a batch from the data and run generation.
 
@@ -214,9 +235,14 @@ class Environment(abc.ABC):
         if raw_batch is None:
             raise StopIteration("No more batches available")
 
-        # Expand batch for groups
         expanded_batch = self.expand_batch_for_groups(raw_batch, group_size)
+        # Expand batch for groups
+        if accelerator is not None:
+            expanded_batch = self.split_batch_in_parts(expanded_batch, accelerator.num_processes//torch.cuda.device_count())
+            expanded_batch = expanded_batch[accelerator.process_index//torch.cuda.device_count()]
 
+            if not accelerator.is_local_main_process:
+                return None
         # Run generation
         env_output = asyncio.run(self.generate(expanded_batch))
 
