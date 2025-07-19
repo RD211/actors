@@ -80,7 +80,7 @@ class GPUFormatter(logging.Formatter):
         for idx in range(torch.cuda.device_count()):
             handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
             mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            percentages.append(f"{idx}:{int(mem.used / mem.total * 100)}%")
+            percentages.append(f"{int(mem.used / mem.total * 100)}%")
         return "GPU% [" + " ".join(percentages) + "]"
 
     @staticmethod

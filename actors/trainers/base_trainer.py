@@ -272,22 +272,26 @@ class BaseRLTrainer:
                 for actor in actors_with_offloading.values():
                     actor.training_config.offload_optimizer = False
                     actor.training_config.offload_model = False
-
+        print("A"*100)
         accelerators: dict[str, Accelerator] = {
             actor: Accelerator(
                 mixed_precision="bf16",
-                deepspeed_plugin=self.ds_plugins[actor],
+                deepspeed_plugin=self.ds_plugins,
                 kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=10))],
-            )
-            for actor in self.ds_plugins
+            ) if i == 0 else Accelerator()
+            for (i, actor) in enumerate(self.ds_plugins)
         }
+
+        # Wait for everyone.
+        for accel in accelerators.values():
+            accel.wait_for_everyone()
 
         actors: dict[str, ActorTrainState] = {}
 
         for name, actor_obj in trainable_actors.items():
             accel = accelerators[name]
             model = actor_obj.training_config.model_factory().train()
-
+            accelerators.state.select_deepspeed_plugin(name)
             self.logger.normal(
                 colorize(
                     f"🔧 Initializing actor '{name}'",
@@ -542,10 +546,22 @@ class BaseRLTrainer:
             start_step_profiling()
             with _step_profiler.track("full_train_step", no_memory_measurement=True):
                 try:
-                    env_output = self.env(
-                        batch_size=self.batch_size // self.group_size,
-                        group_size=self.group_size,
+                    env_output
+                    if self.accel.is_local_main_process:
+                        env_output = self.env(
+                            batch_size=self.batch_size // self.group_size // self.num_nodes,
+                            group_size=self.group_size,
+                        )
+                    # We combine the env_output from all local_main_processes.
+                    env_output = self.accel.gather_for_metrics(
+                        [env_output]
                     )
+                    # We remove Nones.
+                    env_output = [
+                        eo for eo in env_output if eo is not None
+                    ]
+                    env_output = sum(env_output)
+
                     # We sleep all trainable actors.
                     for actor_name, _ in self.actors.items():
                         actor_obj = self.actor_objects[actor_name]
@@ -1094,6 +1110,10 @@ class BaseRLTrainer:
     @property
     def number_of_devices(self) -> int:
         return self.accel.num_processes
+
+    @property
+    def num_nodes(self) -> int:
+        return self.number_of_devices // torch.cuda.device_count()
 
     @property
     def rank(self) -> int:

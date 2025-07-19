@@ -38,31 +38,34 @@ class vLLMActor(TrainableLLMActor):
 
         # We extract num_attention_heads if present and check
         # if it is divisible engine_kwargs["tensor_parallel_size"] if tensor parallel size is set
-        if "tensor_parallel_size" in engine_kwargs and hasattr(
-            model_config, "num_attention_heads"
-        ):
-            num_heads = model_config.num_attention_heads
-            tensor_parallel_size = engine_kwargs["tensor_parallel_size"]
-            if num_heads % tensor_parallel_size != 0:
-                for pipeline_parallel_size in range(1, tensor_parallel_size + 1):
-                    if (
-                        tensor_parallel_size % pipeline_parallel_size == 0
-                        and num_heads % (tensor_parallel_size // pipeline_parallel_size)
-                        == 0
-                    ):
-                        engine_kwargs["tensor_parallel_size"] = (
-                            tensor_parallel_size // pipeline_parallel_size
-                        )
-                        engine_kwargs["pipeline_parallel_size"] = pipeline_parallel_size
-                        break
-                self.logger.warning(
-                    colorize(
-                        f"num_attention_heads ({num_heads}) is not divisible by tensor_parallel_size ({tensor_parallel_size}). "
-                        "In order to keep the model working we will set tensor_parallel_size to "
-                        f"{engine_kwargs['tensor_parallel_size']} and pipeline_parallel_size to {engine_kwargs['pipeline_parallel_size']}.",
-                        Palette.ERROR,
-                    )
-                )
+        # TODO: Make this handle all cases when tensor_parallel_size is set etc.
+        # if hasattr(
+        #     model_config, "num_attention_heads"
+        # ):
+        #     num_heads = model_config.num_attention_heads
+
+        #     for gpu_g in gpu_groups:
+        #         tensor_parallel_size = len(gpu_g)
+        #         if num_heads % tensor_parallel_size != 0:
+        #             for pipeline_parallel_size in range(1, tensor_parallel_size + 1):
+        #                 if (
+        #                     tensor_parallel_size % pipeline_parallel_size == 0
+        #                     and num_heads % (tensor_parallel_size // pipeline_parallel_size)
+        #                     == 0
+        #                 ):
+        #                     engine_kwargs["tensor_parallel_size"] = (
+        #                         tensor_parallel_size // pipeline_parallel_size
+        #                     )
+        #                     engine_kwargs["pipeline_parallel_size"] = pipeline_parallel_size
+        #                     break
+        #             self.logger.warning(
+        #                 colorize(
+        #                     f"num_attention_heads ({num_heads}) is not divisible by tensor_parallel_size ({tensor_parallel_size}). "
+        #                     "In order to keep the model working we will set tensor_parallel_size to "
+        #                     f"{engine_kwargs['tensor_parallel_size']} and pipeline_parallel_size to {engine_kwargs['pipeline_parallel_size']}.",
+        #                     Palette.ERROR,
+        #                 )
+        #             )
 
         super().__init__(
             name,
@@ -70,29 +73,28 @@ class vLLMActor(TrainableLLMActor):
             training_config=training_config,
         )
         self.pool = ModelPool()
-        if name not in self.pool.list_models():
-            # Prepare engine kwargs with LoRA support if PEFT config is present
-            final_engine_kwargs = engine_kwargs.copy() if engine_kwargs else {}
+        # Prepare engine kwargs with LoRA support if PEFT config is present
+        final_engine_kwargs = engine_kwargs.copy() if engine_kwargs else {}
 
-            # Enable LoRA in vLLM if PEFT config is provided
-            if self.training_config.peft_config is not None:
-                final_engine_kwargs["enable_lora"] = True
-                # Set reasonable defaults for LoRA if not already specified
-                if "max_lora_rank" not in final_engine_kwargs:
-                    lora_rank = getattr(
-                        self.training_config.peft_config, "r", 16
-                    )  # Default to rank 16
-                    final_engine_kwargs["max_lora_rank"] = lora_rank
-                if "max_loras" not in final_engine_kwargs:
-                    final_engine_kwargs["max_loras"] = 1  # Default to 1 LoRA adapter
+        # Enable LoRA in vLLM if PEFT config is provided
+        if self.training_config.peft_config is not None:
+            final_engine_kwargs["enable_lora"] = True
+            # Set reasonable defaults for LoRA if not already specified
+            if "max_lora_rank" not in final_engine_kwargs:
+                lora_rank = getattr(
+                    self.training_config.peft_config, "r", 16
+                )  # Default to rank 16
+                final_engine_kwargs["max_lora_rank"] = lora_rank
+            if "max_loras" not in final_engine_kwargs:
+                final_engine_kwargs["max_loras"] = 1  # Default to 1 LoRA adapter
 
-            self.pool.load_model(
-                name=name,
-                model_path=model_path,
-                gpu_groups=gpu_groups,
-                use_v1_engine=use_v1_engine,
-                engine_kwargs=final_engine_kwargs,
-            )
+        self.pool.load_model(
+            name=name,
+            model_path=model_path,
+            gpu_groups=gpu_groups,
+            use_v1_engine=use_v1_engine,
+            engine_kwargs=final_engine_kwargs,
+        )
         # Register cleanup function for this actor
         atexit.register(self._cleanup)
         self.name = name
