@@ -1,4 +1,4 @@
-# Actors: Multi-(Agent, Turn) RL
+# Actors: Multi-(Agent, Turn, Env) RL
 
 <p align="center">
   <img src="https://i.imgur.com/Mk0fSSa.png" alt="Long Banner" width="400">
