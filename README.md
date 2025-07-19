@@ -1,7 +1,7 @@
 # Actors: Multi-(Agent, Turn) RL
 
 <p align="center">
-  <img src="https://i.imgur.com/Mk0fSSa.png" alt="Long Banner" width="500">
+  <img src="https://i.imgur.com/Mk0fSSa.png" alt="Long Banner" width="400">
 </p>
 
 <p align="center">
