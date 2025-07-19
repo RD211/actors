@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-# Mark all tests in this file as GPU-only
-pytestmark = pytest.mark.gpu
+# Mark all tests in this file as slow tests (GPU-intensive)
+pytestmark = pytest.mark.slow
 
 
 @pytest.fixture

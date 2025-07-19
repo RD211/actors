@@ -2,8 +2,7 @@ import pytest
 
 from actors import GRPOTrainer, LLMActor, OpenAIActor, TrainableLLMActor, vLLMActor
 
-# Mark all tests in this file as CPU-only
-pytestmark = pytest.mark.cpu
+# These are normal/fast tests - no marker needed
 
 
 def test_imports():

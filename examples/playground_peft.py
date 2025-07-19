@@ -1,14 +1,16 @@
 from datasets import Dataset
-
-# Import PEFT for LoRA configuration
 from peft import LoraConfig, TaskType
 from vllm import SamplingParams
 
-from actors.actors import vLLMActor
-from actors.environments import SimpleSingleTurnEnvironment
-from actors.trainers.base_config import ActorTrainCfg, EvalStrategy, SaveStrategy
-from actors.trainers.grpo_config import GRPOTrainerCfg
-from actors.trainers.grpo_trainer import GRPOTrainer
+from actors import (
+    ActorTrainCfg,
+    EvalStrategy,
+    GRPOTrainer,
+    GRPOTrainerCfg,
+    SaveStrategy,
+    SimpleSingleTurnEnvironment,
+    vLLMActor,
+)
 
 
 def length_reward(completion: str) -> float:

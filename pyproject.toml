@@ -93,11 +93,9 @@ ignore = [
     "C405",
 ]
 
-# Allow autofix for all enabled rules (when `--fix`) is provided.
 fixable = ["ALL"]
 unfixable = []
 
-# Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
 [tool.ruff.format]
@@ -115,10 +113,10 @@ addopts = [
     "-v",
     "--tb=short",
     "--strict-markers",
+    "-m", "not slow",  # By default, skip slow tests
 ]
 markers = [
-    "cpu: marks tests as CPU-only (no GPU required)",
-    "gpu: marks tests as GPU-only (requires CUDA)",
+    "slow: marks tests as slow (run manually or on main branch pushes)",
 ]
 
 [tool.mypy]
