@@ -1,7 +1,9 @@
-from typing import Any, Dict, Optional, Literal, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Literal
+
 import torch
 
 from actors.utils.softmax import _selective_softmax
+
 from .base_loss import BaseRLLoss
 
 if TYPE_CHECKING:
@@ -9,18 +11,19 @@ if TYPE_CHECKING:
 
 AllowedLoss = Literal["grpo", "bnpo", "dr_grpo"]
 
+
 class GRPOLoss(BaseRLLoss):
     def __init__(
         self,
-        config: 'ActorTrainCfg',
+        config: "ActorTrainCfg",
         eps_low: float = 0.2,
         eps_high: float = 0.2,
         loss_type: AllowedLoss = "grpo",
-        delta: Optional[float] = None,
-        max_completion_length: Optional[int] = None,
+        delta: float | None = None,
+        max_completion_length: int | None = None,
     ):
         super().__init__(config=config)
-        
+
         self.eps_l = eps_low
         self.eps_h = eps_high
         self.loss_type = loss_type
@@ -30,17 +33,20 @@ class GRPOLoss(BaseRLLoss):
     def forward(
         self,
         policy,
-        input_ids: torch.Tensor, # shape (B, L)
-        attention_mask: torch.Tensor, # shape (B, L)
-        loss_attention_mask: torch.Tensor, # shape (B, L-1)
-        advantages: torch.Tensor, # shape (B,)
-        ref_logps: Optional[torch.Tensor] = None, # shape (B, L-1)
-        old_logps: Optional[torch.Tensor] = None, # shape (B, L-1)
-        **kwargs: Dict[str, Any],
-    ) -> tuple[torch.Tensor, Dict[str, Any]]:
-        L = input_ids.size(1)
-        logits = policy(input_ids, attention_mask=attention_mask).logits / self.temperature # shape (B, L, V)
-        new_lp = _selective_softmax(logits[:,:-1,:], input_ids[:, 1:]) # shape (B, L-1)
+        input_ids: torch.Tensor,  # shape (B, L)
+        attention_mask: torch.Tensor,  # shape (B, L)
+        loss_attention_mask: torch.Tensor,  # shape (B, L-1)
+        advantages: torch.Tensor,  # shape (B,)
+        ref_logps: torch.Tensor | None = None,  # shape (B, L-1)
+        old_logps: torch.Tensor | None = None,  # shape (B, L-1)
+        **kwargs: dict[str, Any],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        logits = (
+            policy(input_ids, attention_mask=attention_mask).logits / self.temperature
+        )  # shape (B, L, V)
+        new_lp = _selective_softmax(
+            logits[:, :-1, :], input_ids[:, 1:]
+        )  # shape (B, L-1)
         if old_logps is None:
             old_logps = new_lp.detach()
 
@@ -50,8 +56,8 @@ class GRPOLoss(BaseRLLoss):
         ratio_clipped = torch.clamp(ratio, 1 - self.eps_l, 1 + self.eps_h)
 
         if advantages.dim() == 1:
-            adv = advantages[:, None].expand_as(new_lp) # shape (B, L-1)
-        else:                             # already (B, L-1)
+            adv = advantages[:, None].expand_as(new_lp)  # shape (B, L-1)
+        else:  # already (B, L-1)
             adv = advantages
         adv = adv.to(new_lp.dtype)
 
@@ -63,7 +69,6 @@ class GRPOLoss(BaseRLLoss):
 
         mask = attention_mask[:, 1:].to(per_tok.dtype) * loss_attention_mask
 
-
         if self.loss_type == "grpo":
             loss = ((per_tok * mask).sum(-1) / mask.sum(-1).clamp(min=1)).mean()
         elif self.loss_type == "bnpo":
@@ -71,7 +76,9 @@ class GRPOLoss(BaseRLLoss):
         elif self.loss_type == "dr_grpo":
             if self.max_completion_length is None:
                 raise ValueError("max_completion_length required for dr_grpo")
-            loss = (per_tok * mask).sum() / (input_ids.size(0) * self.max_completion_length)
+            loss = (per_tok * mask).sum() / (
+                input_ids.size(0) * self.max_completion_length
+            )
         else:
             raise ValueError(f"unknown loss_type {self.loss_type}")
 

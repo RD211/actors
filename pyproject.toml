@@ -4,22 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "actors"
-version = "0.0.1"
+version = "0.1.0"
 authors = [
-  { name="Example Author", email="author@example.com" },
+  { name="David Dinucu-Jianu", email="david.dinucujianu@gmail.com" },
 ]
-description = "A small example package"
+description = "Actors: A hackable library for doing Multi-Turn Multi-Agent RL with LLMs for the GPU poor and middle class."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 classifiers = [
-    "Programming Language :: Python :: 3",
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+keywords = ["reinforcement learning", "llm", "grpo", "ai"]
 dependencies = [
-    "vllm==0.9.1",
-    "deepspeed==0.17.1",
-    "liger-kernel==0.5.10",
+    "vllm>=0.9.1",
+    "deepspeed>=0.17.1",
+    "liger-kernel>=0.5.10",
     "ninja",
     "accelerate",
     "transformers",
@@ -27,9 +36,91 @@ dependencies = [
     "pynvml",
     "psutil",
     "bitsandbytes",
-    "torch"
+    "torch",
+    "peft>=0.15.2",
+    "wandb",
+    "ray",
+    "math-verify>=0.8.0",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/pypa/sampleproject"
-"Bug Tracker" = "https://github.com/pypa/sampleproject/issues"
+"Homepage" = "https://github.com/RD211/actors"
+"Bug Tracker" = "https://github.com/RD211/actors/issues"
+"Repository" = "https://github.com/RD211/actors"
+"Documentation" = "https://github.com/RD211/actors#readme"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+    "pre-commit",
+]
+docs = [
+    "mkdocs",
+    "mkdocs-material",
+    "mkdocstrings[python]",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["actors*"]
+exclude = ["tests*", "examples*", "docs*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+extend-exclude = [
+    ".eggs",
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".tox",
+    ".venv",
+    "build",
+    "dist",
+]
+
+[tool.ruff.lint]
+extend-select = ["E", "F", "I", "W", "UP", "B", "T", "C"]
+ignore = [
+    "E203",
+    "E501",
+    "E402",
+    "C901",
+    "E722",
+    "C405",
+]
+
+fixable = ["ALL"]
+unfixable = []
+
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+    "-m", "not slow",  # By default, skip slow tests
+]
+markers = [
+    "slow: marks tests as slow (run manually or on main branch pushes)",
+]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

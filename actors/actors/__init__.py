@@ -1,5 +1,5 @@
 from .base import LLMActor, TrainableLLMActor
-from .vllm import vLLMActor
 from .openai import OpenAIActor
+from .vllm import vLLMActor
 
 __all__ = ["LLMActor", "TrainableLLMActor", "vLLMActor", "OpenAIActor"]

@@ -1,6 +1,9 @@
 from __future__ import annotations
+
 import abc
-from typing import Callable, Dict, Sequence, TYPE_CHECKING
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 from transformers import PreTrainedTokenizer
@@ -33,7 +36,7 @@ class TrainableLLMActor(LLMActor):
     @abc.abstractmethod
     def start_weight_update(self): ...
     @abc.abstractmethod
-    def update_weights_batch(self, state_dict: Dict[str, torch.Tensor]): ...
+    def update_weights_batch(self, state_dict: dict[str, torch.Tensor]): ...
     @abc.abstractmethod
     def finalize_weight_update(self): ...
 
@@ -63,7 +66,7 @@ class TrainableLLMActor(LLMActor):
 
         # Import here to avoid circular imports
         from actors.trainers.base_config import ActorTrainCfg
-        
+
         # Use provided config or create a default one
         if training_config is not None:
             self.training_config = training_config
@@ -100,7 +103,7 @@ class TrainableLLMActor(LLMActor):
         """Get the current learning rate."""
         return self.training_config.learning_rate
 
-    def get_training_summary(self) -> Dict:
+    def get_training_summary(self) -> dict:
         """Get a summary of current training configuration."""
         return self.training_config.get_training_summary()
 

@@ -1,14 +1,14 @@
-from copy import deepcopy
-from typing import Container
-import accelerate
 import gc
+from collections.abc import Container
+from copy import deepcopy
+
+import accelerate
 import deepspeed
 import torch
-
 from deepspeed.runtime.bf16_optimizer import BF16_Optimizer
 from deepspeed.runtime.zero.offload_config import (
-    OffloadStateTypeEnum,
     OffloadDeviceEnum,
+    OffloadStateTypeEnum,
 )
 
 
@@ -30,7 +30,6 @@ def prepare_deepspeed(model, accelerator: "accelerate"):
     Adapted from accelerate:
     https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
     """
-    import deepspeed  # local import (instead of top-level) to avoid DS init interfering with other backends (like vllm): https://github.com/deepspeedai/DeepSpeed/issues/7252
 
     deepspeed_plugin = accelerator.state.deepspeed_plugin
     config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
@@ -90,17 +89,19 @@ def _move_zero_tensors(zopt, device, non_blocking=True):
     """Move all ZeRO optimizer tensors to the specified device. Returns bytes moved."""
     moved = 0
     tensors_to_move = []
-    
+
     # Collect all tensors that need to be moved
     for t in _zero_tensors(zopt):
         if t.device != device:
             moved += t.numel() * t.element_size()
             tensors_to_move.append(t)
-    
+
     # Move tensors asynchronously in parallel
     if tensors_to_move:
         # Use CUDA streams for parallel transfers when moving to/from GPU
-        if device.type == 'cuda' or any(t.device.type == 'cuda' for t in tensors_to_move):
+        if device.type == "cuda" or any(
+            t.device.type == "cuda" for t in tensors_to_move
+        ):
             # Batch the transfers for better performance
             for t in tensors_to_move:
                 t.data = t.data.to(device, non_blocking=non_blocking)
@@ -108,7 +109,7 @@ def _move_zero_tensors(zopt, device, non_blocking=True):
             # For CPU-to-CPU moves, process in batches
             for t in tensors_to_move:
                 t.data = t.data.to(device, non_blocking=False)
-    
+
     return moved
 
 
@@ -118,7 +119,9 @@ def _offload_optimizer(model, optimizer, device="cpu", non_blocking=True):
     Returns the number of bytes moved.
     """
     # Offload ZeRO optimizer tensors with non-blocking transfers
-    moved = _move_zero_tensors(optimizer, torch.device(device), non_blocking=non_blocking)
+    moved = _move_zero_tensors(
+        optimizer, torch.device(device), non_blocking=non_blocking
+    )
 
     # Offload DeepSpeed optimizer engine states (grad buffer, hp params, lp grads)
     include = [
@@ -150,7 +153,9 @@ def _offload_model(optimizer, non_blocking=True):
 
 
 def _reload_optimizer(optimizer, device="cuda", non_blocking=True):
-    moved = _move_zero_tensors(optimizer, torch.device(device), non_blocking=non_blocking)
+    moved = _move_zero_tensors(
+        optimizer, torch.device(device), non_blocking=non_blocking
+    )
     return moved
 
 
@@ -160,31 +165,32 @@ def _reload_model(engine, non_blocking=True):
         return
     engine.offloaded_states = set([OffloadStateTypeEnum.lp_params])
     engine.reload_states(non_blocking=non_blocking)
-    engine.offloaded_states = set(copy_of_engine_reload_states) - set([OffloadStateTypeEnum.lp_params])
+    engine.offloaded_states = set(copy_of_engine_reload_states) - set(
+        [OffloadStateTypeEnum.lp_params]
+    )
 
 
 def _reload_engine_states(engine, non_blocking=True):
     """Reload DeepSpeed engine states from CPU back to GPU."""
     _copy_of_engine_reload_states = engine.offloaded_states
-    engine_states = set([
-        OffloadStateTypeEnum.contiguous_grad_buffer,
-        OffloadStateTypeEnum.hp_params,
-        OffloadStateTypeEnum.lp_grads,
-    ])
-    if not any(
-        state in _copy_of_engine_reload_states for state in engine_states
-    ):
+    engine_states = set(
+        [
+            OffloadStateTypeEnum.contiguous_grad_buffer,
+            OffloadStateTypeEnum.hp_params,
+            OffloadStateTypeEnum.lp_grads,
+        ]
+    )
+    if not any(state in _copy_of_engine_reload_states for state in engine_states):
         return
-    engine.offloaded_states = [st for st in engine_states if st in _copy_of_engine_reload_states]
+    engine.offloaded_states = [
+        st for st in engine_states if st in _copy_of_engine_reload_states
+    ]
     engine.reload_states(non_blocking=non_blocking)
-    engine.offloaded_states = set(_copy_of_engine_reload_states) - set(engine_states) 
-    
+    engine.offloaded_states = set(_copy_of_engine_reload_states) - set(engine_states)
+
+
 def offload_model_and_optimizer(
-    model, 
-    optimizer,
-    offload_optimizer=True, 
-    offload_model=True,
-    non_blocking=True
+    model, optimizer, offload_optimizer=True, offload_model=True, non_blocking=True
 ):
     info = {"optimizer_bytes": 0, "model_offloaded": False}
 
@@ -195,8 +201,7 @@ def offload_model_and_optimizer(
     # Start with optimizer offloading (typically larger and benefits more from async)
     if offload_optimizer:
         info["optimizer_bytes"] = _offload_optimizer(
-            model,
-            optimizer, non_blocking=non_blocking
+            model, optimizer, non_blocking=non_blocking
         )
 
     # Offload model parameters
@@ -207,19 +212,15 @@ def offload_model_and_optimizer(
     # Synchronize before cleanup if using non-blocking transfers
     if non_blocking and torch.cuda.is_available():
         torch.cuda.synchronize()
-    
+
     gc.collect()
     torch.cuda.empty_cache()
-    
+
     return info
 
 
 def reload_model_and_optimizer(
-    model, 
-    optimizer, 
-    reload_optimizer=True, 
-    reload_model=True,
-    non_blocking=True
+    model, optimizer, reload_optimizer=True, reload_model=True, non_blocking=True
 ):
     info = {"optimizer_bytes": 0, "model_reloaded": False}
 
@@ -255,65 +256,66 @@ def reload_model_and_optimizer(
 def prepare_deepspeed_reference(model, accelerator: "accelerate", use_cpu_offload=True):
     """
     Prepares the reference model for DeepSpeed inference with aggressive CPU offloading.
-    
+
     This configuration is optimized for reference models that:
     1. Are only used for inference (no gradients)
     2. Are called infrequently (once per training step)
     3. Process large batches at once
     4. Can benefit from full CPU offloading to save GPU memory
-    
+
     Args:
         model: The reference model to prepare
         accelerator: The accelerator instance
         use_cpu_offload: Whether to use aggressive CPU offloading (default: True)
     """
-    import deepspeed
-    
+
     deepspeed_plugin = accelerator.state.deepspeed_plugin
     config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
-    
+
     if use_cpu_offload:
         # Configure for aggressive CPU offloading - reference model specific
-        config_kwargs.update({
-            "zero_optimization": {
-                "stage": 3,
-                "offload_param": {
-                    "device": "cpu",
-                    "pin_memory": True,
-                    "buffer_count": 1,  # Minimal buffer for reference model
-                    "buffer_size": 1e8,  # 100MB buffer
-                    "max_in_cpu": 1e9,  # 1GB max in CPU
+        config_kwargs.update(
+            {
+                "zero_optimization": {
+                    "stage": 3,
+                    "offload_param": {
+                        "device": "cpu",
+                        "pin_memory": True,
+                        "buffer_count": 1,  # Minimal buffer for reference model
+                        "buffer_size": 1e8,  # 100MB buffer
+                        "max_in_cpu": 1e9,  # 1GB max in CPU
+                    },
+                    "offload_optimizer": {
+                        "device": "cpu",  # Not needed for inference but just in case
+                        "pin_memory": True,
+                    },
+                    "stage3_param_persistence_threshold": 0,  # Offload everything
+                    "stage3_prefetch_bucket_size": 1e6,  # Small prefetch for layer-by-layer
+                    "stage3_max_live_parameters": 1e6,  # Keep minimal params on GPU
+                    "stage3_max_reuse_distance": 0,  # Don't keep params around
+                    "reduce_bucket_size": 1e6,  # Smaller buckets for reference model
+                    "contiguous_gradients": False,  # Not needed for inference
+                    "overlap_comm": False,  # Simpler for inference-only
+                    "sub_group_size": 1e6,  # Small sub-groups
                 },
-                "offload_optimizer": {
-                    "device": "cpu",  # Not needed for inference but just in case
-                    "pin_memory": True,
-                },
-                "stage3_param_persistence_threshold": 0,  # Offload everything
-                "stage3_prefetch_bucket_size": 1e6,  # Small prefetch for layer-by-layer
-                "stage3_max_live_parameters": 1e6,  # Keep minimal params on GPU
-                "stage3_max_reuse_distance": 0,  # Don't keep params around
-                "reduce_bucket_size": 1e6,  # Smaller buckets for reference model
-                "contiguous_gradients": False,  # Not needed for inference
-                "overlap_comm": False,  # Simpler for inference-only
-                "sub_group_size": 1e6,  # Small sub-groups
-            },
-            # "activation_checkpointing": {
-            #     "partition_activations": False,  # Not needed for inference
-            #     "cpu_checkpointing": True,  # Offload activations to CPU
-            #     "contiguous_memory_optimization": False,
-            #     "number_checkpoints": 1,
-            #     "synchronize_checkpoint_boundary": True,
-            # },
-            # "memory_efficient_linear": True,  # Use memory efficient linear layers
-            # "aio": {
-            #     "block_size": 262144,  # 256KB blocks for CPU offloading
-            #     "queue_depth": 8,
-            #     "thread_count": 1,
-            #     "single_submit": False,
-            #     "overlap_events": False,
-            # }
-        })
-        
+                # "activation_checkpointing": {
+                #     "partition_activations": False,  # Not needed for inference
+                #     "cpu_checkpointing": True,  # Offload activations to CPU
+                #     "contiguous_memory_optimization": False,
+                #     "number_checkpoints": 1,
+                #     "synchronize_checkpoint_boundary": True,
+                # },
+                # "memory_efficient_linear": True,  # Use memory efficient linear layers
+                # "aio": {
+                #     "block_size": 262144,  # 256KB blocks for CPU offloading
+                #     "queue_depth": 8,
+                #     "thread_count": 1,
+                #     "single_submit": False,
+                #     "overlap_events": False,
+                # }
+            }
+        )
+
         # Set model-specific parameters for better CPU offloading
         if model is not None:
             hidden_size = (
@@ -323,11 +325,17 @@ def prepare_deepspeed_reference(model, accelerator: "accelerate", use_cpu_offloa
             )
             if hidden_size is not None:
                 # Conservative settings for reference model
-                config_kwargs["zero_optimization"].update({
-                    "stage3_param_persistence_threshold": 0,  # Always offload
-                    "stage3_prefetch_bucket_size": min(hidden_size * 10, 1e6),  # Conservative prefetch
-                    "stage3_max_live_parameters": min(hidden_size * 100, 1e6),  # Minimal live params
-                })
+                config_kwargs["zero_optimization"].update(
+                    {
+                        "stage3_param_persistence_threshold": 0,  # Always offload
+                        "stage3_prefetch_bucket_size": min(
+                            hidden_size * 10, 1e6
+                        ),  # Conservative prefetch
+                        "stage3_max_live_parameters": min(
+                            hidden_size * 100, 1e6
+                        ),  # Minimal live params
+                    }
+                )
     else:
         # Use the standard preparation without CPU offloading
         stage = config_kwargs["zero_optimization"]["stage"]
@@ -340,7 +348,6 @@ def prepare_deepspeed_reference(model, accelerator: "accelerate", use_cpu_offloa
 
 
 # Hack to allow offloading other optimizers too.
-import deepspeed.ops.adam.fused_adam as _fused
 
 
 def offload_model(model, optimizer):
@@ -361,24 +368,24 @@ class FastOffloadContext:
         self.offload_optimizer = offload_optimizer
         self.offload_model = offload_model
         self.offload_info = None
-        
+
     def __enter__(self):
         self.offload_info = offload_model_and_optimizer(
-            self.model, 
+            self.model,
             self.optimizer,
             offload_optimizer=self.offload_optimizer,
             offload_model=self.offload_model,
-            non_blocking=True
+            non_blocking=True,
         )
         return self
-        
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         reload_model_and_optimizer(
             self.model,
             self.optimizer,
             reload_optimizer=self.offload_info.get("optimizer_bytes", 0) > 0,
             reload_model=self.offload_info.get("model_offloaded", False),
-            non_blocking=True
+            non_blocking=True,
         )
 
 
@@ -386,8 +393,10 @@ def log_memory_usage(logger, prefix=""):
     """Log current GPU memory usage for debugging offloading behavior."""
     if torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-        reserved = torch.cuda.memory_reserved() / 1024**3   # GB
-        logger.info(f"{prefix}GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+        reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+        logger.info(
+            f"{prefix}GPU memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
 
 
 def _validate_offloading_config(model):
@@ -397,31 +406,38 @@ def _validate_offloading_config(model):
     """
     if not hasattr(model, "optimizer"):
         return False
-    
+
     # Check if the model has ZeRO stage 3 with proper offloading config
     if not hasattr(model.optimizer, "offload_states"):
         return False
-    
+
     return True
 
 
+from deepspeed.accelerator import get_accelerator
 
 ################
 # Patch
 #################
-from deepspeed.runtime.zero.utils import apply_to_tensors_only, get_mapping_to_flat_buffer
-from deepspeed.accelerator import get_accelerator
-def patched_offload_states(self,
-                    include: Container[OffloadStateTypeEnum] = None,
-                    device: OffloadDeviceEnum = OffloadDeviceEnum.cpu,
-                    pin_memory: bool = True,
-                    non_blocking: bool = False):
+from deepspeed.runtime.zero.utils import get_mapping_to_flat_buffer
+
+
+def patched_offload_states(
+    self,
+    include: Container[OffloadStateTypeEnum] = None,
+    device: OffloadDeviceEnum = OffloadDeviceEnum.cpu,
+    pin_memory: bool = True,
+    non_blocking: bool = False,
+):
     device = device.value
     self.empty_partition_cache()
 
     def needs_offload(target):
         # return True
-        return target not in self.offloaded_states and (include == None or target in include)
+        return target not in self.offloaded_states and (
+            include is None or target in include
+        )
+
     # HP param
     if needs_offload(OffloadStateTypeEnum.hp_params):
         if pin_memory:
@@ -431,7 +447,11 @@ def patched_offload_states(self,
                     for t in self.fp32_partitioned_groups_flat
                 ]
 
-            for src_tensor, dest_buf in zip(self.fp32_partitioned_groups_flat, self.hp_params_pin_buffers):
+            for src_tensor, dest_buf in zip(
+                self.fp32_partitioned_groups_flat,
+                self.hp_params_pin_buffers,
+                strict=False,
+            ):
                 dest_buf.copy_(src_tensor, non_blocking=non_blocking)
                 src_tensor.data = dest_buf
         else:
@@ -441,7 +461,8 @@ def patched_offload_states(self,
 
     if needs_offload(OffloadStateTypeEnum.lp_params):
         mapping = get_mapping_to_flat_buffer(
-                    [p.ds_tensor for p in self.module.parameters()])
+            [p.ds_tensor for p in self.module.parameters()]
+        )
         required = max(offset + numel for _, offset, numel in mapping)
         buffer_size = self.lp_param_buffer.numel()
 
@@ -451,7 +472,9 @@ def patched_offload_states(self,
 
             if required > buffer_size:
                 self.lp_param_buffer = torch.empty(
-                    required, dtype=self.lp_param_buffer.dtype, device=self.lp_param_buffer.device,
+                    required,
+                    dtype=self.lp_param_buffer.dtype,
+                    device=self.lp_param_buffer.device,
                 )
 
             lora_params = self._get_parameter_partitions()
@@ -459,60 +482,76 @@ def patched_offload_states(self,
             parameters_to_offload = [p.ds_tensor for p in self.module.parameters()]
             # We remove all parameters in parameters_to_offload that are in lora_params
             parameters_to_offload = [
-                p for p in parameters_to_offload if all(p is not lora_param for lora_param in lora_params)
+                p
+                for p in parameters_to_offload
+                if all(p is not lora_param for lora_param in lora_params)
             ]
             # We now add them back at the beginning of the list
             parameters_to_offload = lora_params + parameters_to_offload
 
-            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameters_to_offload):
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
+                parameters_to_offload
+            ):
                 self.lp_param_buffer.narrow(0, offset, tensor_numel).copy_(tensor.data)
 
             if pin_memory:
                 if not hasattr(self, "lp_param_contiguous_pin_buffer"):
                     self.lp_param_contiguous_pin_buffer = get_accelerator().pin_memory(
-                        torch.empty_like(self.lp_param_buffer, device=device))
-                self.lp_param_contiguous_pin_buffer.copy_(self.lp_param_buffer, non_blocking=non_blocking)
+                        torch.empty_like(self.lp_param_buffer, device=device)
+                    )
+                self.lp_param_contiguous_pin_buffer.copy_(
+                    self.lp_param_buffer, non_blocking=non_blocking
+                )
                 cpu_buffer = self.lp_param_contiguous_pin_buffer
             else:
                 cpu_buffer = self.lp_param_buffer.to(device, non_blocking=non_blocking)
 
             self.lp_param_buffer.data = cpu_buffer
 
-
-            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameters_to_offload):
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
+                parameters_to_offload
+            ):
                 tensor.data = cpu_buffer.narrow(0, offset, tensor_numel)
-
-
 
         else:
             if pin_memory:
                 if not hasattr(self, "lp_param_contiguous_pin_buffer"):
                     self.lp_param_contiguous_pin_buffer = get_accelerator().pin_memory(
-                        torch.empty_like(self.lp_param_buffer, device=device))
-                self.lp_param_contiguous_pin_buffer.copy_(self.lp_param_buffer, non_blocking=non_blocking)
+                        torch.empty_like(self.lp_param_buffer, device=device)
+                    )
+                self.lp_param_contiguous_pin_buffer.copy_(
+                    self.lp_param_buffer, non_blocking=non_blocking
+                )
                 cpu_buffer = self.lp_param_contiguous_pin_buffer
             else:
                 cpu_buffer = self.lp_param_buffer.to(device, non_blocking=non_blocking)
 
             self.lp_param_buffer.data = cpu_buffer
             for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
-                [p.ds_tensor for p in self.module.parameters()]):
+                [p.ds_tensor for p in self.module.parameters()]
+            ):
                 tensor.data = cpu_buffer.narrow(0, offset, tensor_numel)
 
         self.fp16_partitioned_groups_flat.clear()
         self.offloaded_states.add(OffloadStateTypeEnum.lp_params)
-       
+
     # LP grad
     if needs_offload(OffloadStateTypeEnum.lp_grads):
         if pin_memory:
             if not hasattr(self, "lp_grad_partitions_flat_pin_buffers"):
                 self.lp_grad_partitions_flat_pin_buffers = get_accelerator().pin_memory(
-                    torch.empty_like(self.grad_partitions_flat_buffer, device=device))
-            self.lp_grad_partitions_flat_pin_buffers.copy_(self.grad_partitions_flat_buffer,
-                                                            non_blocking=non_blocking)
-            self.grad_partitions_flat_buffer.data = self.lp_grad_partitions_flat_pin_buffers
+                    torch.empty_like(self.grad_partitions_flat_buffer, device=device)
+                )
+            self.lp_grad_partitions_flat_pin_buffers.copy_(
+                self.grad_partitions_flat_buffer, non_blocking=non_blocking
+            )
+            self.grad_partitions_flat_buffer.data = (
+                self.lp_grad_partitions_flat_pin_buffers
+            )
         else:
-            self.grad_partitions_flat_buffer.data = self.grad_partitions_flat_buffer.data.to(device)
+            self.grad_partitions_flat_buffer.data = (
+                self.grad_partitions_flat_buffer.data.to(device)
+            )
         self.averaged_gradients = {}
 
         self.__param_id_to_grad_partition = {}
@@ -521,10 +560,14 @@ def patched_offload_states(self,
 
     # contiguous bucket
     if needs_offload(OffloadStateTypeEnum.contiguous_grad_buffer):
-        if hasattr(self, "_DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer"
-                    ) and self._DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer is not None:
+        if (
+            hasattr(self, "_DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer")
+            and self._DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer is not None
+        ):
             # Record properties like shape, strides, etc. as a meta tensor
-            self.grad_buffer_meta = self._DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer.to("meta")
+            self.grad_buffer_meta = (
+                self._DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer.to("meta")
+            )
             self._DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer = None
             self.offloaded_states.add(OffloadStateTypeEnum.contiguous_grad_buffer)
 
@@ -536,18 +579,23 @@ def patched_offload_states(self,
     gc.collect()
     get_accelerator().empty_cache()
 
-from deepspeed.runtime.zero.offload_states import reload_adam_states
+
 import itertools
-from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
+from deepspeed.runtime.zero.offload_states import reload_adam_states
+
 
 def patched_reload_states(self, non_blocking: bool = False):
-
     device = get_accelerator().current_device_name()
 
     # HP param
     if OffloadStateTypeEnum.hp_params in self.offloaded_states:
         if hasattr(self, "hp_params_pin_buffers"):
-            for src, dest in zip(self.hp_params_pin_buffers, self.fp32_partitioned_groups_flat):
+            for src, dest in zip(
+                self.hp_params_pin_buffers,
+                self.fp32_partitioned_groups_flat,
+                strict=False,
+            ):
                 dest.data = src.to(device, non_blocking=non_blocking)
         else:
             for buf in self.fp32_partitioned_groups_flat:
@@ -556,51 +604,71 @@ def patched_reload_states(self, non_blocking: bool = False):
 
     # LP Param
     if OffloadStateTypeEnum.lp_params in self.offloaded_states:
-        cpu_buffer = self.lp_param_contiguous_pin_buffer if hasattr(
-            self, "lp_param_contiguous_pin_buffer") else self.lp_param_buffer
-        self.lp_param_buffer.data = cpu_buffer.data.to(device, non_blocking=non_blocking)
+        cpu_buffer = (
+            self.lp_param_contiguous_pin_buffer
+            if hasattr(self, "lp_param_contiguous_pin_buffer")
+            else self.lp_param_buffer
+        )
+        self.lp_param_buffer.data = cpu_buffer.data.to(
+            device, non_blocking=non_blocking
+        )
         self._set_fp16_partitioned_groups_flat()
-
 
         if hasattr(self, "lora_mode") and self.lora_mode:
             lora_params = self._get_parameter_partitions()
             parameters_to_offload = [p.ds_tensor for p in self.module.parameters()]
             parameters_to_offload = [
-                p for p in parameters_to_offload if all(p is not lora_param for lora_param in lora_params)
+                p
+                for p in parameters_to_offload
+                if all(p is not lora_param for lora_param in lora_params)
             ]
             parameters_to_offload = lora_params + parameters_to_offload
-            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameters_to_offload):
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
+                parameters_to_offload
+            ):
                 tensor.data = self.lp_param_buffer.narrow(0, offset, tensor_numel)
-        else:    
+        else:
             parameter_partitions = self._get_parameter_partitions()
-            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(parameter_partitions):
+            for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
+                parameter_partitions
+            ):
                 tensor.data = self.lp_param_buffer.narrow(0, offset, tensor_numel)
 
         self.offloaded_states.remove(OffloadStateTypeEnum.lp_params)
 
-
     # LP grad
     if OffloadStateTypeEnum.lp_grads in self.offloaded_states:
         if hasattr(self, "lp_grad_partitions_flat_pin_buffers"):
-            self.grad_partitions_flat_buffer.data = self.lp_grad_partitions_flat_pin_buffers.to(
-                device, non_blocking=non_blocking)
+            self.grad_partitions_flat_buffer.data = (
+                self.lp_grad_partitions_flat_pin_buffers.to(
+                    device, non_blocking=non_blocking
+                )
+            )
         else:
-            self.grad_partitions_flat_buffer.data = self.grad_partitions_flat_buffer.data.to(
-                device, non_blocking=non_blocking)
+            self.grad_partitions_flat_buffer.data = (
+                self.grad_partitions_flat_buffer.data.to(
+                    device, non_blocking=non_blocking
+                )
+            )
         self.averaged_gradients = {}
 
         offset = 0
         all_params = list(itertools.chain.from_iterable(self.fp16_groups))
         for param in all_params:
-            self.__param_id_to_grad_partition[param.ds_id] = self.grad_partitions_flat_buffer.narrow(
-                0, offset, param.partition_numel())
+            self.__param_id_to_grad_partition[param.ds_id] = (
+                self.grad_partitions_flat_buffer.narrow(
+                    0, offset, param.partition_numel()
+                )
+            )
             offset += param.partition_numel()
 
         self.offloaded_states.remove(OffloadStateTypeEnum.lp_grads)
 
     # contiguous bucket
     if OffloadStateTypeEnum.contiguous_grad_buffer in self.offloaded_states:
-        self._DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer = torch.empty_like(self.grad_buffer_meta, device=device)
+        self._DeepSpeedZeroOptimizer_Stage3__ipg_bucket_flat_buffer = torch.empty_like(
+            self.grad_buffer_meta, device=device
+        )
         # self.__ipg_bucket_flat_buffer.data = self.__ipg_bucket_flat_buffer.data.to(device)
         self.offloaded_states.remove(OffloadStateTypeEnum.contiguous_grad_buffer)
 
@@ -611,6 +679,7 @@ def patched_reload_states(self, non_blocking: bool = False):
 
     if non_blocking:
         get_accelerator().synchronize()
+
 
 from deepspeed.runtime.zero.stage3 import DeepSpeedZeroOptimizer_Stage3
 
