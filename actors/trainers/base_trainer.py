@@ -456,6 +456,7 @@ class BaseRLTrainer:
             gather_and_stream_state_dict(
                 ta.accel,
                 self.logger,
+                actor_obj.gpu_groups,
                 ta.model,
                 stream_batch_callback,
                 tie_word_embeddings=ta.model_config.tie_word_embeddings,

@@ -31,6 +31,7 @@ class vLLMActor(TrainableLLMActor):
         training_config: ActorTrainCfg | None = None,
     ):
         self.logger = init_logger(name=name)
+        self.gpu_groups = gpu_groups
         model_config = AutoConfig.from_pretrained(model_path)
 
         if engine_kwargs is None:
@@ -195,32 +196,11 @@ class vLLMActor(TrainableLLMActor):
     def start_weight_update(self):
         self.pool.start_update(self.name)
 
-    def update_weights_batch(self, state_dict: dict[str, torch.Tensor]):
-        if not state_dict:
+    def update_weights_batch(self, ipc_handles: dict):
+        if not ipc_handles:
             return
 
-        tensors_by_device: dict[torch.device, dict[str, torch.Tensor]] = {}
-        for name, tensor in state_dict.items():
-            device = tensor.device
-            if device not in tensors_by_device:
-                tensors_by_device[device] = {}
-            tensors_by_device[device][name] = tensor
-
-        all_ipc_handles = {}
-        for device, tensors in tensors_by_device.items():
-            if device.type == "cuda":
-                device_uuid = current_platform.get_device_uuid(device.index)
-
-                ipc_handles = {
-                    name: reduce_tensor(p.detach()) for name, p in tensors.items()
-                }
-
-                all_ipc_handles[device_uuid] = ipc_handles
-
-        if not all_ipc_handles:
-            return
-
-        self.pool.update_weights_batch(self.name, all_ipc_handles)
+        self.pool.update_weights_batch(self.name, ipc_handles)
 
     def _handle_sleep_state(self):
         self.wake()

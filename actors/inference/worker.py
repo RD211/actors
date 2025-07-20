@@ -46,6 +46,7 @@ class ModelWorker:
         os.environ["VLLM_USE_V1"] = "1" if use_v1_engine else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+        self.gpu_group = gpus
 
         # This is for the new weight update mechanism
         engine_kwargs["worker_extension_cls"] = (
@@ -57,7 +58,6 @@ class ModelWorker:
             tensor_parallel_size=len(gpus),
             trust_remote_code=True,
             enable_sleep_mode=True,
-            # distributed_executor_backend="mp",
             **engine_kwargs,
         )
         self.is_sleeping: bool = False
@@ -80,7 +80,7 @@ class ModelWorker:
 
     def start_update(self) -> tuple[str, str | None]:
         try:
-            self.engine.collective_rpc("init_cpu_cache")
+            self.engine.collective_rpc("init_cpu_cache", args=(self.gpu_group,))
             return "OK", None
         except Exception:
             return "ERROR", traceback.format_exc()

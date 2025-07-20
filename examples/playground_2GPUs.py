@@ -62,11 +62,11 @@ def main():
         engine_kwargs={
             "gpu_memory_utilization": 0.5,
             "max_model_len": 2048,
-            "quantization": "fp8",
+            # "quantization": "fp8",
         },
         training_config=training_config,
         gpu_groups=[
-            [0, 1],        
+            [0,1]    
         ],
     )
     tokenizer = actor.tokenizer
@@ -82,7 +82,7 @@ def main():
         {"text": "Who wrote 'To Kill a Mockingbird'?"},
         {"text": "What is the speed of light?"},
         {"text": "How do you make a cake?"},
-    ] * 5
+    ] * 50
 
     train_data = [
         {
