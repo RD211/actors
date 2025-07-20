@@ -486,7 +486,6 @@ class ActorTrainCfg:
             "rmsprop": optim.RMSprop,
         }
 
-        # Try to import and add bitsandbytes optimizers if available
         try:
             import bitsandbytes as bnb
 

@@ -31,6 +31,8 @@ class vLLMActor(TrainableLLMActor):
         training_config: ActorTrainCfg | None = None,
     ):
         self.logger = init_logger(name=name)
+        if gpu_groups is None:
+            gpu_groups = [list(range(torch.cuda.device_count()))]
         self.gpu_groups = gpu_groups
         model_config = AutoConfig.from_pretrained(model_path)
 
@@ -40,34 +42,21 @@ class vLLMActor(TrainableLLMActor):
         # We extract num_attention_heads if present and check
         # if it is divisible engine_kwargs["tensor_parallel_size"] if tensor parallel size is set
         # TODO: Make this handle all cases when tensor_parallel_size is set etc.
-        # if hasattr(
-        #     model_config, "num_attention_heads"
-        # ):
-        #     num_heads = model_config.num_attention_heads
+        if hasattr(
+            model_config, "num_attention_heads"
+        ):
+            num_heads = model_config.num_attention_heads
 
-        #     for gpu_g in gpu_groups:
-        #         tensor_parallel_size = len(gpu_g)
-        #         if num_heads % tensor_parallel_size != 0:
-        #             for pipeline_parallel_size in range(1, tensor_parallel_size + 1):
-        #                 if (
-        #                     tensor_parallel_size % pipeline_parallel_size == 0
-        #                     and num_heads % (tensor_parallel_size // pipeline_parallel_size)
-        #                     == 0
-        #                 ):
-        #                     engine_kwargs["tensor_parallel_size"] = (
-        #                         tensor_parallel_size // pipeline_parallel_size
-        #                     )
-        #                     engine_kwargs["pipeline_parallel_size"] = pipeline_parallel_size
-        #                     break
-        #             self.logger.warning(
-        #                 colorize(
-        #                     f"num_attention_heads ({num_heads}) is not divisible by tensor_parallel_size ({tensor_parallel_size}). "
-        #                     "In order to keep the model working we will set tensor_parallel_size to "
-        #                     f"{engine_kwargs['tensor_parallel_size']} and pipeline_parallel_size to {engine_kwargs['pipeline_parallel_size']}.",
-        #                     Palette.ERROR,
-        #                 )
-        #             )
-
+            for gpu_g in gpu_groups:
+                tensor_parallel_size = len(gpu_g)
+                if num_heads % tensor_parallel_size != 0:
+                    self.logger.error(
+                        f"{colorize(Palette.RED, 'ERROR:')} "
+                        f"num_attention_heads ({num_heads}) is not divisible by "
+                        f"tensor_parallel_size ({tensor_parallel_size}). "
+                        "This will probably crash but let's try anyway."
+                    )
+        
         super().__init__(
             name,
             model_path,

@@ -47,18 +47,18 @@ def main():
     # Create training configuration
     training_config = ActorTrainCfg(
         learning_rate=2e-6,
-        optimizer="adamw_8bit",
+        optimizer="adamw_32bit",
         loss="liger_grpo",
         scheduler=get_lr_scheduler,
         offload_model=True,
         offload_optimizer=True,
-        beta=0.04,
+        beta=0.0,
     )
 
     # Create actor with improved configuration API
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-0.5B-Instruct",
+        model_path="Qwen/Qwen2.5-3B-Instruct",
         engine_kwargs={
             "gpu_memory_utilization": 0.5,
             "max_model_len": 2048,

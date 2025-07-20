@@ -60,15 +60,15 @@ def main():
         quantization_config=quantization_config,
         offload_model=True,
         offload_optimizer=True,
-        beta=0.001,
+        beta=0.0,
     )
 
     # Create actor with PEFT and quantization configuration
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-0.5B-Instruct",
+        model_path="Qwen/Qwen2.5-14B-Instruct",
         engine_kwargs={
-            "gpu_memory_utilization": 0.6,
+            "gpu_memory_utilization": 0.7,
             "max_model_len": 2048,
             "quantization": "bitsandbytes",
         },
@@ -192,7 +192,8 @@ def main():
 
     import wandb
 
-    wandb.init(project="test_actors-2", entity="rd211", name="3b-lora")
+    if os.getenv("RANK") == "0":
+        wandb.init(project="test_actors-2", entity="rd211", name="14b-lora")
     trainer.train()
     trainer.push_to_hub(
         "rd211/test_actors_lora_main",

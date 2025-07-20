@@ -73,6 +73,11 @@ def prepare_deepspeed(model, accelerator: "accelerate"):
 
 def _zero_tensors(zopt):
     """Generator that yields all tensors in a ZeRO optimizer."""
+
+    # Write to file dir(zopt) to see all attributes
+    with open("zero_tensors.txt", "w") as f:
+        for n in dir(zopt):
+            f.write(f"{n}\n")
     for n in dir(zopt):
         if n.endswith("_groups_flat"):
             for t in getattr(zopt, n, []):
@@ -96,9 +101,12 @@ def _move_zero_tensors(zopt, device, non_blocking=True):
             moved += t.numel() * t.element_size()
             tensors_to_move.append(t)
 
+    # Write tensors to file for debugging
+    with open("zero_tensors_to_move.txt", "w") as f:
+        for t in tensors_to_move:
+            f.write(f"{t.shape} {t.dtype} {t.device}\n")
     # Move tensors asynchronously in parallel
     if tensors_to_move:
-        # Use CUDA streams for parallel transfers when moving to/from GPU
         if device.type == "cuda" or any(
             t.device.type == "cuda" for t in tensors_to_move
         ):
@@ -128,6 +136,7 @@ def _offload_optimizer(model, optimizer, device="cpu", non_blocking=True):
         OffloadStateTypeEnum.contiguous_grad_buffer,
         OffloadStateTypeEnum.hp_params,  # High precision params (optimizer states)
         OffloadStateTypeEnum.lp_grads,  # Low precision gradients
+        OffloadStateTypeEnum.optim_states,  # Optimizer states
     ]
 
     model.optimizer.offload_states(
@@ -420,6 +429,7 @@ from deepspeed.accelerator import get_accelerator
 # Patch
 #################
 from deepspeed.runtime.zero.utils import get_mapping_to_flat_buffer
+from deepspeed.runtime.zero.offload_states import reload_adam_states,offload_adam_states
 
 
 def patched_offload_states(
@@ -573,7 +583,7 @@ def patched_offload_states(
 
     # Adam
     if needs_offload(OffloadStateTypeEnum.optim_states):
-        # offload_adam_states(self.optimizer, device, pin_memory=pin_memory, non_blocking=non_blocking)
+        offload_adam_states(self.optimizer, device, pin_memory=pin_memory, non_blocking=non_blocking)
         self.offloaded_states.add(OffloadStateTypeEnum.optim_states)
 
     gc.collect()
@@ -582,7 +592,6 @@ def patched_offload_states(
 
 import itertools
 
-from deepspeed.runtime.zero.offload_states import reload_adam_states
 
 
 def patched_reload_states(self, non_blocking: bool = False):

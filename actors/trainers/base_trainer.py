@@ -293,12 +293,6 @@ class BaseRLTrainer:
             accel = accelerators[name]
             model = actor_obj.training_config.model_factory().train()
             accel.state.select_deepspeed_plugin(name)
-            self.logger.normal(
-                colorize(
-                    f"🔧 Initializing actor '{name}'",
-                    Palette.INFO,
-                )
-            )
 
             # We check if the model has a quantization_config
             if hasattr(model.config, "quantization_config"):
@@ -922,7 +916,6 @@ class BaseRLTrainer:
             os.makedirs(tgt, exist_ok=True)
 
             state_dict = ta.accel.get_state_dict(ta.model)
-            self.logger.normal(colorize("Gathered a state dict", Palette.INFO))
 
             ta.accel.unwrap_model(ta.model, keep_torch_compile=False).save_pretrained(
                 tgt,
