@@ -73,11 +73,6 @@ def prepare_deepspeed(model, accelerator: "accelerate"):
 
 def _zero_tensors(zopt):
     """Generator that yields all tensors in a ZeRO optimizer."""
-
-    # Write to file dir(zopt) to see all attributes
-    with open("zero_tensors.txt", "w") as f:
-        for n in dir(zopt):
-            f.write(f"{n}\n")
     for n in dir(zopt):
         if n.endswith("_groups_flat"):
             for t in getattr(zopt, n, []):
@@ -89,6 +84,12 @@ def _zero_tensors(zopt):
             if torch.is_tensor(v):
                 yield v
 
+    for v in inner.__dict__['_DeepSpeedZeroOptimizer_Stage3__param_id_to_grad_partition'].values():
+        if torch.is_tensor(v):
+            yield v
+    keys = inner.__dict__.get('ipg_buckets', {}).keys()
+    for k in keys:
+        yield inner.__dict__['ipg_buckets'][k].buffer
 
 def _move_zero_tensors(zopt, device, non_blocking=True):
     """Move all ZeRO optimizer tensors to the specified device. Returns bytes moved."""
@@ -100,23 +101,10 @@ def _move_zero_tensors(zopt, device, non_blocking=True):
         if t.device != device:
             moved += t.numel() * t.element_size()
             tensors_to_move.append(t)
-
-    # Write tensors to file for debugging
-    with open("zero_tensors_to_move.txt", "w") as f:
-        for t in tensors_to_move:
-            f.write(f"{t.shape} {t.dtype} {t.device}\n")
     # Move tensors asynchronously in parallel
     if tensors_to_move:
-        if device.type == "cuda" or any(
-            t.device.type == "cuda" for t in tensors_to_move
-        ):
-            # Batch the transfers for better performance
-            for t in tensors_to_move:
-                t.data = t.data.to(device, non_blocking=non_blocking)
-        else:
-            # For CPU-to-CPU moves, process in batches
-            for t in tensors_to_move:
-                t.data = t.data.to(device, non_blocking=False)
+        for t in tensors_to_move:
+            t.data = t.data.to(device, non_blocking=non_blocking)
 
     return moved
 
@@ -126,15 +114,11 @@ def _offload_optimizer(model, optimizer, device="cpu", non_blocking=True):
     Offload optimizer states (ZeRO tensors + DeepSpeed engine states) to the specified device.
     Returns the number of bytes moved.
     """
-    # Offload ZeRO optimizer tensors with non-blocking transfers
-    moved = _move_zero_tensors(
-        optimizer, torch.device(device), non_blocking=non_blocking
-    )
 
     # Offload DeepSpeed optimizer engine states (grad buffer, hp params, lp grads)
     include = [
         OffloadStateTypeEnum.contiguous_grad_buffer,
-        OffloadStateTypeEnum.hp_params,  # High precision params (optimizer states)
+        OffloadStateTypeEnum.hp_params,  # High precision params 
         OffloadStateTypeEnum.lp_grads,  # Low precision gradients
         OffloadStateTypeEnum.optim_states,  # Optimizer states
     ]
@@ -144,6 +128,10 @@ def _offload_optimizer(model, optimizer, device="cpu", non_blocking=True):
         device=OffloadDeviceEnum.cpu,
         pin_memory=True,
         non_blocking=non_blocking,
+    )
+    # Offload ZeRO optimizer tensors with non-blocking transfers
+    moved = _move_zero_tensors(
+        optimizer, torch.device(device), non_blocking=non_blocking
     )
 
     return moved
@@ -199,7 +187,7 @@ def _reload_engine_states(engine, non_blocking=True):
 
 
 def offload_model_and_optimizer(
-    model, optimizer, offload_optimizer=True, offload_model=True, non_blocking=True
+    model, optimizer, offload_optimizer=False, offload_model=False, non_blocking=True
 ):
     info = {"optimizer_bytes": 0, "model_offloaded": False}
 
@@ -475,7 +463,6 @@ def patched_offload_states(
         )
         required = max(offset + numel for _, offset, numel in mapping)
         buffer_size = self.lp_param_buffer.numel()
-
         if required > buffer_size or hasattr(self, "lora_mode"):
             # We are in LoRA mode.
             self.lora_mode = True
@@ -517,12 +504,10 @@ def patched_offload_states(
                 cpu_buffer = self.lp_param_buffer.to(device, non_blocking=non_blocking)
 
             self.lp_param_buffer.data = cpu_buffer
-
             for tensor, offset, tensor_numel in get_mapping_to_flat_buffer(
                 parameters_to_offload
             ):
                 tensor.data = cpu_buffer.narrow(0, offset, tensor_numel)
-
         else:
             if pin_memory:
                 if not hasattr(self, "lp_param_contiguous_pin_buffer"):

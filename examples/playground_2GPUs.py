@@ -58,7 +58,7 @@ def main():
     # Create actor with improved configuration API
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-3B-Instruct",
+        model_path="Qwen/Qwen2.5-1.5B-Instruct",
         engine_kwargs={
             "gpu_memory_utilization": 0.5,
             "max_model_len": 2048,

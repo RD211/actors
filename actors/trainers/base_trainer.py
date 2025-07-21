@@ -568,6 +568,8 @@ class BaseRLTrainer:
                     for actor_name, _ in self.actors.items():
                         actor_obj = self.actor_objects[actor_name]
                         actor_obj.sleep()
+
+                    self.accel.wait_for_everyone()
                     result = self.train_step(env_output)
                 except StopIteration:
                     break
