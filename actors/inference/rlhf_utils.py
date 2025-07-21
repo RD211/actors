@@ -76,48 +76,7 @@ class ColocateWorkerExtension:
             self.cpu_cache = to_vllm_state_dict(self.cpu_cache)
             self.cpu_cache = fp8_quantize_state_dict(self.cpu_cache)
             self.model_runner.model.load_state_dict(self.cpu_cache)
-            # We get the model class.
-            # from inspect import unwrap
-            # model_class = unwrap(self.model_runner.model.model.__class__)
-            # big_class = self.model_runner.model.__class__
-            # big_class.Qwen2Model = model_class
-            # print(self.model_runner.vllm_config)
-            # #copy of vllm_config
-            # v_config = self.model_runner.vllm_config
-            # level_before = v_config.compilation_config.level
-            # v_config.compilation_config.level = 1
-            # new_model = big_class(
-            #     vllm_config=self.model_runner.vllm_config,
-            # )
-            # to_convert_weights = list(self.cpu_cache.items())
-            # # move everything to gpu
-            # for k, v in to_convert_weights:
-            #     self.cpu_cache[k] = v.to(device="cuda", non_blocking=True)
-            # torch.cuda.empty_cache()
-            # torch.cuda.synchronize()
-            # self.model_runner.model.load_weights(weights=list(self.cpu_cache.items()))
 
-            # state_dict = new_model.state_dict()
-            # with open("fp8_weights.txt", "w") as f:
-            #     for k, v in state_dict.items():
-            #         f.write(f"{k}: {v.shape} {v.dtype} {v.device}\n")
-
-            # with open("model_weights.txt", "w") as f:
-            #     for k, v in self.model_runner.model.state_dict().items():
-            #         f.write(f"{k}: {v.shape} {v.dtype} {v.device}\n")
-            # print("A"*100)
-            # self.model_runner.model.load_state_dict(state_dict)
-            # print("A"*100)
-            # v_config.compilation_config.level = level_before
-
-            # # Output all keys and shapes to file.
-            # with open("fp8_weights.txt", "w") as f:
-            #     for k, v in self.cpu_cache.items():
-            #         f.write(f"{k}: {v.shape} {v.dtype} {v.device}\n")
-
-            # with open("model_weights.txt", "w") as f:
-            #     for k, v in self.model_runner.model.state_dict().items():
-            #         f.write(f"{k}: {v.shape} {v.dtype} {v.device}\n")
         else:
             weights = list(self.cpu_cache.items())
             self.model_runner.model.load_weights(weights=weights)

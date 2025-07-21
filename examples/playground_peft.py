@@ -1,7 +1,7 @@
+import os
 from datasets import Dataset
 from peft import LoraConfig, TaskType
 from vllm import SamplingParams
-
 from actors import (
     ActorTrainCfg,
     EvalStrategy,
@@ -41,7 +41,7 @@ def main():
 
     # Create training configuration
     training_config = ActorTrainCfg(
-        learning_rate=4e-6,
+        learning_rate=1e-6,
         optimizer="adamw_32bit",
         loss="liger_grpo",
         scheduler="cosine",
@@ -50,16 +50,18 @@ def main():
         offload_optimizer=True,
         beta=0.001,
         loss_temp=1.0,  # Temperature for loss scaling
+        model_kwargs={
+            'attn_implementation': 'flash_attention_2',
+        }
     )
 
     # Create actor with PEFT configuration
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-0.5B-Instruct",
+        model_path="Qwen/Qwen2.5-1.5B-Instruct",
         engine_kwargs={
             "gpu_memory_utilization": 0.6,
             "max_model_len": 2048,
-            "quantization": "fp8",
         },
         training_config=training_config,
     )
@@ -167,8 +169,8 @@ def main():
     cfg = GRPOTrainerCfg(
         group_size=16,
         batch_size=64,
-        grad_accumulation_steps=4,
-        num_iterations=2,
+        grad_accumulation_steps=8,
+        num_iterations=1,
         log_every_n=1,
         eval_every_n=None,  # No periodic evaluation
         eval_strategy=EvalStrategy.NONE,  # No evaluation
@@ -180,8 +182,8 @@ def main():
     trainer = GRPOTrainer(cfg=cfg, env=env, actors=[actor])
 
     import wandb
-
-    wandb.init(project="test_actors-2", entity="rd211", name="3b-lora")
+    if os.getenv("RANK") == "0":
+        wandb.init(project="test_actors-2", entity="rd211", name="1.5b-lora")
     trainer.train()
     trainer.push_to_hub(
         "rd211/test_actors_lora_main",

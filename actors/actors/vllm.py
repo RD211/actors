@@ -28,8 +28,11 @@ class vLLMActor(TrainableLLMActor):
         use_v1_engine: bool = True,
         engine_kwargs: dict[str, Any] | None = None,
         insomnia: bool = False,  # If true all sleep calls will be ignored
-        training_config: ActorTrainCfg | None = None,
+        non_trainable: bool = False,
+        training_config: ActorTrainCfg = ActorTrainCfg(),
     ):
+
+        self.non_trainable = non_trainable
         self.logger = init_logger(name=name)
         if gpu_groups is None:
             gpu_groups = [list(range(torch.cuda.device_count()))]

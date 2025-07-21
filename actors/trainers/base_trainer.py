@@ -455,6 +455,7 @@ class BaseRLTrainer:
                 stream_batch_callback,
                 tie_word_embeddings=ta.model_config.tie_word_embeddings,
                 lora_only=is_peft_model(ta.model),
+                batch_size=actor_obj.training_config.update_weights_batch_size,
             )
 
         if actor_obj.training_config.offload_model:
