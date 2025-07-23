@@ -5,10 +5,8 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-from torch.multiprocessing.reductions import reduce_tensor
 from transformers import AutoConfig
 from vllm import RequestOutput, SamplingParams
-from vllm.platforms import current_platform
 
 from actors.inference.pool import ModelPool
 from actors.inference.worker import DEFAULT_LORA
@@ -29,14 +27,15 @@ class vLLMActor(TrainableLLMActor):
         engine_kwargs: dict[str, Any] | None = None,
         insomnia: bool = False,  # If true all sleep calls will be ignored
         non_trainable: bool = False,
-        training_config: ActorTrainCfg = ActorTrainCfg(),
+        training_config: ActorTrainCfg = None,
     ):
-
         self.non_trainable = non_trainable
         self.logger = init_logger(name=name)
         if gpu_groups is None:
             gpu_groups = [list(range(torch.cuda.device_count()))]
         self.gpu_groups = gpu_groups
+        if training_config is None:
+            training_config = ActorTrainCfg()
         model_config = AutoConfig.from_pretrained(model_path)
 
         if engine_kwargs is None:
@@ -45,9 +44,7 @@ class vLLMActor(TrainableLLMActor):
         # We extract num_attention_heads if present and check
         # if it is divisible engine_kwargs["tensor_parallel_size"] if tensor parallel size is set
         # TODO: Make this handle all cases when tensor_parallel_size is set etc.
-        if hasattr(
-            model_config, "num_attention_heads"
-        ):
+        if hasattr(model_config, "num_attention_heads"):
             num_heads = model_config.num_attention_heads
 
             for gpu_g in gpu_groups:
@@ -59,7 +56,7 @@ class vLLMActor(TrainableLLMActor):
                         f"tensor_parallel_size ({tensor_parallel_size}). "
                         "This will probably crash but let's try anyway."
                     )
-        
+
         super().__init__(
             name,
             model_path,

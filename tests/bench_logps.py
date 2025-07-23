@@ -1,23 +1,22 @@
-#!/usr/bin/env python
+# ruff: noqa
 import argparse
 import csv
 import gc
-import math
 import statistics
 import sys
 import time
-from typing import List, Sequence, Tuple
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from actors.utils.get_logps import chunked_logp
-
 
 # ---------------------------------------------------------------------------#
 #  Log‑prob routines                                                          #
 # ---------------------------------------------------------------------------#
+
 
 @torch.no_grad()
 def fast_logps(
@@ -27,18 +26,18 @@ def fast_logps(
     temperature: float,
     max_fused: int,
     device,
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     lengths = [len(seq) for seq in batch_ids]
 
-    enc = tokenizer.pad(
-        {"input_ids": batch_ids}, padding=True, return_tensors="pt"
-    ).to(device)
+    enc = tokenizer.pad({"input_ids": batch_ids}, padding=True, return_tensors="pt").to(
+        device
+    )
 
-    hidden = model.model(               # type: ignore[attr-defined]
+    hidden = model.model(  # type: ignore[attr-defined]
         input_ids=enc.input_ids,
         attention_mask=enc.attention_mask,
         use_cache=False,
-    ).last_hidden_state                 # (B, L, H)
+    ).last_hidden_state  # (B, L, H)
 
     hidden = hidden[:, :-1]
     target = enc.input_ids[:, 1:]
@@ -57,9 +56,7 @@ def fast_logps(
         dim=0,
     ).to(device)
 
-    h_flat = (
-        hidden.reshape(-1, hidden.size(-1))[non_pad.reshape(-1)]
-    )
+    h_flat = hidden.reshape(-1, hidden.size(-1))[non_pad.reshape(-1)]
     tgt_flat = target.reshape(-1)[non_pad.reshape(-1)]
 
     out_flat = chunked_logp(
@@ -74,6 +71,7 @@ def fast_logps(
 
     return out
 
+
 @torch.no_grad()
 def baseline_logps(
     model,
@@ -81,10 +79,10 @@ def baseline_logps(
     batch_ids: Sequence[Sequence[int]],
     temperature: float,
     device,
-) -> List[torch.Tensor]:
-    enc = tokenizer.pad(
-        {"input_ids": batch_ids}, padding=True, return_tensors="pt"
-    ).to(device)
+) -> list[torch.Tensor]:
+    enc = tokenizer.pad({"input_ids": batch_ids}, padding=True, return_tensors="pt").to(
+        device
+    )
 
     logits = model(**enc, use_cache=False).logits[:, :-1].float()
     logp = F.log_softmax(logits / temperature, dim=-1)
@@ -92,9 +90,7 @@ def baseline_logps(
     gathered = torch.gather(logp, -1, tgt).squeeze(-1)
 
     lengths = [len(seq) for seq in batch_ids]
-    return [
-        gathered[i, : l - 1].detach().cpu() for i, l in enumerate(lengths)
-    ]
+    return [gathered[i, : l - 1].detach().cpu() for i, l in enumerate(lengths)]
 
 
 # ---------------------------------------------------------------------------#
@@ -106,7 +102,7 @@ def synth_batch(
     seq_len: int,
     include_bos: bool,
     seed: int,
-) -> List[List[int]]:
+) -> list[list[int]]:
     g = torch.Generator(device="cpu")
     g.manual_seed(seed)
 
@@ -145,7 +141,7 @@ def run_benchmark(
     runs: int,
     warmup: int,
     device,
-) -> Tuple[dict, dict]:
+) -> tuple[dict, dict]:
     base_batch = synth_batch(tokenizer, batch_size, seq_len, True, 1234)
 
     def _measure(fn_fast: bool):
@@ -171,17 +167,13 @@ def run_benchmark(
                     device,
                 )
             else:
-                out = baseline_logps(
-                    model, tokenizer, batch_ids, temperature, device
-                )
+                out = baseline_logps(model, tokenizer, batch_ids, temperature, device)
             torch.cuda.synchronize(device)
             end = time.perf_counter()
 
             walls.append(end - start)
             tps.append(sum(len(t) for t in out) / (end - start))
-            mems.append(
-                torch.cuda.max_memory_allocated(device) - start_mem
-            )
+            mems.append(torch.cuda.max_memory_allocated(device) - start_mem)
 
         med = lambda v: statistics.median(v)
         return {
@@ -287,12 +279,12 @@ def main() -> int:
             args.max_fused,
             device,
         )
-        b = baseline_logps(
-            model, tokenizer, test_batch, args.temperature, device
-        )
+        b = baseline_logps(model, tokenizer, test_batch, args.temperature, device)
 
         max_abs = max(
-            abs(float(x) - float(y)) for u, v in zip(a, b) for x, y in zip(u, v)
+            abs(float(x) - float(y))
+            for u, v in zip(a, b, strict=False)
+            for x, y in zip(u, v, strict=False)
         )
 
         if max_abs > args.atol:

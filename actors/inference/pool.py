@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import atexit
 import math
+import os
 import threading
 import time
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any
 
 import ray
@@ -15,13 +17,10 @@ from vllm import RequestOutput, SamplingParams
 from actors.inference.worker import DEFAULT_LORA, ModelWorker
 from actors.utils.logger import Palette, colorize, logger
 
-from functools import wraps
-import inspect
-import os
-
 # ═══════════════════════════════════════════════════════════════════════
 # Helpers & Types
 # ═══════════════════════════════════════════════════════════════════════
+
 
 def is_local_main() -> bool:
     for key in ("LOCAL_RANK", "LOCAL_PROCESS_INDEX", "ACCELERATE_LOCAL_PROCESS_INDEX"):
@@ -29,18 +28,23 @@ def is_local_main() -> bool:
             return int(os.environ[key]) == 0
     return True
 
+
 def main_process_only(return_value=None):
     """
     Decorator that turns any method into a no-op on non-local-main processes.
     """
+
     def _decorator(fn):
         @wraps(fn)
         def _wrapper(self, *args, **kwargs):
             if self._disabled:
                 return return_value
             return fn(self, *args, **kwargs)
+
         return _wrapper
+
     return _decorator
+
 
 @dataclass
 class ModelStats:
@@ -63,9 +67,11 @@ class ModelRecord:
     workers: list[Any] = field(default_factory=list)
     stats: ModelStats = field(default_factory=ModelStats)
 
+
 # ═══════════════════════════════════════════════════════════════════════
 # ModelPool Class
 # ═══════════════════════════════════════════════════════════════════════
+
 
 class ModelPool:
     """RPC façade combining many ModelWorker processes."""
@@ -86,12 +92,11 @@ class ModelPool:
             return
         self._disabled = not is_local_main()
         if self._disabled:
-            return  
+            return
 
-        
         self.total_gpus = torch.cuda.device_count()
         self.models: dict[str, ModelRecord] = {}
-        os.environ['RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES'] = "1"
+        os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
         ray.init(ignore_reinit_error=True)
         self._init_done = True
         # Register cleanup on exit
@@ -201,7 +206,7 @@ class ModelPool:
                         # All environment variables that we have.
                         # **os.environ,
                     }
-                }
+                },
             ).remote(name, model_path, grp, use_v1_engine, engine_kwargs)
             for grp in gpu_groups
         ]
@@ -461,7 +466,7 @@ class ModelPool:
 for name, member in list(ModelPool.__dict__.items()):
     if (
         callable(member)
-        and not name.startswith("_")           # public API only
+        and not name.startswith("_")  # public API only
         and not isinstance(member, property)
     ):
         setattr(ModelPool, name, main_process_only(None)(member))

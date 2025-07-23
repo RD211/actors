@@ -333,17 +333,17 @@ class GRPOTrainer(BaseRLTrainer):
         policy_for_loss = (
             unwrapped_model.base_model.model  # PEFT: use the inner model
             if is_peft_model(ta.model)
-            else unwrapped_model              # vanilla model
+            else unwrapped_model  # vanilla model
         )
 
         with _step_profiler.track("loss_fn", actor_name=actor_name):
             # TODO: Higher VRAM usage here which is undesirable.
             loss, stats = self._forward_redirection(
-                ta.model,              # wrapper  (DeepSpeedEngine/FSDP/…)
-                unwrapped_model,       # original (torch.nn.Module)
-                ta.loss_fn.forward,    # *bound* method of the loss object
+                ta.model,  # wrapper  (DeepSpeedEngine/FSDP/…)
+                unwrapped_model,  # original (torch.nn.Module)
+                ta.loss_fn.forward,  # *bound* method of the loss object
                 # ---- everything the loss expects --------------------
-                policy_for_loss,       # ← first positional arg: `policy`
+                policy_for_loss,  # ← first positional arg: `policy`
                 ids_pt,
                 attention_mask,
                 loss_attention_mask,

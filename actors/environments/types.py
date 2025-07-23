@@ -351,13 +351,16 @@ class GroupedEnvironmentOutput:
         combined_groups = {}
 
         for actor_name in self.groups:
-            combined_groups[actor_name] = self.groups[actor_name] + other.groups[actor_name]
+            combined_groups[actor_name] = (
+                self.groups[actor_name] + other.groups[actor_name]
+            )
 
         return GroupedEnvironmentOutput(
             problems=combined_problems,
             groups=combined_groups,
             group_size=self.group_size,
         )
+
 
 # Type aliases for convenience
 RewardComponents = dict[str, list[float]]

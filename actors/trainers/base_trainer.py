@@ -5,8 +5,9 @@ import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from functools import reduce
 from operator import add
+from typing import Any
 
 import deepspeed
 import torch
@@ -14,7 +15,7 @@ from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import DeepSpeedPlugin, DistributedType
 from peft import get_peft_model, prepare_model_for_kbit_training
 from transformers import PreTrainedTokenizerBase
-from functools import reduce
+
 from actors.actors.base import TrainableLLMActor
 from actors.environments.env_base import Environment
 from actors.environments.types import ActorOutput, GroupedEnvironmentOutput
@@ -279,7 +280,9 @@ class BaseRLTrainer:
                 mixed_precision="bf16",
                 deepspeed_plugin=self.ds_plugins,
                 kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=10))],
-            ) if i == 0 else Accelerator()
+            )
+            if i == 0
+            else Accelerator()
             for (i, actor) in enumerate(self.ds_plugins)
         }
 
@@ -472,7 +475,7 @@ class BaseRLTrainer:
                 actor_obj.update_lora_weights()
             else:
                 actor_obj.finalize_weight_update()
-        
+
         self.accel.wait_for_everyone()
 
     def _clip_gradients(
@@ -554,16 +557,10 @@ class BaseRLTrainer:
                         accelerator=self.accel,
                     )
                     # We combine the env_output from all local_main_processes.
-                    env_output = self.accel.gather_for_metrics(
-                        [env_output]
-                    )
+                    env_output = self.accel.gather_for_metrics([env_output])
                     # We remove Nones.
-                    env_output = [
-                        eo for eo in env_output if eo is not None
-                    ]
-                    env_output = reduce(
-                        add, env_output
-                    )
+                    env_output = [eo for eo in env_output if eo is not None]
+                    env_output = reduce(add, env_output)
 
                     # We sleep all trainable actors.
                     for actor_name, _ in self.actors.items():
@@ -708,9 +705,7 @@ class BaseRLTrainer:
         if self.accel.is_local_main_process:
             eval_outputs = self.env.eval(group_size=1)
         # gather
-        eval_outputs = self.accel.gather_for_metrics(
-            [eval_outputs]
-        )
+        eval_outputs = self.accel.gather_for_metrics([eval_outputs])
         # Remove Nones
         eval_outputs = [eo for eo in eval_outputs if eo is not None]
         new_eval_outputs = {}
@@ -1072,7 +1067,11 @@ class BaseRLTrainer:
                 modifier_rank=None,
             ):
                 lp_flat = chunked_logp(
-                    h_flat, model.lm_head, tgt_flat, max_fused=max_fused, temperature=temperature
+                    h_flat,
+                    model.lm_head,
+                    tgt_flat,
+                    max_fused=max_fused,
+                    temperature=temperature,
                 ).cpu()
 
             pos = 0

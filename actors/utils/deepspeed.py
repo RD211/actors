@@ -84,12 +84,15 @@ def _zero_tensors(zopt):
             if torch.is_tensor(v):
                 yield v
 
-    for v in inner.__dict__['_DeepSpeedZeroOptimizer_Stage3__param_id_to_grad_partition'].values():
+    for v in inner.__dict__[
+        "_DeepSpeedZeroOptimizer_Stage3__param_id_to_grad_partition"
+    ].values():
         if torch.is_tensor(v):
             yield v
-    keys = inner.__dict__.get('ipg_buckets', {}).keys()
+    keys = inner.__dict__.get("ipg_buckets", {}).keys()
     for k in keys:
-        yield inner.__dict__['ipg_buckets'][k].buffer
+        yield inner.__dict__["ipg_buckets"][k].buffer
+
 
 def _move_zero_tensors(zopt, device, non_blocking=True):
     """Move all ZeRO optimizer tensors to the specified device. Returns bytes moved."""
@@ -118,7 +121,7 @@ def _offload_optimizer(model, optimizer, device="cpu", non_blocking=True):
     # Offload DeepSpeed optimizer engine states (grad buffer, hp params, lp grads)
     include = [
         OffloadStateTypeEnum.contiguous_grad_buffer,
-        OffloadStateTypeEnum.hp_params,  # High precision params 
+        OffloadStateTypeEnum.hp_params,  # High precision params
         OffloadStateTypeEnum.lp_grads,  # Low precision gradients
         OffloadStateTypeEnum.optim_states,  # Optimizer states
     ]
@@ -412,12 +415,15 @@ def _validate_offloading_config(model):
 
 
 from deepspeed.accelerator import get_accelerator
+from deepspeed.runtime.zero.offload_states import (
+    offload_adam_states,
+    reload_adam_states,
+)
 
 ################
 # Patch
 #################
 from deepspeed.runtime.zero.utils import get_mapping_to_flat_buffer
-from deepspeed.runtime.zero.offload_states import reload_adam_states,offload_adam_states
 
 
 def patched_offload_states(
@@ -568,7 +574,9 @@ def patched_offload_states(
 
     # Adam
     if needs_offload(OffloadStateTypeEnum.optim_states):
-        offload_adam_states(self.optimizer, device, pin_memory=pin_memory, non_blocking=non_blocking)
+        offload_adam_states(
+            self.optimizer, device, pin_memory=pin_memory, non_blocking=non_blocking
+        )
         self.offloaded_states.add(OffloadStateTypeEnum.optim_states)
 
     gc.collect()
@@ -576,7 +584,6 @@ def patched_offload_states(
 
 
 import itertools
-
 
 
 def patched_reload_states(self, non_blocking: bool = False):

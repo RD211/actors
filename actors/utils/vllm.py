@@ -6,6 +6,7 @@ import torch
 
 def fp8_quantize_state_dict(sd):
     from vllm import _custom_ops as ops
+
     out = OrderedDict()
     for k, v in sd.items():
         if (

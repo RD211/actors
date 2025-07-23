@@ -218,7 +218,7 @@ class Environment(abc.ABC):
         return parts
 
     def __call__(
-        self, batch_size: int, group_size: int = 1, accelerator = None
+        self, batch_size: int, group_size: int = 1, accelerator=None
     ) -> GroupedEnvironmentOutput | None:
         """
         Get a batch from the data and run generation.
@@ -238,8 +238,12 @@ class Environment(abc.ABC):
         expanded_batch = self.expand_batch_for_groups(raw_batch, group_size)
         # Expand batch for groups
         if accelerator is not None:
-            expanded_batch = self.split_batch_in_parts(expanded_batch, accelerator.num_processes//torch.cuda.device_count())
-            expanded_batch = expanded_batch[accelerator.process_index//torch.cuda.device_count()]
+            expanded_batch = self.split_batch_in_parts(
+                expanded_batch, accelerator.num_processes // torch.cuda.device_count()
+            )
+            expanded_batch = expanded_batch[
+                accelerator.process_index // torch.cuda.device_count()
+            ]
 
             if not accelerator.is_local_main_process:
                 return None

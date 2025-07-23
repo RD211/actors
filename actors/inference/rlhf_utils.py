@@ -1,5 +1,4 @@
 import torch
-import ray
 
 from actors.utils.logger import Palette, colorize, logger
 from actors.utils.vllm import (
@@ -32,10 +31,16 @@ class ColocateWorkerExtension:
         if not hasattr(self, "device_uuid"):
             self.report_device_id()
 
-        if self.device_uuid not in ipc_handles_batch: #and not (hasattr(self, "initialized_lora") and self.initialized_lora):
+        if (
+            self.device_uuid not in ipc_handles_batch
+        ):  # and not (hasattr(self, "initialized_lora") and self.initialized_lora):
             return
 
-        handles = ipc_handles_batch[self.device_uuid] if self.device_uuid in ipc_handles_batch else ipc_handles_batch[list(ipc_handles_batch.keys())[0]]
+        handles = (
+            ipc_handles_batch[self.device_uuid]
+            if self.device_uuid in ipc_handles_batch
+            else ipc_handles_batch[list(ipc_handles_batch.keys())[0]]
+        )
         device_id = self.device.index
 
         # Use a dedicated stream to allow for asynchronous H2D transfers.
@@ -52,7 +57,6 @@ class ColocateWorkerExtension:
                 device="cpu", non_blocking=True
             )
 
-
     def load_weights_from_cache(self):
         """
         Loads the complete set of weights from the CPU cache into the model
@@ -62,13 +66,11 @@ class ColocateWorkerExtension:
 
         if not hasattr(self, "cpu_cache") or not self.cpu_cache:
             return
-        
 
         # If vllm has any fp8 weights, we do something special.
         if any(
             "weight_scale" in k for k in self.model_runner.model.state_dict().keys()
         ):
-
             # This currently only works on Qwen2 models and no tensor parallelism.
             # Also fails if the gpu does not support fp8 :)
             # Very experimental and hacky.
@@ -125,17 +127,14 @@ class ColocateWorkerExtension:
         loras = adapter_manager.modules
 
         def _copy_lora_from_cpu(
-            src: torch.Tensor, 
-            dst: torch.Tensor,
-            tp_idx: int,
-            tp_world_size: int
+            src: torch.Tensor, dst: torch.Tensor, tp_idx: int, tp_world_size: int
         ):
             if src.shape == dst.shape:
                 dst.data.copy_(src)
                 return
 
             shard_dim = None
-            for dim, (full, local) in enumerate(zip(src.shape, dst.shape)):
+            for dim, (full, local) in enumerate(zip(src.shape, dst.shape, strict=False)):
                 if full != local:
                     if full // tp_world_size == local and full % tp_world_size == 0:
                         shard_dim = dim
@@ -146,8 +145,8 @@ class ColocateWorkerExtension:
                     "look like tensor-parallel sharding."
                 )
             slice_size = src.shape[shard_dim] // tp_world_size
-            start      = tp_idx * slice_size
-            end        = start + slice_size
+            start = tp_idx * slice_size
+            end = start + slice_size
 
             sl = [slice(None)] * src.ndim
             sl[shard_dim] = slice(start, end)
@@ -179,5 +178,5 @@ class ColocateWorkerExtension:
                     cpu_tensor = self.cpu_cache[lora_b_key][i].unsqueeze(0).unsqueeze(0)
                     gpu_tensor = loras[lora_key].lora_b_stacked[i]
                     _copy_lora_from_cpu(cpu_tensor, gpu_tensor, tp_idx, tp_world_size)
-                
+
         self.cpu_cache = {}

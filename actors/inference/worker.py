@@ -7,8 +7,8 @@ from typing import Any
 import ray
 import torch
 from vllm import LLM, SamplingParams
-from actors.utils.logger import should_use_tqdm
 
+from actors.utils.logger import should_use_tqdm
 
 
 # Sentinel value for default LoRA behavior (use LoRA if enabled, otherwise None)
@@ -22,11 +22,18 @@ class DefaultLoRA:
 DEFAULT_LORA = DefaultLoRA()
 
 _CLEAN_VARS = (
-    "RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE",
-    "MASTER_ADDR", "MASTER_PORT",
-    "GROUP_RANK", "GROUP_WORLD_SIZE",
-    "TORCHELASTIC_", "ACCELERATE_",
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "GROUP_RANK",
+    "GROUP_WORLD_SIZE",
+    "TORCHELASTIC_",
+    "ACCELERATE_",
 )
+
 
 @ray.remote
 class ModelWorker:
@@ -41,7 +48,9 @@ class ModelWorker:
         engine_kwargs: dict[str, Any],
     ) -> None:
         for k in list(os.environ):
-            if k in _CLEAN_VARS or any(k.startswith(p) for p in _CLEAN_VARS if p.endswith("_")):
+            if k in _CLEAN_VARS or any(
+                k.startswith(p) for p in _CLEAN_VARS if p.endswith("_")
+            ):
                 os.environ.pop(k, None)
         os.environ["VLLM_USE_V1"] = "1" if use_v1_engine else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"

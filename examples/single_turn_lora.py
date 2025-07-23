@@ -1,7 +1,9 @@
 import os
+
 from datasets import Dataset
 from peft import LoraConfig, TaskType
 from vllm import SamplingParams
+
 from actors import (
     ActorTrainCfg,
     EvalStrategy,
@@ -51,8 +53,8 @@ def main():
         beta=0.001,
         loss_temp=1.0,  # Temperature for loss scaling
         model_kwargs={
-            'attn_implementation': 'flash_attention_2',
-        }
+            "attn_implementation": "flash_attention_2",
+        },
     )
 
     # Create actor with PEFT configuration
@@ -182,6 +184,7 @@ def main():
     trainer = GRPOTrainer(cfg=cfg, env=env, actors=[actor])
 
     import wandb
+
     if os.getenv("RANK") == "0":
         wandb.init(project="test_actors-2", entity="rd211", name="1.5b-lora")
     trainer.train()
