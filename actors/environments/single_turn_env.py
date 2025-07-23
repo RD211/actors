@@ -13,7 +13,7 @@ from actors.environments.types import ActorOutput, EnvironmentOutput
 from actors.rewards.base import BaseRewardFunction, RewardFunction
 
 
-class SimpleSingleTurnEnvironment(Environment):
+class SingleTurnEnvironment(Environment):
     def __init__(
         self,
         actor: TrainableLLMActor,

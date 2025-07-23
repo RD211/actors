@@ -80,7 +80,7 @@ class GPUFormatter(logging.Formatter):
         for idx in range(torch.cuda.device_count()):
             handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
             mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            percentages.append(f"{idx}:{int(mem.used / mem.total * 100)}%")
+            percentages.append(f"{int(mem.used / mem.total * 100)}%")
         return "GPU% [" + " ".join(percentages) + "]"
 
     @staticmethod
@@ -241,6 +241,14 @@ def init_logger(
         logger.addHandler(handler)
 
     logger.propagate = False
+
+    # Only local main process should log
+    if os.getenv("LOCAL_RANK", "0") != "0":
+        logger = logging.getLogger(name)
+        logger.handlers.clear()
+        logger.addHandler(logging.NullHandler())
+        logger.propagate = False
+        return logger
     return logger
 
 

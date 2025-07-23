@@ -15,9 +15,10 @@ class ColocateWorkerExtension:
         self.device_uuid = current_platform.get_device_uuid(self.device.index)
         return self.device_uuid
 
-    def init_cpu_cache(self):
+    def init_cpu_cache(self, gpu_group: list[int]):
         """Initializes a CPU cache for storing weight batches."""
         self.cpu_cache = {}
+        self.gpu_group = gpu_group
 
     def receive_and_cache_weights(self, ipc_handles_batch: dict):
         """
@@ -30,54 +31,54 @@ class ColocateWorkerExtension:
         if not hasattr(self, "device_uuid"):
             self.report_device_id()
 
-        # The ipc_handles_batch is a dictionary mapping device_uuid to
-        # another dictionary of tensor_name: ipc_handle.
-        if self.device_uuid not in ipc_handles_batch:
+        if (
+            self.device_uuid not in ipc_handles_batch
+        ):  # and not (hasattr(self, "initialized_lora") and self.initialized_lora):
             return
 
-        handles = ipc_handles_batch[self.device_uuid]
+        handles = (
+            ipc_handles_batch[self.device_uuid]
+            if self.device_uuid in ipc_handles_batch
+            else ipc_handles_batch[list(ipc_handles_batch.keys())[0]]
+        )
         device_id = self.device.index
 
         # Use a dedicated stream to allow for asynchronous H2D transfers.
-        stream = torch.cuda.Stream()
-        with torch.cuda.stream(stream):
-            for name, handle in handles.items():
-                func, args = handle
-                list_args = list(args)
-                # The 6th argument to ipc_open is the device ID. We override it
-                # to ensure the tensor is created on the correct local device.
-                list_args[6] = device_id
-                tensor = func(*list_args)
-                # Asynchronously copy the tensor to CPU to avoid blocking.
-                # The tensor must be contiguous for non-blocking transfer.
-                self.cpu_cache[name] = tensor.contiguous().to(
-                    device="cpu", non_blocking=True
-                )
-
-        # Wait for all asynchronous transfers to complete.
-        stream.synchronize()
+        for name, handle in handles.items():
+            func, args = handle
+            list_args = list(args)
+            # The 6th argument to ipc_open is the device ID. We override it
+            # to ensure the tensor is created on the correct local device.
+            list_args[6] = device_id
+            tensor = func(*list_args)
+            # Asynchronously copy the tensor to CPU to avoid blocking.
+            # The tensor must be contiguous for non-blocking transfer.
+            self.cpu_cache[name] = tensor.contiguous().to(
+                device="cpu", non_blocking=True
+            )
 
     def load_weights_from_cache(self):
         """
         Loads the complete set of weights from the CPU cache into the model
         on the GPU.
         """
+        torch.cuda.synchronize()
+
         if not hasattr(self, "cpu_cache") or not self.cpu_cache:
-            logger.warning(
-                colorize(
-                    "No weights in CPU cache to load. Ensure that `receive_and_cache_weights` was called.",
-                    Palette.WARNING,
-                )
-            )
             return
 
         # If vllm has any fp8 weights, we do something special.
         if any(
             "weight_scale" in k for k in self.model_runner.model.state_dict().keys()
         ):
+            # This currently only works on Qwen2 models and no tensor parallelism.
+            # Also fails if the gpu does not support fp8 :)
+            # Very experimental and hacky.
+            # TODO: Make this not hacky.
             self.cpu_cache = to_vllm_state_dict(self.cpu_cache)
             self.cpu_cache = fp8_quantize_state_dict(self.cpu_cache)
             self.model_runner.model.load_state_dict(self.cpu_cache)
+
         else:
             weights = list(self.cpu_cache.items())
             self.model_runner.model.load_weights(weights=weights)
@@ -124,6 +125,35 @@ class ColocateWorkerExtension:
         lora_A_keys = [k for k in self.cpu_cache.keys() if "lora_A" in k]
         lora_B_keys = [k for k in self.cpu_cache.keys() if "lora_B" in k]
         loras = adapter_manager.modules
+
+        def _copy_lora_from_cpu(
+            src: torch.Tensor, dst: torch.Tensor, tp_idx: int, tp_world_size: int
+        ):
+            if src.shape == dst.shape:
+                dst.data.copy_(src)
+                return
+
+            shard_dim = None
+            for dim, (full, local) in enumerate(zip(src.shape, dst.shape, strict=False)):
+                if full != local:
+                    if full // tp_world_size == local and full % tp_world_size == 0:
+                        shard_dim = dim
+                        break
+            if shard_dim is None:
+                raise RuntimeError(
+                    f"Shape mismatch {src.shape} → {dst.shape} does not "
+                    "look like tensor-parallel sharding."
+                )
+            slice_size = src.shape[shard_dim] // tp_world_size
+            start = tp_idx * slice_size
+            end = start + slice_size
+
+            sl = [slice(None)] * src.ndim
+            sl[shard_dim] = slice(start, end)
+            dst.data.copy_(src[tuple(sl)])
+
+        tp_idx = self.device.index
+        tp_world_size = len(self.gpu_group)
         for lora_key in loras.keys():
             lora_a_key = next(
                 k for k in lora_A_keys if lora_key.split("model.layers")[1] in k
@@ -137,19 +167,16 @@ class ColocateWorkerExtension:
                 self.cpu_cache[lora_b_key] = [self.cpu_cache[lora_b_key]]
 
             for i, _ in enumerate(loras[lora_key].lora_a_stacked):
+                # LoRA‑A
                 if lora_a_key:
-                    self.cpu_cache[lora_a_key][i] = (
-                        self.cpu_cache[lora_a_key][i].unsqueeze(0).unsqueeze(0)
-                    )
-                    loras[lora_key].lora_a_stacked[i].data.copy_(
-                        self.cpu_cache[lora_a_key][i]
-                    )
+                    cpu_tensor = self.cpu_cache[lora_a_key][i].unsqueeze(0).unsqueeze(0)
+                    gpu_tensor = loras[lora_key].lora_a_stacked[i]
+                    _copy_lora_from_cpu(cpu_tensor, gpu_tensor, tp_idx, tp_world_size)
+
+                # LoRA‑B
                 if lora_b_key:
-                    self.cpu_cache[lora_b_key][i] = (
-                        self.cpu_cache[lora_b_key][i].unsqueeze(0).unsqueeze(0)
-                    )
-                    loras[lora_key].lora_b_stacked[i].data.copy_(
-                        self.cpu_cache[lora_b_key][i]
-                    )
-        # Clean up the cache to free memory
+                    cpu_tensor = self.cpu_cache[lora_b_key][i].unsqueeze(0).unsqueeze(0)
+                    gpu_tensor = loras[lora_key].lora_b_stacked[i]
+                    _copy_lora_from_cpu(cpu_tensor, gpu_tensor, tp_idx, tp_world_size)
+
         self.cpu_cache = {}

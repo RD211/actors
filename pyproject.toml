@@ -41,6 +41,7 @@ dependencies = [
     "wandb",
     "ray",
     "math-verify>=0.8.0",
+    "colorama",
 ]
 
 [project.urls]

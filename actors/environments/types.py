@@ -334,6 +334,33 @@ class GroupedEnvironmentOutput:
 
         return EnvironmentOutput(actors=actors)
 
+    def __add__(self, other: GroupedEnvironmentOutput) -> GroupedEnvironmentOutput:
+        if self.group_size != other.group_size:
+            raise ValueError(
+                f"Cannot add GroupedEnvironmentOutput with different group sizes: "
+                f"{self.group_size} != {other.group_size}"
+            )
+
+        if set(self.groups.keys()) != set(other.groups.keys()):
+            raise ValueError(
+                "Cannot add GroupedEnvironmentOutput with different actor sets: "
+                f"{set(self.groups.keys())} != {set(other.groups.keys())}"
+            )
+
+        combined_problems = self.problems + other.problems
+        combined_groups = {}
+
+        for actor_name in self.groups:
+            combined_groups[actor_name] = (
+                self.groups[actor_name] + other.groups[actor_name]
+            )
+
+        return GroupedEnvironmentOutput(
+            problems=combined_problems,
+            groups=combined_groups,
+            group_size=self.group_size,
+        )
+
 
 # Type aliases for convenience
 RewardComponents = dict[str, list[float]]

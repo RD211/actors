@@ -92,7 +92,7 @@ class ActorTrainCfg:
     learning_rate: float = 1e-6
     max_grad_norm: float = 1.0
     gradient_checkpointing: bool = True
-    reference_batch_size: int = 4
+    reference_batch_size: int = -1  # -1 is full batch size
 
     # Advantage calculation and normalization
     advantage_calculator: Callable[..., list[float]] | None = None
@@ -146,7 +146,7 @@ class ActorTrainCfg:
         learning_rate: float = 1e-6,
         max_grad_norm: float = 1.0,
         gradient_checkpointing: bool = True,
-        reference_batch_size: int = 4,
+        reference_batch_size: int = -1,
         # Advantage calculation and normalization
         advantage_calculator: Callable[..., list[float]] | None = None,
         std_normalization: bool = True,
@@ -170,8 +170,10 @@ class ActorTrainCfg:
         # PEFT/LoRA configuration
         peft_config: LoraConfig | None = None,
         # Offloading parameters
-        offload_optimizer: bool = False,
-        offload_model: bool = False,
+        offload_optimizer: bool = True,
+        offload_model: bool = True,
+        # Updating vllm weights
+        update_weights_batch_size: int = 300,
     ):
         """
         Initialize ActorTrainCfg with all configuration options.
@@ -200,6 +202,7 @@ class ActorTrainCfg:
             peft_config: PEFT configuration for LoRA/QLoRA training (only LoraConfig supported)
             offload_optimizer: Whether to offload optimizer to CPU
             offload_model: Whether to offload model to CPU
+            update_weights_batch_size: Batch size for updating weights in vLLM (number of tensors)
         """
         # Validate PEFT config
         if peft_config is not None and not isinstance(peft_config, LoraConfig):
@@ -223,6 +226,7 @@ class ActorTrainCfg:
         self.peft_config = peft_config
         self.offload_optimizer = offload_optimizer
         self.offload_model = offload_model
+        self.update_weights_batch_size = update_weights_batch_size
 
         # Set factories if provided, otherwise keep the dataclass defaults
         if model_factory is not None:
@@ -486,7 +490,6 @@ class ActorTrainCfg:
             "rmsprop": optim.RMSprop,
         }
 
-        # Try to import and add bitsandbytes optimizers if available
         try:
             import bitsandbytes as bnb
 

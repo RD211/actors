@@ -8,7 +8,7 @@ from actors import (
     GRPOTrainer,
     GRPOTrainerCfg,
     SaveStrategy,
-    SimpleSingleTurnEnvironment,
+    SingleTurnEnvironment,
     vLLMActor,
 )
 
@@ -152,7 +152,7 @@ def main():
     }
 
     # Create environment with data and actor
-    env = SimpleSingleTurnEnvironment(
+    env = SingleTurnEnvironment(
         actor=actor,
         train_data=train_dataset,
         eval_data=eval_datasets,

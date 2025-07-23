@@ -5,6 +5,8 @@ import time
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from functools import reduce
+from operator import add
 from typing import Any
 
 import deepspeed
@@ -28,7 +30,7 @@ from actors.utils.deepspeed import (
     prepare_deepspeed,
     reload_model_and_optimizer,
 )
-from actors.utils.get_logps import _chunked_logp
+from actors.utils.get_logps import chunked_logp
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.utils.logger import Palette, colorize, init_logger
 from actors.utils.tracker import (
@@ -276,24 +278,24 @@ class BaseRLTrainer:
         accelerators: dict[str, Accelerator] = {
             actor: Accelerator(
                 mixed_precision="bf16",
-                deepspeed_plugin=self.ds_plugins[actor],
+                deepspeed_plugin=self.ds_plugins,
                 kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=10))],
             )
-            for actor in self.ds_plugins
+            if i == 0
+            else Accelerator()
+            for (i, actor) in enumerate(self.ds_plugins)
         }
+
+        # Wait for everyone.
+        for accel in accelerators.values():
+            accel.wait_for_everyone()
 
         actors: dict[str, ActorTrainState] = {}
 
         for name, actor_obj in trainable_actors.items():
             accel = accelerators[name]
             model = actor_obj.training_config.model_factory().train()
-
-            self.logger.normal(
-                colorize(
-                    f"🔧 Initializing actor '{name}'",
-                    Palette.INFO,
-                )
-            )
+            accel.state.select_deepspeed_plugin(name)
 
             # We check if the model has a quantization_config
             if hasattr(model.config, "quantization_config"):
@@ -399,7 +401,10 @@ class BaseRLTrainer:
 
         return actors
 
-    def _setup_loras(self) -> str:
+    def _setup_loras(self):
+        # If there is any actor with a PEFT configuration, we will create lora adapters.
+        if not any(actor.has_peft_config for actor in self.actor_objects.values()):
+            return
         # TODO: If not loras. there is no need to do all of this.
         os.makedirs(self.cfg.checkpoint_path, exist_ok=True)
 
@@ -416,7 +421,7 @@ class BaseRLTrainer:
 
         temp_dir = [d for _, d in temp_dir if d is not None][0]
 
-        self.save_pretrained(temp_dir)
+        self.save_pretrained(temp_dir, lora_only=True)
 
         multiple_actors = len(self.actors) > 1
         if self.accel.is_local_main_process:
@@ -429,8 +434,6 @@ class BaseRLTrainer:
         self.accel.wait_for_everyone()
         if self.accel.is_main_process:
             shutil.rmtree(temp_dir, ignore_errors=True)
-
-        return temp_dir
 
     # ═══════════════════════════════════════════════════════════════════════
     # Training parts
@@ -450,10 +453,12 @@ class BaseRLTrainer:
             gather_and_stream_state_dict(
                 ta.accel,
                 self.logger,
+                actor_obj.gpu_groups,
                 ta.model,
                 stream_batch_callback,
                 tie_word_embeddings=ta.model_config.tie_word_embeddings,
                 lora_only=is_peft_model(ta.model),
+                batch_size=actor_obj.training_config.update_weights_batch_size,
             )
 
         if actor_obj.training_config.offload_model:
@@ -470,6 +475,8 @@ class BaseRLTrainer:
                 actor_obj.update_lora_weights()
             else:
                 actor_obj.finalize_weight_update()
+
+        self.accel.wait_for_everyone()
 
     def _clip_gradients(
         self,
@@ -539,21 +546,32 @@ class BaseRLTrainer:
 
             self._step += 1
 
+            self.accel.wait_for_everyone()
             start_step_profiling()
             with _step_profiler.track("full_train_step", no_memory_measurement=True):
                 try:
+                    env_output = None
                     env_output = self.env(
                         batch_size=self.batch_size // self.group_size,
                         group_size=self.group_size,
+                        accelerator=self.accel,
                     )
+                    # We combine the env_output from all local_main_processes.
+                    env_output = self.accel.gather_for_metrics([env_output])
+                    # We remove Nones.
+                    env_output = [eo for eo in env_output if eo is not None]
+                    env_output = reduce(add, env_output)
+
                     # We sleep all trainable actors.
                     for actor_name, _ in self.actors.items():
                         actor_obj = self.actor_objects[actor_name]
                         actor_obj.sleep()
+
+                    self.accel.wait_for_everyone()
                     result = self.train_step(env_output)
                 except StopIteration:
                     break
-
+            self.accel.wait_for_everyone()
             log_step_profiling(self._substep, self.accel, use_wandb=self.cfg.use_wandb)
 
             metrics = result.get_combined_metrics()
@@ -678,19 +696,33 @@ class BaseRLTrainer:
     def evaluate(self, is_final: bool = False) -> dict[str, Any] | None:
         if not self.env.eval_datasets:
             return None
-
+        self.accel.wait_for_everyone()
         if self.accel.is_main_process:
             self.logger.normal(colorize("🔍 Starting evaluation...", Palette.INFO))
 
         # Use environment's eval method to get all eval results
-        eval_outputs = self.env.eval(group_size=1)
-
+        eval_outputs = None
+        if self.accel.is_local_main_process:
+            eval_outputs = self.env.eval(group_size=1)
+        # gather
+        eval_outputs = self.accel.gather_for_metrics([eval_outputs])
+        # Remove Nones
+        eval_outputs = [eo for eo in eval_outputs if eo is not None]
+        new_eval_outputs = {}
+        for eo in eval_outputs:
+            for eval_name, output in eo.items():
+                if eval_name not in new_eval_outputs:
+                    new_eval_outputs[eval_name] = output
+                else:
+                    new_eval_outputs[eval_name].extend(output)
+        eval_outputs = new_eval_outputs
         all_eval_metrics = {}
+        self.accel.wait_for_everyone()
         for eval_name, env_output in eval_outputs.items():
             result = self.eval_step(env_output)
             self.log_evaluation_metrics(eval_name, result, env_output, is_final)
             all_eval_metrics[eval_name] = result.metrics
-
+        self.accel.wait_for_everyone()
         if self.accel.is_main_process:
             self.logger.normal(colorize("✅ Evaluation completed", Palette.INFO))
 
@@ -859,13 +891,15 @@ class BaseRLTrainer:
                         )
                     )
 
-    def save_pretrained(self, output_dir: str):
+    def save_pretrained(self, output_dir: str, lora_only: bool = False):
         os.makedirs(output_dir, exist_ok=True)
         multi = len(self.actors) > 1
 
         for name, ta in self.actors.items():
             # reload if offloaded
             actor_obj = self.actor_objects[name]
+            if lora_only and not is_peft_model(ta.model):
+                continue
             if actor_obj.training_config.offload_model:
                 self.logger.normal(
                     colorize("🔄 Reloading model for actor LORA", Palette.INFO)
@@ -880,7 +914,6 @@ class BaseRLTrainer:
             os.makedirs(tgt, exist_ok=True)
 
             state_dict = ta.accel.get_state_dict(ta.model)
-            self.logger.normal(colorize("Gathered a state dict", Palette.INFO))
 
             ta.accel.unwrap_model(ta.model, keep_torch_compile=False).save_pretrained(
                 tgt,
@@ -990,11 +1023,14 @@ class BaseRLTrainer:
         """
         Super memory efficient logp computation and actually faster than standard.
         """
+
         total = len(ids)
         world = self.number_of_devices
         per_rank = (total + world - 1) // world
         start, end = self.rank * per_rank, min((self.rank + 1) * per_rank, total)
         ids_local = ids[start:end]
+        if batch_size <= 0:
+            batch_size = per_rank
 
         local_out: list[list[float]] = []
 
@@ -1023,15 +1059,19 @@ class BaseRLTrainer:
             h_flat = hidden.reshape(-1, hidden.shape[-1])  # (N,L-1,H)
             tgt_flat = target.reshape(-1)  # (N,)
             non_pad = non_pad.reshape(-1).bool()  # (N,)
-            h_flat = h_flat[non_pad] / temperature  # (N,H)
+            h_flat = h_flat[non_pad]  # (N,H)
             tgt_flat = tgt_flat[non_pad]  # (N,)
 
             with deepspeed.zero.GatheredParameters(
                 [model.lm_head.weight, model.lm_head.bias],
                 modifier_rank=None,
             ):
-                lp_flat = _chunked_logp(
-                    h_flat, model.lm_head, tgt_flat, max_fused=max_fused
+                lp_flat = chunked_logp(
+                    h_flat,
+                    model.lm_head,
+                    tgt_flat,
+                    max_fused=max_fused,
+                    temperature=temperature,
                 ).cpu()
 
             pos = 0
@@ -1094,6 +1134,10 @@ class BaseRLTrainer:
     @property
     def number_of_devices(self) -> int:
         return self.accel.num_processes
+
+    @property
+    def num_nodes(self) -> int:
+        return self.number_of_devices // torch.cuda.device_count()
 
     @property
     def rank(self) -> int:

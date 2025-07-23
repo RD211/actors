@@ -21,6 +21,19 @@ class DefaultLoRA:
 
 DEFAULT_LORA = DefaultLoRA()
 
+_CLEAN_VARS = (
+    "RANK",
+    "WORLD_SIZE",
+    "LOCAL_RANK",
+    "LOCAL_WORLD_SIZE",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "GROUP_RANK",
+    "GROUP_WORLD_SIZE",
+    "TORCHELASTIC_",
+    "ACCELERATE_",
+)
+
 
 @ray.remote
 class ModelWorker:
@@ -34,9 +47,15 @@ class ModelWorker:
         use_v1_engine: bool,
         engine_kwargs: dict[str, Any],
     ) -> None:
+        for k in list(os.environ):
+            if k in _CLEAN_VARS or any(
+                k.startswith(p) for p in _CLEAN_VARS if p.endswith("_")
+            ):
+                os.environ.pop(k, None)
         os.environ["VLLM_USE_V1"] = "1" if use_v1_engine else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, gpus))
+        self.gpu_group = gpus
 
         # This is for the new weight update mechanism
         engine_kwargs["worker_extension_cls"] = (
@@ -48,7 +67,6 @@ class ModelWorker:
             tensor_parallel_size=len(gpus),
             trust_remote_code=True,
             enable_sleep_mode=True,
-            distributed_executor_backend="external_launcher",
             **engine_kwargs,
         )
         self.is_sleeping: bool = False
@@ -71,7 +89,7 @@ class ModelWorker:
 
     def start_update(self) -> tuple[str, str | None]:
         try:
-            self.engine.collective_rpc("init_cpu_cache")
+            self.engine.collective_rpc("init_cpu_cache", args=(self.gpu_group,))
             return "OK", None
         except Exception:
             return "ERROR", traceback.format_exc()

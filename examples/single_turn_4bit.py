@@ -1,5 +1,9 @@
+import os
+
+import torch
 from datasets import Dataset
 from peft import LoraConfig, TaskType
+from transformers import BitsAndBytesConfig
 from vllm import SamplingParams
 
 from actors import (
@@ -8,7 +12,7 @@ from actors import (
     GRPOTrainer,
     GRPOTrainerCfg,
     SaveStrategy,
-    SimpleSingleTurnEnvironment,
+    SingleTurnEnvironment,
     vLLMActor,
 )
 
@@ -21,6 +25,15 @@ def length_reward(completion: str) -> float:
 
 
 def main():
+    # Create quantization configuration
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_quant_storage=torch.bfloat16,
+    )
+
     # Create LoRA configuration
     lora_config = LoraConfig(
         r=256,  # LoRA rank
@@ -41,25 +54,25 @@ def main():
 
     # Create training configuration
     training_config = ActorTrainCfg(
-        learning_rate=4e-6,
+        learning_rate=1e-6,
         optimizer="adamw_32bit",
         loss="liger_grpo",
         scheduler="cosine",
         peft_config=lora_config,
+        quantization_config=quantization_config,
         offload_model=True,
         offload_optimizer=True,
-        beta=0.001,
-        loss_temp=1.0,  # Temperature for loss scaling
+        beta=0.0,
     )
 
-    # Create actor with PEFT configuration
+    # Create actor with PEFT and quantization configuration
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-0.5B-Instruct",
+        model_path="Qwen/Qwen2.5-14B-Instruct",
         engine_kwargs={
-            "gpu_memory_utilization": 0.6,
+            "gpu_memory_utilization": 0.7,
             "max_model_len": 2048,
-            "quantization": "fp8",
+            "quantization": "bitsandbytes",
         },
         training_config=training_config,
     )
@@ -150,7 +163,7 @@ def main():
     }
 
     # Create environment with data
-    env = SimpleSingleTurnEnvironment(
+    env = SingleTurnEnvironment(
         actor=actor,
         train_data=train_dataset,
         eval_data=eval_datasets,
@@ -165,8 +178,8 @@ def main():
 
     # Create trainer configuration
     cfg = GRPOTrainerCfg(
-        group_size=16,
-        batch_size=64,
+        group_size=8,
+        batch_size=16,
         grad_accumulation_steps=4,
         num_iterations=2,
         log_every_n=1,
@@ -181,7 +194,8 @@ def main():
 
     import wandb
 
-    wandb.init(project="test_actors-2", entity="rd211", name="3b-lora")
+    if os.getenv("RANK") == "0":
+        wandb.init(project="test_actors-2", entity="rd211", name="14b-lora")
     trainer.train()
     trainer.push_to_hub(
         "rd211/test_actors_lora_main",
