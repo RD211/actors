@@ -49,11 +49,12 @@ def _logp_kernel(
     tl.store(out_ptr + tok * out_stride, (tgt_val - m) - tl.log(d))
 
 
-def _chunked_logp(
+def chunked_logp(
     hidden: torch.Tensor,  # (BT, H)
     lm_head: torch.nn.Linear,
     target: torch.Tensor,  # (BT,)
     max_fused: int,
+    temperature: float = 1.0,
     block: int = 128,
 ) -> torch.Tensor:  # (BT,) fp32
     BT, H = hidden.shape
@@ -67,10 +68,10 @@ def _chunked_logp(
 
     for start in range(0, BT, chunk):
         end = min(start + chunk, BT)
-        logits = hidden[start:end] @ W.T
+        logits = (hidden[start:end] @ W.T).float()
         if b is not None:
             logits += b
-
+        logits = logits / temperature
         _logp_kernel[(end - start,)](
             logits,
             logits.stride(0),

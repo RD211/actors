@@ -58,16 +58,9 @@ We plan on releasing and making special trainers for more RL methods after all b
 We plan to have the following:
 
 ### Single Trainable Agent
-- SimpleSingleTurnEnvironment - Standard environment
-- CollaborativeProblemSolvingEnvironment - Iterates on a problem in a round robin fashion with the provided models. 
-- HeavyAgentProblemSolvingEnvironment - Given a problem does thinking with multiple agents in parallel and then merges solutions. Probably what Grok 4 heavy does I suppose or the pro versions of OpenAI models.
-- JailbreakEnvironment - two agents, one is frozen and one is training, the model that is training tries to trick the frozen model into performing tasks it was instructed not to perform.
+- SingleTurnEnvironment - Standard environment
+- MultiAgentProblemSolvingEnvironment - Samples multiple candidate solutions and merges them at the end.
 
 ### Multi Trainable Agent
 - HeavyMultiAgentProblemSolvingEnvironment - Same as the single agent one but now the multiple samples come from different models and can improve diversity. The model that combines the solutions can be selected as one of the models or a non-trainable one.
-- CollaborativeProblemSolvingEnvironment - Iterates on a problem together for specific number of rounds.
-- 
-
-### Fun
-- AdversarialChessEnvironment - chess game basically.
-- SelfPlayChessEnvironment - plays chess on its own.
+- CollaborativeProblemSolvingEnvironment - Iterates on a problem in a round robin fashion with the provided models. 

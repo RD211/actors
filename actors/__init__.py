@@ -9,7 +9,7 @@ from .environments import (
     GroupedEnvironmentOutput,
     RewardComponents,
     RewardFunction,
-    SimpleSingleTurnEnvironment,
+    SingleTurnEnvironment,
 )
 from .trainers import (
     ActorTrainCfg,
@@ -39,7 +39,7 @@ __all__ = [
     "SaveStrategy",
     # Environments
     "Environment",
-    "SimpleSingleTurnEnvironment",
+    "SingleTurnEnvironment",
     "RewardFunction",
     # Types
     "ActorOutput",

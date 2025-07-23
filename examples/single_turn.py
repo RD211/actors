@@ -1,7 +1,5 @@
 import torch
 from datasets import Dataset
-from peft import LoraConfig, TaskType
-from transformers import BitsAndBytesConfig
 from vllm import SamplingParams
 
 from actors import (
@@ -10,7 +8,7 @@ from actors import (
     GRPOTrainer,
     GRPOTrainerCfg,
     SaveStrategy,
-    SimpleSingleTurnEnvironment,
+    SingleTurnEnvironment,
     vLLMActor,
 )
 
@@ -22,55 +20,48 @@ def length_reward(completion: str) -> float:
     )  # Negative reward for length, capped at -5.0
 
 
+def get_lr_scheduler(optimizer, max_step):
+    warmup_steps = 2
+    # part 1 – warm-up: linearly increase from 0.1× to 1.0× base_lr
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=0.1,  # 0.1 × base_lr -> 100 µ after 1st step
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+
+    # part 2 – linear decay all the way to 0
+    decay = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1.0, end_factor=0.0, total_iters=max_step - warmup_steps
+    )
+
+    # stitch them together
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
+    )
+    return scheduler
+
+
 def main():
-    # Create quantization configuration
-    quantization_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_quant_storage=torch.bfloat16,
-    )
-
-    # Create LoRA configuration
-    lora_config = LoraConfig(
-        r=256,  # LoRA rank
-        lora_alpha=512,  # LoRA scaling parameter
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],  # Target all linear layers
-        lora_dropout=0.0,  # LoRA dropout
-        bias="none",  # Don't adapt bias parameters
-        task_type=TaskType.CAUSAL_LM,  # Task type for causal language modeling
-    )
-
     # Create training configuration
     training_config = ActorTrainCfg(
-        learning_rate=4e-6,
-        optimizer="adamw_32bit",
+        learning_rate=2e-6,
+        optimizer="adamw_8bit",
         loss="liger_grpo",
-        scheduler="cosine",
-        peft_config=lora_config,
-        quantization_config=quantization_config,
+        scheduler=get_lr_scheduler,
         offload_model=True,
         offload_optimizer=True,
-        beta=0.0,
+        beta=0.04,
     )
 
-    # Create actor with PEFT and quantization configuration
+    # Create actor with improved configuration API
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-14B-Instruct",
+        model_path="Qwen/Qwen2.5-0.5B-Instruct",
         engine_kwargs={
-            "gpu_memory_utilization": 0.7,
+            "gpu_memory_utilization": 0.5,
             "max_model_len": 2048,
-            "quantization": "bitsandbytes",
+            "quantization": "fp8",
         },
         training_config=training_config,
     )
@@ -87,7 +78,7 @@ def main():
         {"text": "Who wrote 'To Kill a Mockingbird'?"},
         {"text": "What is the speed of light?"},
         {"text": "How do you make a cake?"},
-    ] * 120
+    ] * 50
 
     train_data = [
         {
@@ -160,8 +151,8 @@ def main():
         ),
     }
 
-    # Create environment with data
-    env = SimpleSingleTurnEnvironment(
+    # Create environment with data and actor
+    env = SingleTurnEnvironment(
         actor=actor,
         train_data=train_dataset,
         eval_data=eval_datasets,
@@ -178,11 +169,11 @@ def main():
     cfg = GRPOTrainerCfg(
         group_size=16,
         batch_size=64,
-        grad_accumulation_steps=4,
+        grad_accumulation_steps=8,
         num_iterations=2,
         log_every_n=1,
-        eval_every_n=None,  # No periodic evaluation
-        eval_strategy=EvalStrategy.NONE,  # No evaluation
+        eval_every_n=50,  # Run evaluation every 50 steps
+        eval_strategy=EvalStrategy.ALL,  # Run evaluation both periodically and at the end
         checkpoint_every_n=30,
         save_strategy=SaveStrategy.ALL,
     )
@@ -192,11 +183,10 @@ def main():
 
     import wandb
 
-    if os.getenv("RANK") == "0":
-        wandb.init(project="test_actors-2", entity="rd211", name="14b-lora")
+    wandb.init(project="test_actors-2", entity="rd211", name="0.5B")
     trainer.train()
     trainer.push_to_hub(
-        "rd211/test_actors_lora_main",
+        "rd211/test_actors_main",
         private=True,
     )
 

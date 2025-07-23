@@ -29,7 +29,7 @@ from actors.utils.deepspeed import (
     prepare_deepspeed,
     reload_model_and_optimizer,
 )
-from actors.utils.get_logps import _chunked_logp
+from actors.utils.get_logps import chunked_logp
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.utils.logger import Palette, colorize, init_logger
 from actors.utils.tracker import (
@@ -1064,15 +1064,15 @@ class BaseRLTrainer:
             h_flat = hidden.reshape(-1, hidden.shape[-1])  # (N,L-1,H)
             tgt_flat = target.reshape(-1)  # (N,)
             non_pad = non_pad.reshape(-1).bool()  # (N,)
-            h_flat = h_flat[non_pad] / temperature  # (N,H)
+            h_flat = h_flat[non_pad]  # (N,H)
             tgt_flat = tgt_flat[non_pad]  # (N,)
 
             with deepspeed.zero.GatheredParameters(
                 [model.lm_head.weight, model.lm_head.bias],
                 modifier_rank=None,
             ):
-                lp_flat = _chunked_logp(
-                    h_flat, model.lm_head, tgt_flat, max_fused=max_fused
+                lp_flat = chunked_logp(
+                    h_flat, model.lm_head, tgt_flat, max_fused=max_fused, temperature=temperature
                 ).cpu()
 
             pos = 0

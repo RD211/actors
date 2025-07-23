@@ -3,7 +3,7 @@ Environment modules for the actors library.
 """
 
 from .env_base import Environment
-from .single_turn_env import RewardFunction, SimpleSingleTurnEnvironment
+from .single_turn_env import RewardFunction, SingleTurnEnvironment
 from .types import (
     ActorOutput,
     ActorOutputDict,
@@ -22,6 +22,6 @@ __all__ = [
     "ActorOutputDict",
     "GroupedEnvironmentOutput",
     # Single turn environment
-    "SimpleSingleTurnEnvironment",
+    "SingleTurnEnvironment",
     "RewardFunction",
 ]
