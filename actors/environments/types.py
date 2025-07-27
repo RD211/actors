@@ -25,14 +25,17 @@ class ActorOutput:
     """
 
     input_ids: list[list[int]]
-    attention_mask: list[list[int]]
     rewards: list[float]
+    attention_mask: list[list[int]] | None = None
     reward_components: dict[str, list[float]] | None = None
     ended_in_eos: list[bool] = None
     metadata: dict[str, Any] | None = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate that all lists have consistent lengths."""
+        if not self.attention_mask:
+            self.attention_mask = [[1] * len(seq) for seq in self.input_ids]
+
         lengths = [len(self.input_ids), len(self.attention_mask), len(self.rewards)]
         if self.reward_components:
             for _, values in self.reward_components.items():

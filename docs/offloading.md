@@ -1,7 +1,7 @@
 # Offloading
 
 #### ⚠️ Note
-| Offloading  is **only supported with DeepSpeed ZeRO-3**. 
+| Offloading  is **only supported with DeepSpeed ZeRO-3**.
 
 You can enable **model and optimizer offloading** with just a couple of flags:
 
@@ -34,13 +34,10 @@ See [`deepspeed.py`](../actors/utils/deepspeed.py) for the implementation. We've
 
 * Support more optimizer types
 * Offload *all* memory, not just partial states
-* Work reliably with **LoRA**, which previously had issues
+* Work reliably with **LoRA**, which previously had issues in our setup.
 
 ---
 
 ### 🕒 WIP (Coming Soon)
 
 We are trying to see if we can offload parts of the optimizer states during loss calculations. This would give us a bit more headroom for higher context lengths.
-
----
-

@@ -19,9 +19,7 @@ from actors import (
 
 def length_reward(completion: str) -> float:
     """Rewards shorter responses."""
-    return -min(
-        len(completion) / 500, 5.0
-    )  # Negative reward for length, capped at -5.0
+    return -min(len(completion) / 500, 5.0)
 
 
 def main():
@@ -36,8 +34,8 @@ def main():
 
     # Create LoRA configuration
     lora_config = LoraConfig(
-        r=256,  # LoRA rank
-        lora_alpha=512,  # LoRA scaling parameter
+        r=256,
+        lora_alpha=512,
         target_modules=[
             "q_proj",
             "k_proj",
@@ -46,10 +44,10 @@ def main():
             "gate_proj",
             "up_proj",
             "down_proj",
-        ],  # Target all linear layers
-        lora_dropout=0.0,  # LoRA dropout
-        bias="none",  # Don't adapt bias parameters
-        task_type=TaskType.CAUSAL_LM,  # Task type for causal language modeling
+        ],
+        lora_dropout=0.0,
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
     )
 
     # Create training configuration
@@ -194,12 +192,8 @@ def main():
     import wandb
 
     if os.getenv("RANK") == "0":
-        wandb.init(project="test_actors-2", entity="rd211", name="14b-lora")
+        wandb.init(project="actors", name="14b-lora")
     trainer.train()
-    trainer.push_to_hub(
-        "rd211/test_actors_lora_main",
-        private=True,
-    )
 
 
 if __name__ == "__main__":

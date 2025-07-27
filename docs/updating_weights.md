@@ -28,6 +28,4 @@ For LoRA, however, we send all parameters to everybody — they’re small, and 
 
 ### 🕒 WIP (Coming Soon)
 
-If there is only one big batch, there’s no need to move it to CPU and then back to GPU — we should probably skip this step.
-
 FP8 weight loading with inflight quantization is coming soon (hopefully). It currently works on a single GPU that supports FP8, such as a 4090.

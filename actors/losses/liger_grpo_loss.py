@@ -45,9 +45,7 @@ class LigerGRPOLoss(BaseRLLoss):
         old_logps: Tensor | None = None,  # (B, L-1)
         **_: dict,
     ) -> tuple[Tensor, dict[str, float]]:
-        model_to_infer = (
-            policy.base_model.model.model if self.is_lora else policy.base_model.model
-        )
+        model_to_infer = policy.base_model.model.model if self.is_lora else policy.model
         hidden: Tensor = model_to_infer(
             input_ids, attention_mask=attention_mask
         ).last_hidden_state[:, :-1, :]
