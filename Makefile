@@ -1,8 +1,8 @@
 .PHONY: install precommit test-cpu test-gpu test-all
 
 precommit:
-	python -m ruff format actors/ tests/ examples/
-	python -m ruff check --fix actors/ tests/ examples/
+	python -m ruff format actors/ tests/ examples/ docs/
+	python -m ruff check --fix actors/ tests/ examples/ docs/
 # 	python -m mypy actors/ --ignore-missing-imports
 	@echo "✅ All checks passed! Ready to commit! 🎉"
 
