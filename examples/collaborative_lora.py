@@ -214,7 +214,7 @@ def main():
                 ),
             ),
         ],
-        round_spec="Alice -> Bob -> Alice -> Bob",  # This is the definition of the order of turns.
+        round_spec="Alice -> Bob -> Alice -> Bob",
         reward_functions=[reward],
         run_concurrently=False,
         prompt_column="problem",
@@ -240,12 +240,9 @@ def main():
     trainer = GRPOTrainer(cfg=cfg, env=env, actors=[alice_actor, bob_actor])
 
     # Initialize wandb for logging
-    if (
-        os.getenv("RANK") == "0"
-    ):  # This is just to not have multiple wandb instances running per rank.
-        # Initialize wandb only on the main process
+    if os.getenv("RANK") == "0":
         wandb.init(
-            project="collaborative-actors",
+            project="actors",
             name="Alice-Bob-Collaborative-LoRA",
         )
 

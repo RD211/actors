@@ -118,10 +118,15 @@ class TrainingMetrics:
     ):
         """Helper to add reward component statistics for an actor."""
         if rewards:
-            mean_value = sum(rewards) / len(rewards)
+            non_none_rewards = [r for r in rewards if r is not None]
+            mean_value = (
+                sum(non_none_rewards) / len(non_none_rewards)
+                if non_none_rewards
+                else 0.0
+            )
             std_value = (
-                torch.tensor(rewards).float().std(unbiased=False).item()
-                if len(rewards) > 1
+                torch.tensor(non_none_rewards).float().std(unbiased=False).item()
+                if len(non_none_rewards) > 1
                 else 0.0
             )
             self.add_step_metric(actor_name, f"{component_name}_mean", mean_value)
@@ -220,6 +225,11 @@ class BaseRLTrainer:
             actors_dict[actor.name] = actor
 
         self.actors = self._setup_actors(actors_dict)
+
+        # We might use the env variables later.
+        os.environ["RANK"] = str(self.accel.process_index)
+        os.environ["LOCAL_RANK"] = str(self.accel.local_process_index)
+
         self.actor_objects = actors_dict
         self._setup_loras()
 
@@ -584,6 +594,8 @@ class BaseRLTrainer:
                             )
 
                             for key in env_output.problems[0].keys():
+                                if key.startswith("_"):
+                                    continue
                                 enhanced_completion_data[key] = []
                                 for problem in env_output.problems:
                                     for _ in range(
@@ -771,16 +783,19 @@ class BaseRLTrainer:
 
         if actor_output.reward_components:
             for comp_name, comp_rewards in actor_output.reward_components.items():
+                filtered_comp_rewards = [r for r in comp_rewards if r is not None]
                 comp_mean = (
-                    sum(comp_rewards) / len(comp_rewards) if comp_rewards else 0.0
+                    sum(filtered_comp_rewards) / len(filtered_comp_rewards)
+                    if filtered_comp_rewards
+                    else 0.0
                 )
                 comp_std = (
                     (
-                        sum((r - comp_mean) ** 2 for r in comp_rewards)
-                        / len(comp_rewards)
+                        sum((r - comp_mean) ** 2 for r in filtered_comp_rewards)
+                        / len(filtered_comp_rewards)
                     )
                     ** 0.5
-                    if len(comp_rewards) > 1
+                    if len(filtered_comp_rewards) > 1
                     else 0.0
                 )
                 metrics[f"{comp_name}_mean"] = comp_mean

@@ -1,3 +1,5 @@
+import os
+
 import torch
 from datasets import Dataset
 from vllm import SamplingParams
@@ -22,20 +24,17 @@ def length_reward(completion: str, **kwargs) -> float:
 
 def get_lr_scheduler(optimizer, max_step):
     warmup_steps = 2
-    # part 1 – warm-up: linearly increase from 0.1× to 1.0× base_lr
     warmup = torch.optim.lr_scheduler.LinearLR(
         optimizer,
-        start_factor=0.1,  # 0.1 × base_lr -> 100 µ after 1st step
+        start_factor=0.1,
         end_factor=1.0,
         total_iters=warmup_steps,
     )
 
-    # part 2 – linear decay all the way to 0
     decay = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=1.0, end_factor=0.0, total_iters=max_step - warmup_steps
     )
 
-    # stitch them together
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup, decay], milestones=[warmup_steps]
     )
@@ -54,7 +53,7 @@ def main():
         beta=0.0,
     )
 
-    # Create actor with improved configuration API
+    # Create actor
     actor = vLLMActor(
         name="main",
         model_path="Qwen/Qwen2.5-0.5B-Instruct",
@@ -182,12 +181,9 @@ def main():
 
     import wandb
 
-    wandb.init(project="test_actors-2", entity="rd211", name="0.5B")
+    if os.getenv("RANK") == "0":  # Initialize wandb only on the main process
+        wandb.init(project="actors", name="0.5B")
     trainer.train()
-    trainer.push_to_hub(
-        "rd211/test_actors_main",
-        private=True,
-    )
 
 
 if __name__ == "__main__":

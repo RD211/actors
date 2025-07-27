@@ -277,7 +277,7 @@ class Environment(abc.ABC):
         results = {}
         for eval_name, eval_data in self.eval_datasets.items():
             # Convert eval dataset to batch format
-            eval_batch = {key: eval_data[key] for key in eval_data.column_names}
+            eval_batch = {key: eval_data[:][key] for key in eval_data.column_names}
 
             # Always expand batch for groups (even if group_size=1)
             expanded_batch = self.expand_batch_for_groups(eval_batch, group_size)
@@ -307,3 +307,230 @@ class Environment(abc.ABC):
         Returns:
             EnvironmentOutput containing actor outputs
         """
+
+    # ═════════════════════════════════════════════════════════════════════════════
+    # Combining multiple environments
+    # ═════════════════════════════════════════════════════════════════════════════
+
+    def __add__(self, other: Environment) -> Environment:
+        """
+        Combine two environments by merging their datasets and data states.
+        """
+
+        import random
+
+        from datasets import concatenate_datasets
+
+        if not isinstance(other, Environment):
+            raise TypeError("Can only combine with another Environment")
+
+        class CombinedEnvironment(Environment):
+            def __init__(
+                self, env1: Environment, env2: Environment, seed: int | None = None
+            ):
+                self.keys_for_env1 = (
+                    set(env1.train_data.column_names) if env1.train_data else set()
+                )
+                self.keys_for_env2 = (
+                    set(env2.train_data.column_names) if env2.train_data else set()
+                )
+                self.all_keys = self.keys_for_env1.union(self.keys_for_env2)
+                # We add a special random column to distinguish between datasets
+                self.random_column_name = f"_GROUP_{random.randint(0, 1e10)}"
+                if env1.train_data is not None:
+                    env1.train_data = env1.train_data.add_column(
+                        self.random_column_name, ["env1"] * len(env1.train_data)
+                    )
+                if env2.train_data is not None:
+                    env2.train_data = env2.train_data.add_column(
+                        self.random_column_name, ["env2"] * len(env2.train_data)
+                    )
+
+                self.env1 = env1
+                self.env2 = env2
+
+                # Concatenate datasets
+                train_data = None
+                if env1.train_data is not None and env2.train_data is not None:
+                    train_data = concatenate_datasets(
+                        [env1.train_data, env2.train_data]
+                    )
+                    if seed is not None:
+                        train_data = train_data.shuffle(seed=seed)
+                    else:
+                        train_data = train_data.shuffle()
+                elif env1.train_data is not None:
+                    train_data = env1.train_data
+                elif env2.train_data is not None:
+                    train_data = env2.train_data
+
+                self.eval_datasets_env1 = (
+                    set(env1.eval_datasets.keys()) if env1.eval_datasets else set()
+                )
+                self.eval_datasets_env2 = (
+                    set(env2.eval_datasets.keys()) if env2.eval_datasets else set()
+                )
+
+                # If they share a common eval dataset we change the name to {name}_env1 or _env2
+                eval_datasets = {}
+                for name, data in env1.eval_datasets.items():
+                    if name in env2.eval_datasets:
+                        eval_datasets[f"{name}_env1"] = data
+                        eval_datasets[f"{name}_env2"] = env2.eval_datasets[name]
+                    else:
+                        eval_datasets[name] = data
+
+                for name, data in env2.eval_datasets.items():
+                    if (
+                        name not in eval_datasets
+                        and name not in self.eval_datasets_env1
+                    ):
+                        eval_datasets[name] = data
+
+                super().__init__(
+                    train_data=train_data,
+                    eval_data={
+                        **env1.eval_datasets,
+                        **env2.eval_datasets,
+                    },
+                )
+
+            def eval(self, group_size: int = 1) -> dict[str, GroupedEnvironmentOutput]:
+                """
+                Run evaluation on all eval datasets.
+
+                Args:
+                    group_size: Number of generations per problem
+
+                Returns:
+                    Dictionary mapping dataset names to their GroupedEnvironmentOutput
+                """
+                if not self.eval_datasets:
+                    return {}
+
+                results = {}
+                env1_results = self.env1.eval(group_size)
+                env2_results = self.env2.eval(group_size)
+                keys_env1 = set(env1_results.keys())
+                keys_env2 = set(env2_results.keys())
+
+                for name, output in env1_results.items():
+                    if name in keys_env2:
+                        name = f"{name}_env1"
+                    results[name] = output
+
+                for name, output in env2_results.items():
+                    if name in keys_env1:
+                        name = f"{name}_env2"
+                    results[name] = output
+
+                return results
+
+            async def generate(self, batch: dict[str, Any]) -> EnvironmentOutput:
+                ids_of_env1 = [
+                    i
+                    for i, v in enumerate(batch[self.random_column_name])
+                    if v == "env1"
+                ]
+                ids_of_env2 = [
+                    i
+                    for i, v in enumerate(batch[self.random_column_name])
+                    if v == "env2"
+                ]
+                batch_env1 = {
+                    k: [v[i] for i in ids_of_env1]
+                    for k, v in batch.items()
+                    if k in self.keys_for_env1
+                }
+                batch_env2 = {
+                    k: [v[i] for i in ids_of_env2]
+                    for k, v in batch.items()
+                    if k in self.keys_for_env2
+                }
+
+                env_output1: EnvironmentOutput = (
+                    await self.env1.generate(batch_env1) if ids_of_env1 else None
+                )
+                env_output2: EnvironmentOutput = (
+                    await self.env2.generate(batch_env2) if ids_of_env2 else None
+                )
+                if not env_output1:
+                    return env_output2
+                if not env_output2:
+                    return env_output1
+
+                # Merge outputs
+                for actor_name in env_output1.actors:
+                    actor_output1 = env_output1.actors[actor_name]
+                    actor_output2 = env_output2.actors[actor_name]
+
+                    input_ids = [None] * (
+                        len(actor_output1.input_ids) + len(actor_output2.input_ids)
+                    )
+                    for i, input_id in enumerate(actor_output1.input_ids):
+                        input_ids[ids_of_env1[i]] = input_id
+                    for i, input_id in enumerate(actor_output2.input_ids):
+                        input_ids[ids_of_env2[i]] = input_id
+
+                    attention_mask = [None] * (
+                        len(actor_output1.attention_mask)
+                        + len(actor_output2.attention_mask)
+                    )
+                    for i, mask in enumerate(actor_output1.attention_mask):
+                        attention_mask[ids_of_env1[i]] = mask
+                    for i, mask in enumerate(actor_output2.attention_mask):
+                        attention_mask[ids_of_env2[i]] = mask
+
+                    ended_in_eos = [None] * (
+                        len(actor_output1.ended_in_eos)
+                        + len(actor_output2.ended_in_eos)
+                    )
+                    for i, eos in enumerate(actor_output1.ended_in_eos):
+                        ended_in_eos[ids_of_env1[i]] = eos
+                    for i, eos in enumerate(actor_output2.ended_in_eos):
+                        ended_in_eos[ids_of_env2[i]] = eos
+
+                    rewards = [None] * (
+                        len(actor_output1.rewards) + len(actor_output2.rewards)
+                    )
+                    for i, reward in enumerate(actor_output1.rewards):
+                        rewards[ids_of_env1[i]] = reward
+                    for i, reward in enumerate(actor_output2.rewards):
+                        rewards[ids_of_env2[i]] = reward
+
+                    reward_components = {
+                        k: [None]
+                        * (len(actor_output1.rewards) + len(actor_output2.rewards))
+                        for k in set(actor_output1.reward_components.keys())
+                        | set(actor_output2.reward_components.keys())
+                    }
+                    for k, v in actor_output1.reward_components.items():
+                        for i, comp in enumerate(v):
+                            reward_components[k][ids_of_env1[i]] = comp
+                    for k, v in actor_output2.reward_components.items():
+                        for i, comp in enumerate(v):
+                            reward_components[k][ids_of_env2[i]] = comp
+
+                    metadata = {
+                        k: [None]
+                        * (len(actor_output1.metadata) + len(actor_output2.metadata))
+                        for k in actor_output1.metadata.keys()
+                        | actor_output2.metadata.keys()
+                    }
+                    for k, v in actor_output1.metadata.items():
+                        for i, meta in enumerate(v):
+                            metadata[k][ids_of_env1[i]] = meta
+                    for k, v in actor_output2.metadata.items():
+                        for i, meta in enumerate(v):
+                            metadata[k][ids_of_env2[i]] = meta
+
+                    actor_output1.input_ids = input_ids
+                    actor_output1.attention_mask = attention_mask
+                    actor_output1.ended_in_eos = ended_in_eos
+                    actor_output1.rewards = rewards
+                    actor_output1.reward_components = reward_components
+                    actor_output1.metadata = metadata
+                    env_output1.actors[actor_name] = actor_output1
+                return env_output1
+
+        return CombinedEnvironment(self, other)

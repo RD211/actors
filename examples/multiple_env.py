@@ -87,11 +87,10 @@ judge_actor = vLLMActor(
 # ----------------------------------------------------------
 
 # ------------------------------------------------------------
-# Reward function for the collaborative task.
+# Reward functions for the collaborative tasks.
 # ------------------------------------------------------------
 
 
-@conversation_reward_function(name="correctness_reward", weight=1.0, batched=True)
 def reward(conversation, problem, answer):
     conversations = conversation
     problems = problem
@@ -109,7 +108,7 @@ def reward(conversation, problem, answer):
         else ""
         for text in texts
     ]
-    bonus = [0.25 if ans else 0.0 for ans in extracted_answers]
+
     # Create the prompts for the judge
     prompts_judge = [
         [
@@ -146,11 +145,33 @@ def reward(conversation, problem, answer):
     for i, reward in enumerate(judge_responses):
         rewards[i % len(rewards)] += reward / out_of
 
-    # Add bonus for giving any answer
-    for i in range(len(rewards)):
-        rewards[i] += bonus[i]
-
     return rewards
+
+
+@conversation_reward_function(name="bonus_reward", weight=1.0, batched=True)
+def bonus_reward(conversation):
+    """
+    A bonus reward function that gives a small bonus for providing any answer.
+    Something like a formatting bonus.
+    """
+    conversations = conversation
+
+    # Extract answers from conversations
+    texts = [
+        "".join([msg["content"] for msg in conv if msg.get("role", "") != "system"])
+        for conv in conversations
+    ]
+    extracted_answers = [
+        re.search(r"boxed{(.*?)}", text).group(1)
+        if re.search(r"boxed{(.*?)}", text)
+        else ""
+        for text in texts
+    ]
+
+    # Give a bonus of 0.25 if an answer is provided, otherwise 0.0
+    bonus = [0.25 if ans else 0.0 for ans in extracted_answers]
+
+    return bonus
 
 
 # ----------------------------------------------------------
@@ -161,8 +182,10 @@ def reward(conversation, problem, answer):
 # -----------------------------------------------------------
 def main():
     # Dataset loading
-    train_dataset = load_dataset("rl-actors/GSM8K-Easy-Math", split="train")
-    eval_dataset = load_dataset("rl-actors/GSM8K-Easy-Math", split="test")
+    math_train_dataset = load_dataset("rl-actors/GSM8K-Easy-Math", split="train").take(
+        1000
+    )
+    math_eval_dataset = load_dataset("rl-actors/GSM8K-Easy-Math", split="test")
 
     # We give specific prompts to both actors.
     system_prompt_alice = (
@@ -179,7 +202,7 @@ def main():
     )
 
     # Create collaborative environment
-    env = CollaborativeEnvironment(
+    math_env = CollaborativeEnvironment(
         actor_cfgs=[
             CollaborativeActorConfig(
                 actor=alice_actor,
@@ -198,13 +221,50 @@ def main():
                 ),
             ),
         ],
-        round_spec="Alice -> Bob -> Alice -> Bob",  # This is the definition of the order of turns.
-        reward_functions=[reward],
+        round_spec="Alice -> Bob -> Alice -> Bob",
+        reward_functions=[
+            conversation_reward_function("correctness_reward_math", batched=True)(
+                reward
+            )
+        ],
         run_concurrently=False,
         prompt_column="problem",
         mask_other_agents_for_loss=True,
-        train_data=train_dataset,
-        eval_data=eval_dataset,
+        train_data=math_train_dataset,
+        eval_data=math_eval_dataset,
+    )
+
+    physics_train_dataset = load_dataset("rl-actors/Physics-GPQA", split="train")
+    physics_env = CollaborativeEnvironment(
+        actor_cfgs=[
+            CollaborativeActorConfig(
+                actor=alice_actor,
+                system_prompt=system_prompt_alice,
+                sampling_params=SamplingParams(
+                    temperature=0.8,
+                    max_tokens=1500,
+                ),
+            ),
+            CollaborativeActorConfig(
+                actor=bob_actor,
+                system_prompt=system_prompt_bob,
+                sampling_params=SamplingParams(
+                    temperature=0.8,
+                    max_tokens=1500,
+                ),
+            ),
+        ],
+        round_spec="Alice -> Bob -> Alice -> Bob",
+        reward_functions=[
+            conversation_reward_function("correctness_reward_physics", batched=True)(
+                reward
+            ),
+            bonus_reward,
+        ],
+        run_concurrently=False,
+        prompt_column="problem",
+        mask_other_agents_for_loss=True,
+        train_data=physics_train_dataset,
     )
 
     # Create trainer configuration
@@ -214,14 +274,16 @@ def main():
         grad_accumulation_steps=4,
         num_iterations=2,
         log_every_n=1,
-        eval_every_n=25,
+        eval_every_n=5,
         eval_strategy=EvalStrategy.ALL,
         checkpoint_every_n=20,
         save_strategy=SaveStrategy.ALL,
     )
 
     # Create trainer with environment and both actors
-    trainer = GRPOTrainer(cfg=cfg, env=env, actors=[alice_actor, bob_actor])
+    trainer = GRPOTrainer(
+        cfg=cfg, env=math_env + physics_env, actors=[alice_actor, bob_actor]
+    )
 
     # Initialize wandb for logging
     if os.getenv("RANK") == "0":
