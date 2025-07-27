@@ -70,7 +70,8 @@ env = CollaborativeEnvironment(
 ## Installation
 
 ```bash
-pip install rl-actors
+git clone https://github.com/RD211/actors.git
+pip install .
 ```
 
 You should always run the code with **accelerate** using a **ZeRO‑3** configuration to be able to use all the features of the library.
