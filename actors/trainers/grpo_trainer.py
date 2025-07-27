@@ -244,7 +244,6 @@ class GRPOTrainer(BaseRLTrainer):
                 ),
                 strict=False,
             ):
-                self.accel.free_memory()
                 self._backward_one_slice(
                     ta,
                     id_slice,
@@ -257,7 +256,6 @@ class GRPOTrainer(BaseRLTrainer):
                     name,
                 )
                 free_memory()
-                self.accel.free_memory()
 
             grad_norm = self._clip_gradients(
                 ta, clip_to=actor_obj.training_config.max_grad_norm
@@ -330,20 +328,13 @@ class GRPOTrainer(BaseRLTrainer):
 
         adv_pt = torch.tensor(advantages, dtype=torch.float32, device=dev)
         unwrapped_model = ta.accel.unwrap_model(ta.model)
-        policy_for_loss = (
-            unwrapped_model.base_model.model  # PEFT: use the inner model
-            if is_peft_model(ta.model)
-            else unwrapped_model  # vanilla model
-        )
-
         with _step_profiler.track("loss_fn", actor_name=actor_name):
-            # TODO: Higher VRAM usage here which is undesirable.
             loss, stats = self._forward_redirection(
-                ta.model,  # wrapper  (DeepSpeedEngine/FSDP/…)
-                unwrapped_model,  # original (torch.nn.Module)
-                ta.loss_fn.forward,  # *bound* method of the loss object
+                ta.model,
+                unwrapped_model,
+                ta.loss_fn.forward,
                 # ---- everything the loss expects --------------------
-                policy_for_loss,  # ← first positional arg: `policy`
+                unwrapped_model,
                 ids_pt,
                 attention_mask,
                 loss_attention_mask,
@@ -352,11 +343,7 @@ class GRPOTrainer(BaseRLTrainer):
                 old_lp,
             )
             # loss, stats = ta.loss_fn(
-            #     policy=(
-            #         unwrapped_model.base_model
-            #         if is_peft_model(ta.model)
-            #         else unwrapped_model
-            #     ),
+            #     policy=unwrapped_model,
             #     input_ids=ids_pt,
             #     attention_mask=attention_mask,
             #     loss_attention_mask=loss_attention_mask,
@@ -364,8 +351,7 @@ class GRPOTrainer(BaseRLTrainer):
             #     ref_logps=ref_lp,
             #     old_logps=old_lp,
             # )
-
-        ta.accel.backward(loss / self.grad_accumulation_steps)
+        ta.accel.backward(loss)
 
         result.add_substep_metric(actor_name, substep_idx, "loss", loss.item())
         if "kl" in stats and getattr(ta.loss_fn, "beta", 0.0) != 0.0:

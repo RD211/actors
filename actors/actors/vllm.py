@@ -29,7 +29,6 @@ class vLLMActor(TrainableLLMActor):
         non_trainable: bool = False,
         training_config: ActorTrainCfg = None,
     ):
-        self.non_trainable = non_trainable
         self.logger = init_logger(name=name)
         if gpu_groups is None:
             gpu_groups = [list(range(torch.cuda.device_count()))]
@@ -61,6 +60,7 @@ class vLLMActor(TrainableLLMActor):
             name,
             model_path,
             training_config=training_config,
+            non_trainable=non_trainable,
         )
         self.pool = ModelPool()
         # Prepare engine kwargs with LoRA support if PEFT config is present

@@ -10,7 +10,7 @@ from vllm import SamplingParams
 from actors.actors.base import TrainableLLMActor
 from actors.environments.env_base import Environment
 from actors.environments.types import ActorOutput, EnvironmentOutput
-from actors.rewards.base import BaseRewardFunction, RewardFunction
+from actors.rewards import RewardFunction
 
 
 class SingleTurnEnvironment(Environment):
@@ -18,7 +18,7 @@ class SingleTurnEnvironment(Environment):
         self,
         actor: TrainableLLMActor,
         sampling_params: SamplingParams,
-        reward_functions: Sequence[RewardFunction | BaseRewardFunction | Callable],
+        reward_functions: Sequence[RewardFunction | Callable],
         prompt_column: str = "text",
         mask_prompt_for_loss: bool = True,
         train_data: HFDataset | DatasetDict | None = None,
@@ -46,9 +46,7 @@ class SingleTurnEnvironment(Environment):
 
         self.reward_functions: list[RewardFunction] = []
         for rf in reward_functions:
-            if isinstance(rf, BaseRewardFunction):
-                self.reward_functions.append(rf.to_reward_function())
-            elif isinstance(rf, RewardFunction):
+            if isinstance(rf, RewardFunction):
                 self.reward_functions.append(rf)
             elif callable(rf):
                 func_name = rf.__name__ if hasattr(rf, "__name__") else "reward_func"
@@ -57,7 +55,7 @@ class SingleTurnEnvironment(Environment):
                 )
             else:
                 raise ValueError(
-                    f"Reward function must be RewardFunction, BaseRewardFunction, or callable, "
+                    f"Reward function must be RewardFunction or callable, "
                     f"got {type(rf)}"
                 )
 

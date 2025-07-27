@@ -5,15 +5,15 @@ precommit:
 	python -m ruff check --fix actors/ tests/ examples/
 # 	python -m mypy actors/ --ignore-missing-imports
 	@echo "✅ All checks passed! Ready to commit! 🎉"
+
 install:
 	pip install -e ".[dev]"
 
+test:
+	ACTORS_LOGGING_LEVEL='silent' python -m pytest tests/ -v -m "not slow"
 
-test-cpu:
-	python -m pytest tests/ -v -m "cpu or not gpu"
-
-test-gpu:
-	python -m pytest tests/ -v -m "gpu"
+test-slow:
+	ACTORS_LOGGING_LEVEL='silent' python -m pytest tests/ -v -m "slow"
 
 test-all:
-	python -m pytest tests/ -v
+	ACTORS_LOGGING_LEVEL='silent' python -m pytest tests/ -v -m "not slow or slow"

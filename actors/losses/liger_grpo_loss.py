@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-import deepspeed
 import torch
 from liger_kernel.chunked_loss import LigerFusedLinearGRPOLoss
 from torch import Tensor, nn
@@ -33,6 +32,7 @@ class LigerGRPOLoss(BaseRLLoss):
             temperature=self.temperature,
         )
         self.loss_type: AllowedLoss = loss_type
+        self.is_lora = config.peft_config is not None
 
     def forward(
         self,
@@ -45,16 +45,16 @@ class LigerGRPOLoss(BaseRLLoss):
         old_logps: Tensor | None = None,  # (B, L-1)
         **_: dict,
     ) -> tuple[Tensor, dict[str, float]]:
-        hidden: Tensor = policy.model(
+        model_to_infer = (
+            policy.base_model.model.model if self.is_lora else policy.base_model.model
+        )
+        hidden: Tensor = model_to_infer(
             input_ids, attention_mask=attention_mask
         ).last_hidden_state[:, :-1, :]
+
         tgt_ids: Tensor = input_ids[:, 1:]
         mask: Tensor = attention_mask[:, 1:]
-        gp = deepspeed.zero.GatheredParameters(
-            [policy.lm_head.weight, policy.lm_head.bias],
-            modifier_rank=None,
-        )
-        gp.__enter__()
+
         loss, metrics = self.core(
             _input=hidden,
             lin_weight=policy.lm_head.weight,
@@ -65,7 +65,6 @@ class LigerGRPOLoss(BaseRLLoss):
             ref_per_token_logps=ref_logps,
             old_per_token_logps=old_logps,
         )
-        gp.__exit__(None, None, None)
 
         if self.beta > 0.0:
             kl = metrics[0]

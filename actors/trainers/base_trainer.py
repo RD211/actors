@@ -248,6 +248,7 @@ class BaseRLTrainer:
                 // self.cfg.grad_accumulation_steps
                 // torch.cuda.device_count()
             )
+            plug.deepspeed_config = cfg
 
         actors_with_offloading = {
             name: actor
@@ -278,7 +279,7 @@ class BaseRLTrainer:
         accelerators: dict[str, Accelerator] = {
             actor: Accelerator(
                 mixed_precision="bf16",
-                deepspeed_plugin=self.ds_plugins,
+                deepspeed_plugins=self.ds_plugins,
                 kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(hours=10))],
             )
             if i == 0
@@ -294,8 +295,8 @@ class BaseRLTrainer:
 
         for name, actor_obj in trainable_actors.items():
             accel = accelerators[name]
-            model = actor_obj.training_config.model_factory().train()
             accel.state.select_deepspeed_plugin(name)
+            model = actor_obj.training_config.model_factory().train()
 
             # We check if the model has a quantization_config
             if hasattr(model.config, "quantization_config"):
@@ -342,12 +343,14 @@ class BaseRLTrainer:
                     model.enable_input_require_grads()
 
             disable_dropout_in_model(model)
-            model.train()
             model_cfg = model.config
 
             optim = actor_obj.training_config.optim_factory(model.parameters())
-            model, optim = accel.prepare(model, optim)
+            sched = actor_obj.training_config.scheduler_factory(
+                optim, self.total_expected_steps
+            )
 
+            model, optim, sched = accel.prepare(model, optim, sched)
             loss_fn = actor_obj.training_config.loss_factory()
             beta = actor_obj.training_config.beta
 
@@ -362,15 +365,8 @@ class BaseRLTrainer:
 
                 ref_model.requires_grad_(False)
                 ref_model.config.use_cache = False
-
-                ref_model = ref_model.to(dtype=model.dtype)
                 ref_model = prepare_deepspeed(ref_model, accel)
                 disable_dropout_in_model(ref_model)
-
-            sched = actor_obj.training_config.scheduler_factory(
-                optim, self.total_expected_steps
-            )
-            sched = accel.prepare(sched)
 
             train_state = ActorTrainState(
                 model=model,

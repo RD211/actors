@@ -57,7 +57,6 @@ def main():
         learning_rate=1e-6,
         optimizer="adamw_32bit",
         loss="liger_grpo",
-        scheduler="cosine",
         peft_config=lora_config,
         quantization_config=quantization_config,
         offload_model=True,
@@ -68,7 +67,7 @@ def main():
     # Create actor with PEFT and quantization configuration
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-14B-Instruct",
+        model_path="Qwen/Qwen3-8B",
         engine_kwargs={
             "gpu_memory_utilization": 0.7,
             "max_model_len": 2048,

@@ -8,6 +8,8 @@ import torch
 from torch import nn
 from transformers import PreTrainedTokenizer
 
+from actors.inference.pool import ModelPool
+
 if TYPE_CHECKING:
     from actors.trainers.base_config import ActorTrainCfg, ActorTrainState
 
@@ -16,6 +18,12 @@ class LLMActor(abc.ABC):
     def __init__(self, name: str, model_path: str | None = None):
         self.name = name
         self.model_path = model_path
+
+        # Name must not have () or / or any whitespace or * or ->
+        if any(c in name for c in "()* /") or "->" in name:
+            raise ValueError(
+                f"Invalid actor name: {name}, must not contain () or / or whitespace or * or ->"
+            )
 
     @abc.abstractmethod
     def generate(self, prompts: Sequence[str], **kwargs): ...
@@ -43,6 +51,7 @@ class TrainableLLMActor(LLMActor):
     # ═══════════════════════════════════════════════════════════════
     # LoRA/PEFT Support Methods
     # ═══════════════════════════════════════════════════════════════
+
     @abc.abstractmethod
     def update_lora_weights(self): ...
     @abc.abstractmethod
@@ -53,6 +62,7 @@ class TrainableLLMActor(LLMActor):
         name: str,
         model_path: str,
         training_config: ActorTrainCfg | None = None,
+        non_trainable: bool = False,
     ):
         """
         Initialize a trainable LLM actor with configuration options.
@@ -64,20 +74,17 @@ class TrainableLLMActor(LLMActor):
         """
         super().__init__(name, model_path)
 
-        # Import here to avoid circular imports
         from actors.trainers.base_config import ActorTrainCfg
 
-        # Use provided config or create a default one
         if training_config is not None:
             self.training_config = training_config
         else:
             self.training_config = ActorTrainCfg()
 
-        # Create default factories if we have a model path
         self.training_config.create_default_factories(model_path)
 
-        # Initialize train state as None - will be set during training setup
         self.train_state: ActorTrainState | None = None
+        self.non_trainable = non_trainable
 
     # ═══════════════════════════════════════════════════════════════
     # Convenience Properties - Delegates to ActorTrainCfg
@@ -103,10 +110,6 @@ class TrainableLLMActor(LLMActor):
         """Get the current learning rate."""
         return self.training_config.learning_rate
 
-    def get_training_summary(self) -> dict:
-        """Get a summary of current training configuration."""
-        return self.training_config.get_training_summary()
-
     # ═══════════════════════════════════════════════════════════════
     # Training State Access
     # ═══════════════════════════════════════════════════════════════
@@ -115,3 +118,16 @@ class TrainableLLMActor(LLMActor):
     def is_training_initialized(self) -> bool:
         """Check if training state has been initialized."""
         return self.train_state is not None
+
+    @property
+    def is_actually_trainable(self) -> bool:
+        """Check if the actor is non-trainable."""
+        return not self.non_trainable
+
+    # ═══════════════════════════════════════════════════════════════
+    # Cleanup
+    # ═══════════════════════════════════════════════════════════════
+
+    def kill(self):
+        self.pool = ModelPool()
+        self.pool.unload_model(self.name)

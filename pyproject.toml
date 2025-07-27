@@ -31,7 +31,7 @@ dependencies = [
     "liger-kernel>=0.5.10",
     "ninja",
     "accelerate",
-    "transformers",
+    "transformers<4.54.0", # temporary fix for https://github.com/vllm-project/vllm-ascend/issues/2034
     "datasets",
     "pynvml",
     "psutil",
@@ -57,6 +57,7 @@ dev = [
     "ruff",
     "mypy",
     "pre-commit",
+    "pytest-asyncio",
 ]
 docs = [
     "mkdocs",
@@ -119,6 +120,7 @@ addopts = [
 markers = [
     "slow: marks tests as slow (run manually or on main branch pushes)",
 ]
+asyncio_mode = "auto"
 
 [tool.mypy]
 python_version = "3.10"
