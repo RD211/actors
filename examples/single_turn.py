@@ -13,7 +13,7 @@ from actors import (
 )
 
 
-def length_reward(completion: str) -> float:
+def length_reward(completion: str, **kwargs) -> float:
     """Rewards shorter responses."""
     return -min(
         len(completion) / 500, 5.0
@@ -46,12 +46,12 @@ def main():
     # Create training configuration
     training_config = ActorTrainCfg(
         learning_rate=2e-6,
-        optimizer="adamw_8bit",
+        optimizer="adamw_32bit",
         loss="liger_grpo",
         scheduler=get_lr_scheduler,
         offload_model=True,
         offload_optimizer=True,
-        beta=0.04,
+        beta=0.0,
     )
 
     # Create actor with improved configuration API
@@ -61,7 +61,6 @@ def main():
         engine_kwargs={
             "gpu_memory_utilization": 0.5,
             "max_model_len": 2048,
-            "quantization": "fp8",
         },
         training_config=training_config,
     )
@@ -167,9 +166,9 @@ def main():
 
     # Create trainer configuration
     cfg = GRPOTrainerCfg(
-        group_size=16,
-        batch_size=64,
-        grad_accumulation_steps=8,
+        group_size=4,
+        batch_size=8,
+        grad_accumulation_steps=2,
         num_iterations=2,
         log_every_n=1,
         eval_every_n=50,  # Run evaluation every 50 steps

@@ -43,10 +43,8 @@ class GRPOLoss(BaseRLLoss):
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         logits = (
             policy(input_ids, attention_mask=attention_mask).logits / self.temperature
-        )  # shape (B, L, V)
-        new_lp = _selective_softmax(
-            logits[:, :-1, :], input_ids[:, 1:]
-        )  # shape (B, L-1)
+        )
+        new_lp = _selective_softmax(logits[:, :-1, :], input_ids[:, 1:])
         if old_logps is None:
             old_logps = new_lp.detach()
 
@@ -56,8 +54,8 @@ class GRPOLoss(BaseRLLoss):
         ratio_clipped = torch.clamp(ratio, 1 - self.eps_l, 1 + self.eps_h)
 
         if advantages.dim() == 1:
-            adv = advantages[:, None].expand_as(new_lp)  # shape (B, L-1)
-        else:  # already (B, L-1)
+            adv = advantages[:, None].expand_as(new_lp)
+        else:
             adv = advantages
         adv = adv.to(new_lp.dtype)
 

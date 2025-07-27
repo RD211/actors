@@ -15,7 +15,7 @@ from actors import (
 )
 
 
-def length_reward(completion: str) -> float:
+def length_reward(completion: str, **kwargs) -> float:
     """Rewards shorter responses."""
     return -min(
         len(completion) / 500, 5.0
@@ -25,8 +25,8 @@ def length_reward(completion: str) -> float:
 def main():
     # Create LoRA configuration
     lora_config = LoraConfig(
-        r=256,  # LoRA rank
-        lora_alpha=512,  # LoRA scaling parameter
+        r=128,  # LoRA rank
+        lora_alpha=256,  # LoRA scaling parameter
         target_modules=[
             "q_proj",
             "k_proj",
@@ -43,7 +43,7 @@ def main():
 
     # Create training configuration
     training_config = ActorTrainCfg(
-        learning_rate=1e-6,
+        learning_rate=5e-7,
         optimizer="adamw_32bit",
         loss="liger_grpo",
         scheduler="cosine",
@@ -60,7 +60,7 @@ def main():
     # Create actor with PEFT configuration
     actor = vLLMActor(
         name="main",
-        model_path="Qwen/Qwen2.5-1.5B-Instruct",
+        model_path="Qwen/Qwen2.5-0.5B-Instruct",
         engine_kwargs={
             "gpu_memory_utilization": 0.6,
             "max_model_len": 2048,
@@ -171,7 +171,7 @@ def main():
     cfg = GRPOTrainerCfg(
         group_size=16,
         batch_size=64,
-        grad_accumulation_steps=2,
+        grad_accumulation_steps=4,
         num_iterations=1,
         log_every_n=1,
         eval_every_n=None,  # No periodic evaluation
@@ -186,7 +186,7 @@ def main():
     import wandb
 
     if os.getenv("RANK") == "0":
-        wandb.init(project="test_actors-2", entity="rd211", name="1.5b-lora")
+        wandb.init(project="actors", entity="rd211", name="0.5b-lora")
     trainer.train()
     trainer.push_to_hub(
         "rd211/test_actors_lora_main",

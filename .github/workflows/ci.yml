@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10"]
+        python-version: ["3.11"]
 
     steps:
     - uses: actions/checkout@v4
@@ -29,5 +29,4 @@ jobs:
     - name: Run code quality checks
       run: |
         # Format and lint with ruff
-        python -m ruff format --check actors/ tests/ examples/
-        python -m ruff check actors/ tests/ examples/
+        make precommit

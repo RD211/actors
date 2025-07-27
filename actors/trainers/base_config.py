@@ -8,7 +8,7 @@ import accelerate
 import torch
 from torch import nn, optim
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import CosineAnnealingLR, LRScheduler
+from torch.optim.lr_scheduler import LRScheduler
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -97,7 +97,7 @@ class ActorTrainCfg:
     # Advantage calculation and normalization
     advantage_calculator: Callable[..., list[float]] | None = None
     std_normalization: bool = True
-    beta: float = 0.1
+    beta: float = 0.0
     loss_temp: float = 1.0
 
     # Model configuration
@@ -121,10 +121,9 @@ class ActorTrainCfg:
     _scheduler_factory: (
         Callable[[Optimizer], LRScheduler]
         | Callable[[Optimizer, int | None], LRScheduler]
+        | None
     ) = field(
-        default=lambda opt, steps: CosineAnnealingLR(
-            opt, T_max=steps if steps else 1000
-        ),
+        default=None,
         repr=False,
         init=False,
     )
@@ -161,7 +160,7 @@ class ActorTrainCfg:
         optimizer_kwargs: dict[str, Any] | None = None,
         loss: str | type | Callable | None = None,
         loss_kwargs: dict[str, Any] | None = None,
-        scheduler: str | type | Callable | None = None,
+        scheduler: str | type | Callable | None = "cosine",
         scheduler_kwargs: dict[str, Any] | None = None,
         # Factory functions
         model_factory: Callable[[], nn.Module] | None = None,
@@ -292,6 +291,7 @@ class ActorTrainCfg:
             # Merge default kwargs with user-provided kwargs
             default_kwargs = {
                 "trust_remote_code": True,
+                "torch_dtype": torch.bfloat16,
             }
             merged_kwargs = {**default_kwargs, **self.model_kwargs}
 
@@ -315,7 +315,6 @@ class ActorTrainCfg:
             self._reference_model_factory = self._model_factory
 
         if self._tokenizer_factory is None:
-            # Extract tokenizer-specific kwargs (if any)
             tokenizer_kwargs = {
                 k: v
                 for k, v in self.model_kwargs.items()
@@ -323,9 +322,14 @@ class ActorTrainCfg:
             }
             if "trust_remote_code" not in tokenizer_kwargs:
                 tokenizer_kwargs["trust_remote_code"] = True
-            self._tokenizer_factory = lambda: AutoTokenizer.from_pretrained(
-                model_path, **tokenizer_kwargs
-            )
+
+            def get_tokenizer():
+                tok = AutoTokenizer.from_pretrained(model_path, **tokenizer_kwargs)
+                if tok.pad_token is None:
+                    tok.pad_token = tok.eos_token
+                return tok
+
+            self._tokenizer_factory = get_tokenizer
 
     def set_learning_rate(self, lr: float):
         """Set the learning rate."""
@@ -535,7 +539,7 @@ class ActorTrainCfg:
             eta_min = kwargs.get("eta_min", 0)
             return lambda opt, steps: CosineAnnealingLR(
                 opt,
-                T_max=T_max if T_max else (steps if steps else 1000),
+                T_max=steps if steps is not None else T_max,
                 eta_min=eta_min,
             )
         elif name.lower() == "linear":
