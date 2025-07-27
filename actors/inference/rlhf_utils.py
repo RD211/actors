@@ -46,6 +46,7 @@ class ColocateWorkerExtension:
             self.cpu_cache[name] = tensor.contiguous().to(
                 device="cpu", non_blocking=True
             )
+        torch.cuda.synchronize()
 
     def load_weights_from_cache(self):
         torch.cuda.synchronize()

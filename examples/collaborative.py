@@ -25,8 +25,8 @@ from actors.rewards.base_conversation_reward import conversation_reward_function
 
 # Create training configuration for first actor
 training_config_alice = ActorTrainCfg(
-    learning_rate=2e-6,
-    optimizer="adamw_8bit",
+    learning_rate=1e-6,
+    optimizer="adamw_32bit",
     loss="liger_grpo",
     offload_model=True,
     offload_optimizer=True,
@@ -35,8 +35,8 @@ training_config_alice = ActorTrainCfg(
 
 # Create training configuration for second actor
 training_config_bob = ActorTrainCfg(
-    learning_rate=2e-6,
-    optimizer="adamw_8bit",
+    learning_rate=1e-6,
+    optimizer="adamw_32bit",
     loss="liger_grpo",
     offload_model=True,
     offload_optimizer=True,
@@ -50,23 +50,25 @@ training_config_bob = ActorTrainCfg(
 # Create first actor (Alice)
 alice_actor = vLLMActor(
     name="Alice",
-    model_path="Qwen/Qwen2.5-0.5B-Instruct",
+    model_path="Qwen/Qwen3-4B",
     engine_kwargs={
-        "gpu_memory_utilization": 0.5,
+        "gpu_memory_utilization": 0.65,
         "max_model_len": 8192,
     },
     training_config=training_config_alice,
+    gpu_groups=[[0,1]]
 )
 
 # Create second actor (Bob)
 bob_actor = vLLMActor(
     name="Bob",
-    model_path="HuggingFaceTB/SmolLM2-360M-Instruct",
+    model_path="Qwen/Qwen3-4B",
     engine_kwargs={
-        "gpu_memory_utilization": 0.5,
+        "gpu_memory_utilization": 0.65,
         "max_model_len": 8192,
     },
     training_config=training_config_bob,
+    gpu_groups=[[0,1]]
 )
 
 # ----------------------------------------------------------
@@ -76,12 +78,13 @@ bob_actor = vLLMActor(
 # This judge allows us to evaluate even hard to equate answers.
 judge_actor = vLLMActor(
     name="Judge",
-    model_path="Qwen/Qwen2.5-1.5B-Instruct",
+    model_path="Qwen/Qwen3-4B",
     engine_kwargs={
-        "gpu_memory_utilization": 0.6,
+        "gpu_memory_utilization": 0.65,
         "max_model_len": 4096,
     },
     non_trainable=True,
+    gpu_groups=[[0,1]]
 )
 
 # ----------------------------------------------------------
@@ -210,8 +213,8 @@ def main():
     # Create trainer configuration
     cfg = GRPOTrainerCfg(
         group_size=8,
-        batch_size=32,
-        grad_accumulation_steps=4,
+        batch_size=128,
+        grad_accumulation_steps=8,
         num_iterations=2,
         log_every_n=1,
         eval_every_n=25,

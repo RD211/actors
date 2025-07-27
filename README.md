@@ -73,7 +73,7 @@ env = CollaborativeEnvironment(
 pip install rl-actors
 ```
 
-You should always run the code with **accelerate** using a **ZeRO‑3** configuration.
+You should always run the code with **accelerate** using a **ZeRO‑3** configuration to be able to use all the features of the library.
 
 ```bash
 accelerate launch --config_file zero3.yaml your_script.py

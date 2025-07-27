@@ -475,7 +475,7 @@ class BaseRLTrainer:
                 if self.accel.is_main_process:
                     if offload_info["model_offloaded"]:
                         self.logger.normal(colorize("💤 Offloaded model", Palette.INFO))
-
+        self.accel.wait_for_everyone()
         if self.accel.is_local_main_process:
             if is_peft_model(ta.model):
                 actor_obj.update_lora_weights()
