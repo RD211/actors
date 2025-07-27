@@ -411,7 +411,7 @@ class BaseRLTrainer:
         # If there is any actor with a PEFT configuration, we will create lora adapters.
         if not any(actor.has_peft_config for actor in self.actor_objects.values()):
             return
-        # TODO: If not loras. there is no need to do all of this.
+
         os.makedirs(self.cfg.checkpoint_path, exist_ok=True)
 
         if self.accel.is_main_process:
@@ -1031,10 +1031,6 @@ class BaseRLTrainer:
         batch_size: int = 4,
         max_fused: int = 1 << 15,
     ) -> list[list[float]]:
-        """
-        Super memory efficient logp computation and actually faster than standard.
-        """
-
         total = len(ids)
         world = self.number_of_devices
         per_rank = (total + world - 1) // world

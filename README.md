@@ -17,7 +17,7 @@
   </a>
 </p>
 
-> ⚠️ **Warning:** Not really production ready yet; there may be a ton of bugs.
+> ⚠️ **Warning:** Not really production ready yet; there may be a ton of bugs and expect many breaking changes.
 
 ---
 
@@ -211,6 +211,13 @@ Training multiple models at the same time requires a lot of careful VRAM managem
 * Triton kernel for computing log‑probabilities. Helps with long context a bit. [More details here.](docs/logps_kernel.md)
 * [Liger kernels](https://github.com/linkedin/Liger-Kernel) for computing the GRPO loss.
 * Efficient streamed implementation for updating vLLM weights along with LoRA in‑memory updates. [More details here.](docs/updating_weights.md)
+
+#### Debugging VRAM
+> In order to debug memory issues try running with `ACTORS_LOGGING_LEVEL='verbose'`. 
+
+Sometimes memory becomes very fragmented and can cause OOM errors when switching to the inference part. You can try running with: `PYTORCH_CUDA_ALLOC_CONF=garbage_collection_threshold:0.3,max_split_size_mb:64` and it might fix the problem.
+
+Sometimes, after a failed run, memory might remain allocated for a while. Make sure to terminate all previous processes before starting a new run.
 
 ---
 

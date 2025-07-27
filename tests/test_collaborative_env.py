@@ -98,13 +98,13 @@ async def test_one_actor_without_masking(smollm_actor):
 
     decoded_text = tok.decode(ao.input_ids[0])
     assert "You are SmolLM" in decoded_text, "System prompt not found in output"
-    assert (
-        decoded_text.count("smol says:") == 0
-    ), f"Expected no mentions of 'smol says:' in {decoded_text}"
+    assert decoded_text.count("smol says:") == 0, (
+        f"Expected no mentions of 'smol says:' in {decoded_text}"
+    )
     # Sum of attention mask should equal input length
-    assert sum(ao.attention_mask[0]) == len(
-        ao.input_ids[0]
-    ), "Attention mask should be all 1s."
+    assert sum(ao.attention_mask[0]) == len(ao.input_ids[0]), (
+        "Attention mask should be all 1s."
+    )
 
 
 @pytest.mark.slow
@@ -137,9 +137,9 @@ async def test_one_actor_with_masking(smollm_actor):
 
     decoded_text = tok.decode(ao.input_ids[0])
     assert "You are SmolLM" in decoded_text, "System prompt not found in output"
-    assert (
-        decoded_text.count("smol says:") == 0
-    ), f"Expected no mentions of 'smol says:' in {decoded_text}"
+    assert decoded_text.count("smol says:") == 0, (
+        f"Expected no mentions of 'smol says:' in {decoded_text}"
+    )
     # Sum of attention mask should equal input length
     len_tokens_to_mask = len(
         tok.apply_chat_template(
@@ -152,12 +152,12 @@ async def test_one_actor_with_masking(smollm_actor):
             tokenize=True,
         )
     )
-    assert (
-        sum(ao.attention_mask[0]) == len(ao.input_ids[0]) - len_tokens_to_mask
-    ), "Attention mask should mask out system prompt tokens."
-    assert all(
-        m == 1 for m in ao.attention_mask[0][len_tokens_to_mask:]
-    ), "Attention mask should be all 1s after system prompt tokens."
+    assert sum(ao.attention_mask[0]) == len(ao.input_ids[0]) - len_tokens_to_mask, (
+        "Attention mask should mask out system prompt tokens."
+    )
+    assert all(m == 1 for m in ao.attention_mask[0][len_tokens_to_mask:]), (
+        "Attention mask should be all 1s after system prompt tokens."
+    )
 
 
 @pytest.mark.slow
@@ -203,12 +203,12 @@ async def test_two_actors_with_masking(smollm_actor, qwen_actor):
     qwen_decoded = tok2.decode(qwen_ao.input_ids[0])
     assert "You are SmolLM" in smol_decoded, "System prompt not found in SmolLM output"
     assert "You are Qwen" in qwen_decoded, "System prompt not found in Qwen output"
-    assert (
-        qwen_decoded.count("smol says:") >= 1
-    ), "Expected at least 1 mention of 'smol says:'"
-    assert (
-        smol_decoded.count("qwen says:") >= 1
-    ), "Expected at least 1 mention of 'qwen says:'"
+    assert qwen_decoded.count("smol says:") >= 1, (
+        "Expected at least 1 mention of 'smol says:'"
+    )
+    assert smol_decoded.count("qwen says:") >= 1, (
+        "Expected at least 1 mention of 'qwen says:'"
+    )
 
     # Check attention masks
     smol_len_tokens_to_mask = len(
@@ -230,12 +230,12 @@ async def test_two_actors_with_masking(smollm_actor, qwen_actor):
     )
 
     # Asser that the system prompt is masked out in both actors
-    assert all(
-        m == 0 for m in smol_ao.attention_mask[0][:smol_len_tokens_to_mask]
-    ), "Attention mask should mask out SmolLM system prompt tokens."
-    assert all(
-        m == 0 for m in qwen_ao.attention_mask[0][:qwen_len_tokens_to_mask]
-    ), "Attention mask should mask out Qwen system prompt tokens."
+    assert all(m == 0 for m in smol_ao.attention_mask[0][:smol_len_tokens_to_mask]), (
+        "Attention mask should mask out SmolLM system prompt tokens."
+    )
+    assert all(m == 0 for m in qwen_ao.attention_mask[0][:qwen_len_tokens_to_mask]), (
+        "Attention mask should mask out Qwen system prompt tokens."
+    )
 
     count_tokens_smol = sum(smol_ao.attention_mask[0])
     count_tokens_qwen = sum(qwen_ao.attention_mask[0])
@@ -245,9 +245,9 @@ async def test_two_actors_with_masking(smollm_actor, qwen_actor):
             smol_len_tokens_to_mask : smol_len_tokens_to_mask + count_tokens_smol
         ]
     ), "Wrong attention mask for SmolLM."
-    assert all(
-        m == 1 for m in qwen_ao.attention_mask[0][-count_tokens_qwen:]
-    ), "Wrong attention mask for Qwen."
+    assert all(m == 1 for m in qwen_ao.attention_mask[0][-count_tokens_qwen:]), (
+        "Wrong attention mask for Qwen."
+    )
 
 
 @pytest.mark.slow
@@ -293,12 +293,12 @@ async def test_two_actors_long_conversation(trump_actor, musk_actor):
     musk_decoded = tok2.decode(musk_ao.input_ids[0])
     assert "You are Elon" in musk_decoded, "System prompt not found in Musk output"
     assert "You are Donald" in trump_decoded, "System prompt not found in Trump output"
-    assert (
-        trump_decoded.count("Musk says:") >= 2
-    ), "Expected at least 2 mentions of 'Musk says:'"
-    assert (
-        musk_decoded.count("Trump says:") >= 2
-    ), "Expected at least 2 mentions of 'Trump says:'"
+    assert trump_decoded.count("Musk says:") >= 2, (
+        "Expected at least 2 mentions of 'Musk says:'"
+    )
+    assert musk_decoded.count("Trump says:") >= 2, (
+        "Expected at least 2 mentions of 'Trump says:'"
+    )
 
 
 @pytest.mark.slow
@@ -345,15 +345,15 @@ async def test_two_actors_concurrent(trump_actor, musk_actor):
         trump_decoded = tok1.decode(trump_ao.input_ids[i])
         musk_decoded = tok2.decode(musk_ao.input_ids[i])
         assert "You are Elon" in musk_decoded, "System prompt not found in Musk output"
-        assert (
-            "You are Donald" in trump_decoded
-        ), "System prompt not found in Trump output"
-        assert (
-            trump_decoded.count("Musk says:") >= 1
-        ), "Expected at least 1 mention of 'Musk says:'"
-        assert (
-            musk_decoded.count("Trump says:") >= 1
-        ), "Expected at least 1 mention of 'Trump says:'"
+        assert "You are Donald" in trump_decoded, (
+            "System prompt not found in Trump output"
+        )
+        assert trump_decoded.count("Musk says:") >= 1, (
+            "Expected at least 1 mention of 'Musk says:'"
+        )
+        assert musk_decoded.count("Trump says:") >= 1, (
+            "Expected at least 1 mention of 'Trump says:'"
+        )
 
 
 @conversation_reward_function("always_1")
@@ -418,23 +418,23 @@ async def test_reward_functions(trump_actor, musk_actor):
     assert len(musk_ao.rewards) == 4, "Expected four rewards for Musk"
     assert len(trump_ao.rewards) == 4, "Expected four rewards for Trump"
 
-    assert (
-        len(trump_ao.reward_components.keys()) == 2
-    ), "Expected two reward components for Trump"
-    assert (
-        len(musk_ao.reward_components.keys()) == 2
-    ), "Expected two reward components for Musk"
+    assert len(trump_ao.reward_components.keys()) == 2, (
+        "Expected two reward components for Trump"
+    )
+    assert len(musk_ao.reward_components.keys()) == 2, (
+        "Expected two reward components for Musk"
+    )
 
-    assert (
-        trump_ao.reward_components["always_1"][0] == 1.0
-    ), "always_1 reward function should return 1.0 for Trump"
-    assert (
-        musk_ao.reward_components["always_1"][0] == 1.0
-    ), "always_1 reward function should return 1.0 for Musk"
+    assert trump_ao.reward_components["always_1"][0] == 1.0, (
+        "always_1 reward function should return 1.0 for Trump"
+    )
+    assert musk_ao.reward_components["always_1"][0] == 1.0, (
+        "always_1 reward function should return 1.0 for Musk"
+    )
 
-    assert (
-        trump_ao.reward_components["dod_reward"][0] == 2.0
-    ), "dod_reward for Trump should return 2.0"
-    assert (
-        musk_ao.reward_components["dod_reward"][0] == -1.0
-    ), "dod_reward for Musk should return -1.0"
+    assert trump_ao.reward_components["dod_reward"][0] == 2.0, (
+        "dod_reward for Trump should return 2.0"
+    )
+    assert musk_ao.reward_components["dod_reward"][0] == -1.0, (
+        "dod_reward for Musk should return -1.0"
+    )

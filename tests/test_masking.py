@@ -74,13 +74,13 @@ def test_masks_apply_per_turn(tokenizer, base_messages):
     for i, sl in enumerate(slices):
         segment_mask_vals = masks[sl]
         if turn_masks[i]:
-            assert all(
-                v == 1 for v in segment_mask_vals
-            ), f"Turn {i} should be included but has masked tokens"
+            assert all(v == 1 for v in segment_mask_vals), (
+                f"Turn {i} should be included but has masked tokens"
+            )
         else:
-            assert all(
-                v == 0 for v in segment_mask_vals
-            ), f"Turn {i} should be masked but has unmasked tokens"
+            assert all(v == 0 for v in segment_mask_vals), (
+                f"Turn {i} should be masked but has unmasked tokens"
+            )
 
 
 def test_partial_mask_length_mismatch(tokenizer, base_messages):

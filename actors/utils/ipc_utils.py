@@ -13,8 +13,6 @@ def _detach(named: tuple[str, torch.Tensor]):
 
 
 def _tensors_to_ipc(tensors: dict[str, torch.Tensor], workers: int | None = None):
-    """Same signature as _tensors_to_ipc but parallelised."""
-
     def _one(item):
         name, t = item
         if t.device.type != "cuda":

@@ -26,7 +26,7 @@ from actors.rewards.base_conversation_reward import conversation_reward_function
 # Create training configuration for first actor
 training_config_alice = ActorTrainCfg(
     learning_rate=1e-6,
-    optimizer="adamw_32bit",
+    optimizer="adamw_8bit",
     loss="liger_grpo",
     offload_model=True,
     offload_optimizer=True,
@@ -36,7 +36,7 @@ training_config_alice = ActorTrainCfg(
 # Create training configuration for second actor
 training_config_bob = ActorTrainCfg(
     learning_rate=1e-6,
-    optimizer="adamw_32bit",
+    optimizer="adamw_8bit",
     loss="liger_grpo",
     offload_model=True,
     offload_optimizer=True,
@@ -56,7 +56,7 @@ alice_actor = vLLMActor(
         "max_model_len": 8192,
     },
     training_config=training_config_alice,
-    gpu_groups=[[0,1]]
+    gpu_groups=[[0, 1]],
 )
 
 # Create second actor (Bob)
@@ -68,7 +68,7 @@ bob_actor = vLLMActor(
         "max_model_len": 8192,
     },
     training_config=training_config_bob,
-    gpu_groups=[[0,1]]
+    gpu_groups=[[0, 1]],
 )
 
 # ----------------------------------------------------------
@@ -84,7 +84,7 @@ judge_actor = vLLMActor(
         "max_model_len": 4096,
     },
     non_trainable=True,
-    gpu_groups=[[0,1]]
+    gpu_groups=[[0, 1]],
 )
 
 # ----------------------------------------------------------
@@ -164,8 +164,8 @@ def reward(conversation, problem, answer):
 # -----------------------------------------------------------
 def main():
     # Dataset loading
-    train_dataset = load_dataset("rl-actors/GSM8K-Easy-Math", split="train")
-    eval_dataset = load_dataset("rl-actors/GSM8K-Easy-Math", split="test")
+    train_dataset = load_dataset("rl-actors/Big-Math-RL-Verified-Subset", split="train")
+    eval_dataset = load_dataset("rl-actors/Big-Math-RL-Verified-Subset", split="test")
 
     # We give specific prompts to both actors.
     system_prompt_alice = (
@@ -214,7 +214,7 @@ def main():
     cfg = GRPOTrainerCfg(
         group_size=8,
         batch_size=128,
-        grad_accumulation_steps=8,
+        grad_accumulation_steps=16,
         num_iterations=2,
         log_every_n=1,
         eval_every_n=25,

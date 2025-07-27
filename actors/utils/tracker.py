@@ -80,9 +80,8 @@ class StepProfiler:
             current_mem = torch.cuda.memory_allocated(self.device)
             peak_mem = torch.cuda.max_memory_allocated(self.device)
 
-            # Only the two metrics you want
-            mem_change_mb = (current_mem - operation_start_mem) / 1e6  # MB
-            peak_usage_mb = peak_mem / 1e6  # MB
+            mem_change_mb = (current_mem - operation_start_mem) / 1e6
+            peak_usage_mb = peak_mem / 1e6
 
             self.metrics[metric_key]["mem_change_mb"] = mem_change_mb
             self.metrics[metric_key]["peak_memory_mb"] = peak_usage_mb
@@ -149,10 +148,6 @@ def gpu_tracker(
     extra: dict | None = None,
     actor_name: str = None,
 ):
-    """
-    Legacy context manager for backward compatibility.
-    Now uses the new StepProfiler under the hood.
-    """
     with _step_profiler.track(name, no_memory_measurement, actor_name):
         yield
 

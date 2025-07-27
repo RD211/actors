@@ -185,7 +185,6 @@ class GRPOTrainer(BaseRLTrainer):
             old_lp = (
                 self._get_logps(
                     (
-                        # TODO: Check this, it looks wrong.
                         self.accel.unwrap_model(ta.model).base_model.model
                         if is_peft_model(ta.model)
                         else self.accel.unwrap_model(ta.model)
@@ -342,15 +341,7 @@ class GRPOTrainer(BaseRLTrainer):
                 ref_lp,
                 old_lp,
             )
-            # loss, stats = ta.loss_fn(
-            #     policy=unwrapped_model,
-            #     input_ids=ids_pt,
-            #     attention_mask=attention_mask,
-            #     loss_attention_mask=loss_attention_mask,
-            #     advantages=adv_pt,
-            #     ref_logps=ref_lp,
-            #     old_logps=old_lp,
-            # )
+
         ta.accel.backward(loss)
 
         result.add_substep_metric(actor_name, substep_idx, "loss", loss.item())
