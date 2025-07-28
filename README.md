@@ -67,12 +67,17 @@ env = CollaborativeEnvironment(
 
 ## Installation
 
+You can install the library from source for the latest features and bug fixes:
 ```bash
 git clone https://github.com/RD211/actors.git
 pip install .
 ```
+Or install from PyPI:
+```bash
+pip install rl-actors
+```
 
-You should always run the code with **accelerate** using a **ZeRO‑3** configuration to be able to use all the features of the library.
+You should run the code with **accelerate** using a **ZeRO‑3** configuration to be able to use all the features of the library.
 
 ```bash
 accelerate launch --config_file zero3.yaml your_script.py
