@@ -21,6 +21,7 @@ class GRPOLoss(BaseRLLoss):
         loss_type: AllowedLoss = "grpo",
         delta: float | None = None,
         max_completion_length: int | None = None,
+        gspo: bool = False,
     ):
         super().__init__(config=config)
 
@@ -29,6 +30,7 @@ class GRPOLoss(BaseRLLoss):
         self.loss_type = loss_type
         self.delta = delta
         self.max_completion_length = max_completion_length
+        self.gspo = gspo
 
     def forward(
         self,
@@ -48,7 +50,20 @@ class GRPOLoss(BaseRLLoss):
         if old_logps is None:
             old_logps = new_lp.detach()
 
-        ratio = torch.exp(new_lp - old_logps)
+        mask = attention_mask[:, 1:].to(new_lp.dtype) * loss_attention_mask
+
+        # From https://github.com/huggingface/trl/blob/03034317d0be0c259c315f5ffad71be138c17d2c/trl/trainer/grpo_trainer.py#L1793
+        ratio = new_lp - old_logps
+        if not self.gspo:
+            log_importance_weights = ratio
+        else:
+            log_importance_weights = (ratio * mask).sum(-1) / mask.sum(-1).clamp(
+                min=1.0
+            )
+            log_importance_weights = log_importance_weights.unsqueeze(-1)
+
+        ratio = torch.exp(log_importance_weights)
+
         if self.delta is not None:
             ratio = torch.clamp(ratio, max=self.delta)
         ratio_clipped = torch.clamp(ratio, 1 - self.eps_l, 1 + self.eps_h)
@@ -65,8 +80,6 @@ class GRPOLoss(BaseRLLoss):
             kl = torch.exp(ref_logps - new_lp) - (ref_logps - new_lp) - 1
             per_tok = per_tok + self.beta * kl
 
-        mask = attention_mask[:, 1:].to(per_tok.dtype) * loss_attention_mask
-
         if self.loss_type == "grpo":
             loss = ((per_tok * mask).sum(-1) / mask.sum(-1).clamp(min=1)).mean()
         elif self.loss_type == "bnpo":
@@ -82,6 +95,10 @@ class GRPOLoss(BaseRLLoss):
 
         metrics = {}
         if kl is not None:
-            metrics["kl"] = ((kl * mask).sum() / mask.sum()).item()
+            metrics["kl"] = (
+                ((kl * mask).sum() / mask.sum()).item()
+                if kl.shape[1] != 1
+                else kl.mean().item()
+            )
 
         return loss, metrics

@@ -98,6 +98,7 @@ class ActorTrainCfg:
     advantage_calculator: Callable[..., list[float]] | None = None
     std_normalization: bool = True
     beta: float = 0.0
+    loss: str = "liger_gspo"
     loss_temp: float = 1.0
 
     # Model configuration
@@ -158,7 +159,7 @@ class ActorTrainCfg:
         # Training components
         optimizer: str | type | Callable | None = None,
         optimizer_kwargs: dict[str, Any] | None = None,
-        loss: str | type | Callable | None = None,
+        loss: str | type | Callable = "liger_gspo",
         loss_kwargs: dict[str, Any] | None = None,
         scheduler: str | type | Callable | None = "cosine",
         scheduler_kwargs: dict[str, Any] | None = None,
@@ -246,6 +247,7 @@ class ActorTrainCfg:
         if loss is not None:
             kwargs = loss_kwargs or {}
             if isinstance(loss, str):
+                self.loss = loss
                 loss = self._get_loss_by_name(loss)
             self._loss_factory = self._as_factory(loss, **kwargs)
 
@@ -259,12 +261,6 @@ class ActorTrainCfg:
         # Call post_init for default setup
         if self._optim_factory is None:
             self._optim_factory = lambda p: optim.AdamW(p)
-        if self._loss_factory is None:
-            # Set default loss factory with loss_kwargs if provided
-            kwargs = loss_kwargs or {}
-            from actors.losses import LigerGRPOLoss
-
-            self._loss_factory = lambda: LigerGRPOLoss(config=self, **kwargs)
 
     def _as_factory(self, obj, **kwargs):
         if isinstance(obj, BaseRLLoss):
@@ -517,11 +513,13 @@ class ActorTrainCfg:
     def _get_loss_by_name(self, name: str):
         """Get loss class by string name."""
         # Import loss classes at runtime to avoid circular imports
-        from actors.losses import GRPOLoss, LigerGRPOLoss
+        from actors.losses import GRPOLoss, GSPOLoss, LigerGRPOLoss, LigerGSPOLoss
 
         losses = {
             "grpo": GRPOLoss,
             "liger_grpo": LigerGRPOLoss,
+            "gspo": GSPOLoss,
+            "liger_gspo": LigerGSPOLoss,
         }
 
         if name.lower() not in losses:
@@ -582,7 +580,6 @@ class ActorTrainCfg:
             model_path: Model path from the actor (optional)
         """
         result = {}
-        factory_fields = {}
 
         if model_path is not None:
             result["model_path"] = model_path
@@ -595,15 +592,11 @@ class ActorTrainCfg:
                 continue
 
             # For private fields, use a cleaner name (remove leading underscore)
-            field_name = f.name[1:] if f.name.startswith("_") else f.name
+            field_name = f.name
             serialized_value = self._serialize_value(value)
 
-            if f.name.startswith("_"):
-                factory_fields[field_name] = serialized_value
-            else:
+            if not f.name.startswith("_"):
                 result[field_name] = serialized_value
-
-        result.update(factory_fields)
 
         return result
 
