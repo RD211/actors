@@ -97,7 +97,7 @@ lora_config = LoraConfig(
 training_config = ActorTrainCfg(
     learning_rate=5e-6,
     optimizer="adamw_8bit",
-    loss="liger_grpo",
+    loss="liger_gspo",
     peft_config=lora_config,
     quantization_config=quantization_config,
     offload_model=True,
@@ -173,9 +173,9 @@ def main():
     # Create trainer configuration
     cfg = GRPOTrainerCfg(
         group_size=8,
-        batch_size=8,  # Unintuitive but this is the global batch size.
+        batch_size=16,  # Unintuitive but this is the global batch size.
         grad_accumulation_steps=1,
-        num_iterations=1,
+        num_iterations=2,
         log_every_n=1,
         eval_every_n=None,  # No periodic evaluation
         eval_strategy=EvalStrategy.NONE,  # No evaluation

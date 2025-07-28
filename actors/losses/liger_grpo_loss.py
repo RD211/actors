@@ -25,7 +25,7 @@ class LigerGRPOLoss(BaseRLLoss):
         if loss_type not in ("grpo", "bnpo", "dr_grpo"):
             raise ValueError(f"invalid loss_type '{loss_type}'")
 
-        self.core: LigerFusedLinearGRPOLoss = LigerFusedLinearGRPOLoss(
+        self.loss: LigerFusedLinearGRPOLoss = LigerFusedLinearGRPOLoss(
             beta=self.beta,
             use_ref_model=self.beta > 0.0,
             loss_type=loss_type,
@@ -53,7 +53,7 @@ class LigerGRPOLoss(BaseRLLoss):
         tgt_ids: Tensor = input_ids[:, 1:]
         mask: Tensor = attention_mask[:, 1:]
 
-        loss, metrics = self.core(
+        loss, metrics = self.loss(
             _input=hidden,
             lin_weight=policy.lm_head.weight,
             bias=policy.lm_head.bias,
