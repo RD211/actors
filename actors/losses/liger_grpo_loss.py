@@ -18,7 +18,7 @@ class LigerGRPOLoss(BaseRLLoss):
     def __init__(
         self,
         config: ActorTrainCfg,
-        loss_type: AllowedLoss = "bnpo",
+        loss_type: AllowedLoss = "grpo",
     ) -> None:
         super().__init__(config=config)
 

@@ -90,7 +90,7 @@ class TrainerCfg:
 class ActorTrainCfg:
     # Basic training parameters
     learning_rate: float = 1e-6
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 0.1
     gradient_checkpointing: bool = True
     reference_batch_size: int = -1  # -1 is full batch size
 
