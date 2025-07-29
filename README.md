@@ -189,10 +189,10 @@ def length_reward(prompt: str, completion: str) -> float:
 
 # We support batched rewards and weights too.
 @conversation_reward_function(name='math_reward', weight=1.0, batched=True)
-def math_reward(conversations: list,
+def math_reward(conversation: list,
                 problem: list,  # Dataset field
                 answer: list,   # Also dataset field
-                actor_names: list  # allows actor-specific rewards.
+                actor_name: list  # allows actor-specific rewards.
               ) -> list[float]:
   # Batched reward functions are designed for Judges.
   # You can use Actors freely in the reward function.
@@ -201,7 +201,7 @@ def math_reward(conversations: list,
 
 # The parameters for the reward functions are automatically filled in as follows:
 # For Single turn you will always get the prompt and completion.
-# For Conversation you will always get conversations and actor_names.
+# For Conversation you will always get conversation and actor_name.
 # For both of them you will get all dataset attributes too, such as `answer` for math data.
 ```
 
@@ -229,7 +229,7 @@ Sometimes, after a failed run, memory might remain allocated for a while. Make s
 ## RL algorithms
 
 Currently there is a **GRPO** and **[GSPO](https://www.arxiv.org/abs/2507.18071)** implementation. Both implementations have both a torch version and a Liger-Kernel chunked version.
-> [!NOTE]  
+> [!NOTE]
 > You can also get a lot of the other implementations such as DAPO, Dr. GRPO just by configuring the existing losses and advantage function.
 
 ---
@@ -276,4 +276,4 @@ alice = vLLMActor(
 
 ## Inspiration
 
-Inspired by [Verifiers](https://github.com/willccbb/verifiers), [TRL](https://github.com/huggingface/trl), and [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF).
+Inspired by [TRL](https://github.com/huggingface/trl), [Unsloth](https://unsloth.ai/), [OpenRLHF](https://github.com/OpenRLHF/OpenRLHF) and [Verifiers](https://github.com/willccbb/verifiers).

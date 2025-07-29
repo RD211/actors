@@ -25,6 +25,7 @@ from actors.trainers.base_config import (
     SaveStrategy,
     TrainerCfg,
 )
+from actors.utils.accelerate import init_distributed_one_gpu
 from actors.utils.deepspeed import (
     offload_model_and_optimizer,
     prepare_deepspeed,
@@ -247,9 +248,9 @@ class BaseRLTrainer:
             name: DeepSpeedPlugin() for name in trainable_actors
         }
 
-        for name, plug in self.ds_plugins.items():
+        for name in self.ds_plugins.keys():
             actor = trainable_actors[name]
-            cfg = plug.deepspeed_config
+            cfg = self.ds_plugins[name].deepspeed_config
             cfg["max_grad_norm"] = actor.training_config.max_grad_norm
             cfg["train_batch_size"] = self.cfg.batch_size
             cfg["gradient_accumulation_steps"] = self.cfg.grad_accumulation_steps
@@ -258,7 +259,8 @@ class BaseRLTrainer:
                 // self.cfg.grad_accumulation_steps
                 // torch.cuda.device_count()
             )
-            plug.deepspeed_config = cfg
+            cfg["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = True
+            self.ds_plugins[name].deepspeed_config = cfg
 
         actors_with_offloading = {
             name: actor
@@ -267,12 +269,14 @@ class BaseRLTrainer:
             or actor.training_config.offload_model
         }
 
+        ran_with_py = init_distributed_one_gpu()
         if actors_with_offloading:
             first_plugin = next(iter(self.ds_plugins.values()))
             zero_config = first_plugin.deepspeed_config.get("zero_optimization", {})
             zero_stage = zero_config.get("stage", 2)
-
-            if zero_stage != 3:
+            if ran_with_py:
+                zero_config["stage"] = 3
+            elif zero_stage != 3:
                 actor_names = ", ".join(actors_with_offloading.keys())
                 warning_msg = (
                     f"⚠️  Offloading is only supported with DeepSpeed ZeRO Stage 3, "

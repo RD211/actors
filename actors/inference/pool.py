@@ -203,8 +203,6 @@ class ModelPool:
                     "env_vars": {
                         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                         "CUDA_VISIBLE_DEVICES": ",".join(map(str, grp)),
-                        # All environment variables that we have.
-                        # **os.environ,
                     }
                 },
             ).remote(name, model_path, grp, use_v1_engine, engine_kwargs)
@@ -328,7 +326,7 @@ class ModelPool:
             from vllm.lora.request import LoRARequest
 
             lora_request = LoRARequest(
-                lora_name="lora", lora_int_id=1, lora_local_path="placeholder"
+                lora_name=f"lora_{name}", lora_int_id=1, lora_local_path="placeholder"
             )
         if lora_request is DEFAULT_LORA:
             lora_request = None
@@ -383,7 +381,7 @@ class ModelPool:
             from vllm.lora.request import LoRARequest
 
             lora_request = LoRARequest(
-                lora_name="lora", lora_int_id=1, lora_local_path="placeholder"
+                lora_name=f"lora_{name}", lora_int_id=1, lora_local_path="placeholder"
             )
         if lora_request is DEFAULT_LORA:
             lora_request = None

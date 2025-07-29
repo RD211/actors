@@ -11,7 +11,6 @@ from .base_conversation_reward import (
 __all__ = [
     "RewardFunction",
     "reward_function",
-    "BaseConversationRewardFunction",
     "ConversationRewardFunction",
     "conversation_reward_function",
 ]

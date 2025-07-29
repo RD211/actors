@@ -1,9 +1,11 @@
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .actors import LLMActor, OpenAIActor, TrainableLLMActor, vLLMActor
 from .environments import (
     ActorOutput,
     ActorOutputDict,
+    CollaborativeActorConfig,
+    CollaborativeEnvironment,
     Environment,
     EnvironmentOutput,
     GroupedEnvironmentOutput,
@@ -11,6 +13,7 @@ from .environments import (
     RewardFunction,
     SingleTurnEnvironment,
 )
+from .rewards import conversation_reward_function, reward_function
 from .trainers import (
     ActorTrainCfg,
     BaseRLTrainer,
@@ -28,6 +31,9 @@ __all__ = [
     "OpenAIActor",
     "TrainableLLMActor",
     "vLLMActor",
+    # Rewards
+    "conversation_reward_function",
+    "reward_function",
     # Trainers
     "GRPOTrainer",
     "BaseRLTrainer",
@@ -40,6 +46,8 @@ __all__ = [
     # Environments
     "Environment",
     "SingleTurnEnvironment",
+    "CollaborativeEnvironment",
+    "CollaborativeActorConfig",
     "RewardFunction",
     # Types
     "ActorOutput",

@@ -72,12 +72,14 @@ class ColocateWorkerExtension:
         # Clean up the cache to free memory
         self.cpu_cache = {}
 
-    def _create_lora_if_not_present(self, lora_path: str):
+    def _create_lora_if_not_present(self, lora_path: str, name: str):
         from vllm.lora.request import LoRARequest
+
+        self.name = name
 
         self.model_runner.add_lora(
             lora_request=LoRARequest(
-                lora_name="lora",
+                lora_name=f"lora_{name}",
                 lora_int_id=1,
                 lora_local_path=lora_path,
             )

@@ -495,8 +495,6 @@ class ActorTrainCfg:
 
             optimizers.update(
                 {
-                    "paged_adamw_32bit": bnb.optim.PagedAdamW32bit,
-                    "paged_adamw_8bit": bnb.optim.PagedAdamW8bit,
                     "adamw_32bit": bnb.optim.AdamW32bit,
                     "adamw_8bit": bnb.optim.AdamW8bit,
                 }

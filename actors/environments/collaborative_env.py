@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from typing import Any
 
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict
+from jinja2 import Template
 from vllm import RequestOutput, SamplingParams
 
 from actors.actors.base import TrainableLLMActor
@@ -18,6 +20,10 @@ from actors.environments.types import ActorOutput, EnvironmentOutput
 from actors.rewards import (
     ConversationRewardFunction,
 )
+
+
+def looks_like_jinja2_template(s):
+    return bool(re.search(r"({{.*?}}|{%.*?%}|{#.*?#})", s))
 
 
 @dataclass
@@ -36,7 +42,7 @@ class CollaborativeEnvironment(Environment):
         reward_functions: Sequence[ConversationRewardFunction | Callable],
         run_concurrently: bool = True,
         prompt_column: str = "text",
-        mask_other_agents_for_loss: bool = False,
+        mask_other_agents_for_loss: bool = True,
         train_data: HFDataset | DatasetDict | None = None,
         prefill_name: bool = False,  # Show name of other agents to the current agent?
         eval_data: (
@@ -96,6 +102,15 @@ class CollaborativeEnvironment(Environment):
         problems = batch[self.prompt_column]
         batch_size = len(problems)
 
+        def get_prompt(cfg: CollaborativeActorConfig, idx: int) -> str:
+            if looks_like_jinja2_template(cfg.system_prompt):
+                template = Template(cfg.system_prompt)
+                keys_in_batch = set(batch.keys())
+                entry = {k: batch[k][idx] for k in keys_in_batch}
+                return template.render(**entry)
+            else:
+                return cfg.system_prompt + problems[idx]
+
         per_row_turns: list[list[str]] = [
             sample_schedule(self.schedule_dsl_spec, self.all_names)
             for _ in range(batch_size)
@@ -133,7 +148,7 @@ class CollaborativeEnvironment(Environment):
                     conv_msgs.append(
                         {
                             "role": "system",
-                            "content": cfg.system_prompt + problems[idx],
+                            "content": get_prompt(cfg, idx),
                         }
                     )
 
@@ -190,7 +205,7 @@ class CollaborativeEnvironment(Environment):
 
             for i, row_msgs in enumerate(dialogs):
                 converted: list[dict[str, str]] = [
-                    {"role": "system", "content": cfg.system_prompt + problems[i]}
+                    {"role": "system", "content": get_prompt(cfg, i)}
                 ]
                 for m in row_msgs:
                     role = "assistant" if m.get("author") == cfg.actor.name else "user"
