@@ -35,7 +35,7 @@ class LigerFusedLinearGSPOFunction(LigerFusedLinearPPOBase):
         max_completion_length=None,
         **kwargs,
     ):
-        """GRPO Loss Function matching GRPOTrainer implementation."""
+        """GSPO Loss Function matching GSPOTrainer implementation."""
         per_token_logps = log_probs.gather(
             dim=-1, index=selected_token_ids.unsqueeze(-1)
         ).squeeze(-1)

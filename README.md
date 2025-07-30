@@ -77,13 +77,18 @@ Or install from PyPI:
 pip install rl-actors
 ```
 
+The library uses **Accelerate**, **DeepSpeed**, **bitsandbytes**, **vLLM**, and **PEFT**, and supports **LoRA** and **QLoRA** training.
 You should run the code with **accelerate** using a **ZeRO‑3** configuration to be able to use all the features of the library.
 
 ```bash
 accelerate launch --config_file zero3.yaml your_script.py
 ```
 
-The library uses **Accelerate**, **DeepSpeed**, **bitsandbytes**, **vLLM**, and **PEFT**, and supports **LoRA** and **QLoRA** training.
+If you are running in a notebook you just need to add this and it should work:
+```python
+import nest_asyncio
+nest_asyncio.apply()
+```
 
 Some quickstart examples can be found at `examples/`.
 
