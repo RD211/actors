@@ -56,7 +56,6 @@ training_config_bob = ActorTrainCfg(
         lora_dropout=0.0,
         task_type=TaskType.CAUSAL_LM,
     ),
-    use_liger_model=False,  # SmolLM3 does not support AutoLiger yet.
 )
 
 # ----------------------------------------------------------

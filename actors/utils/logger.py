@@ -198,6 +198,9 @@ def init_logger(
         os.environ["VLLM_CONFIGURE_LOGGING"] = "1"
     elif env_level == "normal":
         level = NORMAL
+        # Suppress vLLM logs in quiet mode
+        os.environ["VLLM_LOGGING_LEVEL"] = "ERROR"
+        os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
     elif env_level == "quiet":
         level = QUIET
         # Suppress vLLM logs in quiet mode

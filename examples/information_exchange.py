@@ -27,55 +27,51 @@ quantization_config = BitsAndBytesConfig(
     bnb_4bit_quant_storage=torch.bfloat16,
 )
 
-# Create LoRA configuration
-lora_config = LoraConfig(
-    r=64,
-    lora_alpha=64,
-    target_modules=[
-        "q_proj",
-        "k_proj",
-        "v_proj",
-        "o_proj",
-        "gate_proj",
-        "up_proj",
-        "down_proj",
-    ],
-    lora_dropout=0.0,
-    bias="none",
-    task_type=TaskType.CAUSAL_LM,
-)
-
-# Create training configuration
-training_config = ActorTrainCfg(
-    learning_rate=5e-6,
-    optimizer="adamw_8bit",
-    peft_config=lora_config,
-    quantization_config=quantization_config,
-    beta=0.0,
-)
-
-
 # Initialize two actors
 ben = vLLMActor(
     name="Ben",
     model_path="Qwen/Qwen2.5-3B-Instruct",
     engine_kwargs={
-        "gpu_memory_utilization": 0.65,
+        "gpu_memory_utilization": 0.5,
         "max_model_len": 2048,
         "quantization": "bitsandbytes",
     },
-    training_config=training_config,
+    training_config=ActorTrainCfg(
+        learning_rate=5e-6,
+        optimizer="adamw_32bit",
+        peft_config=LoraConfig(
+            r=64,
+            lora_alpha=128,
+            target_modules="all-linear",
+            lora_dropout=0.0,
+            task_type=TaskType.CAUSAL_LM,
+        ),
+        quantization_config=quantization_config,
+        beta=0.0,
+    ),
 )
 
 alice = vLLMActor(
     name="Alice",
-    model_path="Qwen/Qwen2.5-3B-Instruct",
+    model_path="meta-llama/Llama-3.2-3B-Instruct",
     engine_kwargs={
-        "gpu_memory_utilization": 0.65,
+        "gpu_memory_utilization": 0.5,
         "max_model_len": 2048,
         "quantization": "bitsandbytes",
     },
-    training_config=training_config,
+    training_config=ActorTrainCfg(
+        learning_rate=5e-6,
+        optimizer="adamw_32bit",
+        peft_config=LoraConfig(
+            r=64,
+            lora_alpha=128,
+            target_modules="all-linear",
+            lora_dropout=0.0,
+            task_type=TaskType.CAUSAL_LM,
+        ),
+        quantization_config=quantization_config,
+        beta=0.0,
+    ),
 )
 
 
@@ -94,36 +90,44 @@ ds = ben_ds.add_column("text_alice", alice_ds["text_alice"])
 
 
 ben_prompt = r"""
-You are Ben. You will converse with Alice.
-The task is to exchange information in a multi-turn conversation.
-You will receive a sentence that you must transmit to Alice.
-She will also receive a different sentence to transmit to you.
-In order to complete the task you must:
-1. Read or decode the sentence you receive.
-2. Put the sentence she sent to you in this format:
+You are **Ben** and you are chatting with **Alice**.
+Alice has a secret sentence for you, and you have one for her.
+Your goal is to swap the two sentences as quickly as possible.
+
+**What to do**
+
+1. Read the sentence written below (it is only for you).
+2. After Alice successfully sends you *her* secret sentence, reply with **only** the following format:
+
 <Answer>
-The sentence you get from Alice here
+(the sentence from Alice)
 </Answer>
 
-Alice will also do the same with the sentence you sent her.
-Now here is your sentence:
+Do **not** put your own sentence inside these tags.
+Keep the conversation as short as possible—if it drags on, the police might catch you before the swap is done.
+
+Here is your sentence:
 {{ text_ben }}
 """
 
 alice_prompt = r"""
-You are Alice. You will converse with Ben.
-The task is to exchange information in a multi-turn conversation.
-You will receive a sentence that you must transmit to Ben.
-He will also receive a different sentence to transmit to you.
-In order to complete the task you must:
-1. Read or decode the sentence you receive.
-2. Put the sentence he sent to you in this format:
+You are **Alice** and you are chatting with **Ben**.
+Ben has a secret sentence for you, and you have one for him.
+Your goal is to swap the two sentences as quickly as possible.
+
+**What to do**
+
+1. Read the sentence written below (it is only for you).
+2. After Ben successfully sends you *his* secret sentence, reply with **only** the following format:
+
 <Answer>
-The sentence you get from Ben here
+(the sentence from Ben)
 </Answer>
 
-Ben will also do the same with the sentence you sent him.
-Now here is your sentence:
+Do **not** put your own sentence inside these tags.
+Keep the conversation as short as possible—if it drags on, the police might catch you before the swap is done.
+
+Here is your sentence:
 {{ text_alice }}
 """
 
@@ -226,7 +230,7 @@ def main():
             num_iterations=2,
             max_steps=500,
         ),
-        actors=[ben, alice],
+        actors=[alice, ben],
     )
 
     import wandb

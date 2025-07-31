@@ -81,6 +81,9 @@ class TrainableLLMActor(LLMActor):
         else:
             self.training_config = ActorTrainCfg()
 
+        # Lock the training config to this actor
+        self.training_config.lock_to_actor(self.name)
+
         self.training_config.create_default_factories(model_path)
 
         self.train_state: ActorTrainState | None = None

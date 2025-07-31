@@ -292,9 +292,7 @@ class ModelPool:
         for status, msg in results:
             if status == "ERROR":
                 raise RuntimeError(msg)
-        logger.normal(
-            colorize(f"🔧 Created/initialized LoRA for {name}", Palette.SUCCESS)
-        )
+        logger.normal(colorize(f"🔧 Created LoRA for {name}", Palette.SUCCESS))
 
     # ------------- inference internal -----------------------------
     @staticmethod

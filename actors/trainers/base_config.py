@@ -136,8 +136,8 @@ class ActorTrainCfg:
     peft_config: LoraConfig | None = None
 
     # Offloading parameters
-    offload_optimizer: bool = False
-    offload_model: bool = False
+    offload_optimizer: bool = True
+    offload_model: bool = True
 
     def __init__(
         self,
@@ -656,6 +656,17 @@ class ActorTrainCfg:
                 return f"<{type(value).__name__}>"
         else:
             return str(value)
+
+    def lock_to_actor(self, model_name: str):
+        """
+        Prevents using the same actor config for multiple actors.
+        """
+        if hasattr(self, "locked_to_actor"):
+            raise RuntimeError(
+                f"This ActorTrainCfg is already locked to actor '{self.locked_to_actor}'. "
+                "Create a new instance of ActorTrainCfg for each actor."
+            )
+        self.locked_to_actor = model_name
 
 
 # ═══════════════════════════════════════════════════════════════════════

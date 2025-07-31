@@ -275,7 +275,8 @@ class BaseRLTrainer:
             zero_config = first_plugin.deepspeed_config.get("zero_optimization", {})
             zero_stage = zero_config.get("stage", 2)
             if ran_with_py:
-                zero_config["stage"] = 3
+                for plugin in self.ds_plugins.values():
+                    plugin.deepspeed_config["zero_optimization"]["stage"] = 3
             elif zero_stage != 3:
                 actor_names = ", ".join(actors_with_offloading.keys())
                 warning_msg = (
