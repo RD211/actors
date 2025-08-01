@@ -50,12 +50,6 @@ class StepProfiler:
         operation_start_mem = None
 
         if not no_memory_measurement and self.device is not None:
-            # Clear cache before measuring to get accurate baseline
-            import gc
-
-            gc.collect()
-            torch.cuda.empty_cache()
-
             operation_start_mem = torch.cuda.memory_allocated(self.device)
             # Reset peak stats just for this operation
             torch.cuda.reset_peak_memory_stats(self.device)

@@ -12,10 +12,30 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
             module.p = 0
 
 
-def free_memory() -> None:
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-    gc.collect()
+def free_memory_if_needed(threshold: float = 0.85) -> bool:
+    """
+    Flush CUDA cache and trigger Python/IPC GC only if GPU utilisation ≥ `threshold`.
+
+    Parameters
+    ----------
+    threshold : float
+        Fraction of total GPU memory that must be in use before we free it
+
+    Returns
+    -------
+    bool
+        True if memory was freed, False if it was already under the threshold
+    """
+
+    free_b, total_b = torch.cuda.mem_get_info(torch.cuda.current_device())
+    used_ratio = (total_b - free_b) / total_b
+
+    if used_ratio >= threshold:
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+        gc.collect()
+        return True  # freed something
+    return False  # under threshold, skipped
 
 
 # from: https://github.com/huggingface/trl/blob/main/trl/models/utils.py#L376

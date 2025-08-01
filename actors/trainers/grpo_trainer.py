@@ -22,7 +22,7 @@ from actors.utils.deepspeed import (
 )
 from actors.utils.logger import Palette, colorize
 from actors.utils.tracker import _step_profiler
-from actors.utils.train_utils import _ForwardRedirection, free_memory
+from actors.utils.train_utils import _ForwardRedirection, free_memory_if_needed
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Helper functions
@@ -254,7 +254,7 @@ class GRPOTrainer(BaseRLTrainer):
                     substep_idx,
                     name,
                 )
-                free_memory()
+                free_memory_if_needed()
 
             grad_norm = self._clip_gradients(
                 ta, clip_to=actor_obj.training_config.max_grad_norm

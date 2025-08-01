@@ -11,6 +11,8 @@ from deepspeed.runtime.zero.offload_config import (
     OffloadStateTypeEnum,
 )
 
+from actors.utils.train_utils import free_memory_if_needed
+
 
 def _safe_destroy(self):
     for g in getattr(self, "param_groups", []):
@@ -206,11 +208,7 @@ def offload_model_and_optimizer(
         _offload_model(model.optimizer, non_blocking=non_blocking)
         info["model_offloaded"] = True
 
-    if non_blocking and torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-    gc.collect()
-    torch.cuda.empty_cache()
+    free_memory_if_needed()
 
     return info
 
@@ -240,10 +238,6 @@ def reload_model_and_optimizer(
     # Synchronize transfers before cleanup
     if non_blocking and torch.cuda.is_available():
         torch.cuda.synchronize()
-
-    # Clean up memory cache
-    gc.collect()
-    torch.cuda.empty_cache()
 
     return info
 
