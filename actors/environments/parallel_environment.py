@@ -57,7 +57,7 @@ Please put your final answer in a boxed format like this: \\boxed{your_answer}.
 class ParallelActorConfig:
     actor: TrainableLLMActor
     sampling_params: SamplingParams
-    problem_prompt: str = SAMPLER_PROMPT
+    problem_prompt: str | None = None
     num_samples: int = 1
 
 
@@ -65,7 +65,7 @@ class ParallelActorConfig:
 class CombinerActorConfig:
     actor: TrainableLLMActor
     sampling_params: SamplingParams
-    problem_prompt: str = COMBINER_PROMPT
+    problem_prompt: str | None = None
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -153,11 +153,12 @@ class ParallelEnvironment(Environment):
 
         # ---------- 1. build prompts -----------------------------------
         def _render(cfg: ParallelActorConfig, idx: int) -> str:
-            tmpl = Template(cfg.problem_prompt)
+            tmpl = Template(cfg.problem_prompt or SAMPLER_PROMPT)
             entry = {k: batch[k][idx] for k in batch}
-            return tmpl.render(**entry)
+            entry["problem"] = problems[idx]
+            return [{"role": "user", "content": tmpl.render(**entry)}]
 
-        prompts_by_actor: dict[str, list[str]] = defaultdict(list)
+        prompts_by_actor: dict[str, list[dict[str, str]]] = defaultdict(list)
         for cfg in self.sampler_cfgs:
             for idx in range(B):
                 prompts_by_actor[cfg.actor.name].extend(
@@ -198,19 +199,29 @@ class ParallelEnvironment(Environment):
             all_drafts = [
                 d for cfg in self.sampler_cfgs for d in drafts[cfg.actor.name][idx]
             ]
+
+            # We remove the thinking part from the drafts
+            all_drafts = [
+                d.split("</think>")[-1].strip() if "</think>" in d else d
+                for d in all_drafts
+            ]
             comb_prompts.append(
-                {
-                    "role": "user",
-                    "content": Template(self.final_combiner.problem_prompt).render(
-                        problem=problems[idx],
-                        answers=all_drafts,
-                        **{
-                            k: v[idx]
-                            for k, v in batch.items()
-                            if k != self.prompt_column
-                        },
-                    ),
-                }
+                [
+                    {
+                        "role": "user",
+                        "content": Template(
+                            self.final_combiner.problem_prompt or COMBINER_PROMPT
+                        ).render(
+                            problem=problems[idx],
+                            answers=all_drafts,
+                            **{
+                                k: v[idx]
+                                for k, v in batch.items()
+                                if k != self.prompt_column
+                            },
+                        ),
+                    }
+                ]
             )
 
         comb_outs = await self.final_combiner.actor.achat(
@@ -244,7 +255,8 @@ class ParallelEnvironment(Environment):
             vals_all = {}  # cache so we slice only once per RF
             for rf in self.gen_rewards:
                 vals = rf.compute_rewards(
-                    conversations=draft_convs,
+                    prompts=[c[0]["content"] for c in draft_convs],
+                    completions=[c[1]["content"] for c in draft_convs],
                     actor_names=draft_actor_names,
                     **extra_cols,
                 )
@@ -261,18 +273,13 @@ class ParallelEnvironment(Environment):
                     cursor[cfg.actor.name] += N
 
         # ---------- 5. rewards - combiner ------------------------------
-        comb_convs = [
-            [
-                {"role": "user", "content": problems[idx]},
-                {"role": "assistant", "content": comb_answers[idx]},
-            ]
-            for idx in range(B)
-        ]
+
         comb_reward: dict[str, list[float]] = defaultdict(list)
         if self.comb_rewards:
             for rf in self.comb_rewards:
                 comb_reward[rf.name] = rf.compute_rewards(
-                    conversations=comb_convs,
+                    prompts=[c[0]["content"] for c in comb_prompts],
+                    completions=comb_answers,
                     actor_names=[self.final_combiner.actor.name] * B,
                     **batch,
                 )
@@ -318,7 +325,10 @@ class ParallelEnvironment(Environment):
                         group_name="generation",
                         tokenizer=tok,
                         messages=[
-                            {"role": "user", "content": _render(cfg, idx)},
+                            {
+                                "role": "user",
+                                "content": _render(cfg, idx)[0]["content"],
+                            },
                             {"role": "assistant", "content": draft},
                         ],
                         rewards=total,
@@ -339,7 +349,7 @@ class ParallelEnvironment(Environment):
                     group_name="combiner",
                     tokenizer=tok_c,
                     messages=[
-                        {"role": "user", "content": problems[idx]},
+                        {"role": "user", "content": comb_prompts[idx][0]["content"]},
                         {"role": "assistant", "content": comb_answers[idx]},
                     ],
                     rewards=total,

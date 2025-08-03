@@ -10,6 +10,7 @@ import os
 
 import torch
 from datasets import load_dataset
+from math_verify import parse, verify
 from peft import LoraConfig, TaskType
 from transformers import BitsAndBytesConfig
 from vllm import SamplingParams
@@ -27,16 +28,38 @@ from actors import (
 )
 from actors.rewards.base_completion_reward import reward_function
 
-
 # ═══════════════════════════════════════════════════════════════
 # 1. Reward functions
 # ═══════════════════════════════════════════════════════════════
-@reward_function(name="correctness_reward", weight=1.0)
-def correctness_reward(completion, answer):
+
+
+def extract_boxed(completion: str) -> str:
+    if "boxed{" not in completion:
+        return ""
+    stack_of_brackets = 1
+    boxed = ""
+    new_completion = completion.split("boxed{")[-1]
+    for char in new_completion:
+        if char == "{":
+            stack_of_brackets += 1
+            boxed += char
+        elif char == "}":
+            stack_of_brackets -= 1
+            boxed += char
+            if stack_of_brackets == 0:
+                break
+        else:
+            boxed += char
+    return boxed
+
+
+@reward_function(name="correctness_reward", weight=1.0, batched=False)
+def correctness_reward(prompt, completion, answer):
     try:
-        found_answer = completion.split("boxed{").split("}")[0].strip()
-        answer = int(answer.split("### ")[1].strip().replace(",", ""))
-        return 1.0 if str(answer) == found_answer else 0.0
+        found_answer = extract_boxed(completion)
+        parsed_answer = parse(answer)
+        parsed_found_answer = parse(found_answer)
+        return verify(parsed_answer, parsed_found_answer)
     except Exception:
         return 0.0
 
@@ -73,7 +96,7 @@ def LORA_CFG():
     )
 
 
-def TRAIN_CFG_TEMPLATE():
+def TRAIN_CFG_TEMPLATE_SAMPLER():
     return ActorTrainCfg(
         learning_rate=5e-6,
         optimizer="adamw_8bit",
@@ -82,21 +105,36 @@ def TRAIN_CFG_TEMPLATE():
         quantization_config=QUANT_CFG(),
         offload_model=True,
         offload_optimizer=True,
-        beta=0.001,
+        beta=0.0,
         max_grad_norm=0.1,
-        # Make these explicit so they override trainer defaults if omitted there
-        # batch_size=64,
-        # grad_accumulation_steps=4,
+        batch_size=256,
+        grad_accumulation_steps=32,
+        reference_batch_size=4,
+    )
+
+
+def TRAIN_CFG_TEMPLATE_COMBINER():
+    return ActorTrainCfg(
+        learning_rate=5e-6,
+        optimizer="adamw_8bit",
+        loss="liger_grpo",
+        peft_config=LORA_CFG(),
+        quantization_config=QUANT_CFG(),
+        offload_model=True,
+        offload_optimizer=True,
+        beta=0.0,
+        max_grad_norm=0.1,
+        reference_batch_size=4,
     )
 
 
 ENGINE_KWARGS = {
-    "gpu_memory_utilization": 0.7,
-    "max_model_len": 2**15,  # 32k
+    "gpu_memory_utilization": 0.6,
+    "max_model_len": 2**14,  # 16k
     "quantization": "bitsandbytes",
 }
 
-MODEL_PATH = "Qwen/Qwen3-0.6B"
+MODEL_PATH = "Qwen/Qwen3-4B"
 
 # ═══════════════════════════════════════════════════════════════
 # 3. Instantiate 5 actors  (4 samplers + 1 combiner)
@@ -108,11 +146,13 @@ def build_actor(name: str) -> vLLMActor:
         name=name,
         model_path=MODEL_PATH,
         engine_kwargs=ENGINE_KWARGS,
-        training_config=TRAIN_CFG_TEMPLATE(),
+        training_config=TRAIN_CFG_TEMPLATE_SAMPLER()
+        if "Sampler" in name
+        else TRAIN_CFG_TEMPLATE_COMBINER(),
     )
 
 
-sampler_names = ["Sampler-A", "Sampler-B", "Sampler-C", "Sampler-D"]
+sampler_names = ["Sampler-A", "Sampler-B", "Sampler-C", "Sampler-D"][:1]
 samplers = [build_actor(n) for n in sampler_names]
 combiner = build_actor("Combiner")
 
@@ -120,7 +160,12 @@ combiner = build_actor("Combiner")
 # 4. Data
 # ═══════════════════════════════════════════════════════════════
 
-gsm8k = load_dataset("openai/gsm8k", "main")
+math_rl_data = load_dataset(
+    "PrimeIntellect/INTELLECT-2-only-math-filtered-2k", split="train"
+)
+# Rename the prompt column to "problem"
+math_rl_data = math_rl_data.rename_column("prompt", "problem")
+aime25_data = load_dataset("math-ai/aime25", split="test")
 
 # ═══════════════════════════════════════════════════════════════
 # 5. ParallelEnvironment configuration
@@ -130,7 +175,7 @@ sampler_cfgs = [
     ParallelActorConfig(
         actor=a,
         sampling_params=SamplingParams(temperature=1.0, max_tokens=16_000),
-        num_samples=1,  # one draft per sampler
+        num_samples=4,  # one draft per sampler
     )
     for a in samplers
 ]
@@ -145,9 +190,11 @@ env = ParallelEnvironment(
     final_combiner=combiner_cfg,
     generate_reward_functions=[],
     combiner_reward_functions=[correctness_reward],
-    prompt_column="question",
-    train_data=gsm8k["train"],
-    eval_data={"test": gsm8k["test"]},
+    prompt_column="problem",
+    train_data=math_rl_data,
+    eval_data={
+        "aime25": aime25_data,
+    },
 )
 
 # ═══════════════════════════════════════════════════════════════
@@ -156,7 +203,7 @@ env = ParallelEnvironment(
 TRAINER_CFG = GRPOTrainerCfg(
     group_size=8,
     batch_size=64,
-    grad_accumulation_steps=4,
+    grad_accumulation_steps=32,
     num_iterations=2,
     log_every_n=1,
     eval_every_n=5,
@@ -179,7 +226,7 @@ def main():
     import wandb
 
     if os.getenv("RANK", "0") == "0":
-        wandb.init(project="parallel", name="qwen0.6b-4samplers-combiner")
+        wandb.init(project="parallel", name="qwen4b-1sampler-combiner")
 
     trainer.train()
 

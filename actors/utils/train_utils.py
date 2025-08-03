@@ -1,8 +1,11 @@
 import gc
 from typing import Any
 
+import pynvml
 import torch
 from torch import nn
+
+pynvml.nvmlInit()
 
 
 def disable_dropout_in_model(model: torch.nn.Module) -> None:
@@ -12,7 +15,7 @@ def disable_dropout_in_model(model: torch.nn.Module) -> None:
             module.p = 0
 
 
-def free_memory_if_needed(threshold: float = 0.85) -> bool:
+def free_memory_if_needed(threshold: float = 0.75) -> bool:
     """
     Flush CUDA cache and trigger Python/IPC GC only if GPU utilisation ≥ `threshold`.
 
@@ -26,8 +29,9 @@ def free_memory_if_needed(threshold: float = 0.85) -> bool:
     bool
         True if memory was freed, False if it was already under the threshold
     """
-
-    free_b, total_b = torch.cuda.mem_get_info(torch.cuda.current_device())
+    handle = pynvml.nvmlDeviceGetHandleByIndex(torch.cuda.current_device())
+    mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+    free_b, total_b = mem.free, mem.total
     used_ratio = (total_b - free_b) / total_b
 
     if used_ratio >= threshold:

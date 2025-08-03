@@ -205,7 +205,6 @@ class GRPOTrainer(BaseRLTrainer):
 
         old_lp: Sequence[Sequence[float]] | None = None
         ref_lp: Sequence[Sequence[float]] | None = None
-
         with _step_profiler.track("get_logps", actor_name=name):
             old_lp = (
                 self._get_logps(
@@ -255,16 +254,16 @@ class GRPOTrainer(BaseRLTrainer):
                     self.logger.normal(
                         colorize(f"🔄 Backwards for actor '{name}'", Palette.INFO)
                     )
-
+            grad_accumulation_steps = actor_obj.training_config.grad_accumulation_steps
             for adv_slice, id_slice, m_slice, old_slice, ref_slice in zip(
-                split_for_grad_accum(advantages, self.grad_accumulation_steps),
-                split_for_grad_accum(ids_list, self.grad_accumulation_steps),
-                split_for_grad_accum(mask_list, self.grad_accumulation_steps),
+                split_for_grad_accum(advantages, grad_accumulation_steps),
+                split_for_grad_accum(ids_list, grad_accumulation_steps),
+                split_for_grad_accum(mask_list, grad_accumulation_steps),
                 split_for_grad_accum(
-                    old_lp or [None] * len(ids_list), self.grad_accumulation_steps
+                    old_lp or [None] * len(ids_list), grad_accumulation_steps
                 ),
                 split_for_grad_accum(
-                    ref_lp or [None] * len(ids_list), self.grad_accumulation_steps
+                    ref_lp or [None] * len(ids_list), grad_accumulation_steps
                 ),
                 strict=False,
             ):
