@@ -8,7 +8,10 @@ import torch
 
 from actors.actors.base import TrainableLLMActor
 from actors.environments.env_base import Environment
-from actors.environments.types import ActorOutput, GroupedEnvironmentOutput
+from actors.environments.types import (
+    ActorOutput,
+    EnvironmentOutput,
+)
 from actors.trainers.base_trainer import (
     ActorTrainState,
     BaseRLTrainer,
@@ -36,21 +39,16 @@ def split_for_grad_accum(seq: Sequence[Any], steps: int) -> list[Sequence[Any]]:
 
 def default_advantage_calculator(
     rewards: list[float],
-    group_size: int,
     ended_in_eos: list[bool] | None = None,
     std_normalization: bool = True,
 ) -> list[float]:
-    out: list[float] = []
-    for i in range(0, len(rewards), group_size):
-        grp = rewards[i : i + group_size]
-        µ = sum(grp) / len(grp)
+    µ = sum(rewards) / len(rewards)
 
-        if std_normalization:
-            σ = (sum((x - µ) ** 2 for x in grp) / len(grp)) ** 0.5 + 1e-8
-            out.extend([(r - µ) / σ for r in grp])
-        else:
-            out.extend([r - µ for r in grp])
-    return out
+    if std_normalization:
+        σ = (sum((x - µ) ** 2 for x in rewards) / len(rewards)) ** 0.5 + 1e-8
+        return [(r - µ) / σ for r in rewards]
+    else:
+        return [r - µ for r in rewards]
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -81,7 +79,6 @@ class GRPOTrainer(BaseRLTrainer):
         self,
         actor_name: str,
         rewards: list[float],
-        group_size: int,
         ended_in_eos: list[bool] | None = None,
     ) -> list[float]:
         actor_obj = self.actor_objects[actor_name]
@@ -95,8 +92,6 @@ class GRPOTrainer(BaseRLTrainer):
 
                 kwargs = {"rewards": rewards}
 
-                if "group_size" in params:
-                    kwargs["group_size"] = group_size
                 if "ended_in_eos" in params and ended_in_eos is not None:
                     kwargs["ended_in_eos"] = ended_in_eos
 
@@ -107,32 +102,30 @@ class GRPOTrainer(BaseRLTrainer):
                     return advantage_calculator(rewards)
                 except:
                     try:
-                        return advantage_calculator(rewards, group_size)
+                        return advantage_calculator(rewards, ended_in_eos)
                     except:
                         return default_advantage_calculator(
-                            rewards, group_size, ended_in_eos, std_normalization
+                            rewards, ended_in_eos, std_normalization
                         )
         else:
             return default_advantage_calculator(
-                rewards, group_size, ended_in_eos, std_normalization
+                rewards, ended_in_eos, std_normalization
             )
 
-    def train_step(self, env_output: GroupedEnvironmentOutput) -> TrainingMetrics:
+    def train_step(self, env_output: EnvironmentOutput) -> TrainingMetrics:
         result = TrainingMetrics()
 
-        for actor_name, _ in env_output.groups.items():
-            if actor_name not in self.actors:
-                continue
+        for actor_name in self.actors:
+            actor_part = env_output.get_actor_output(actor_name=actor_name)
 
             ta = self.actors[actor_name]
 
-            flat_output = env_output.to_environment_output().actors[actor_name]
             completion_data = self._build_completion_data(
-                ta, flat_output, actor_name, is_eval=False
+                ta, actor_part, actor_name, is_eval=False
             )
             result.add_completion_data(actor_name, completion_data)
 
-            self._process_actor_step(actor_name, ta, flat_output, result)
+            self._process_actor_step(actor_name, ta, actor_part, result)
 
         return result
 
@@ -140,7 +133,7 @@ class GRPOTrainer(BaseRLTrainer):
         self,
         name: str,
         ta: ActorTrainState,
-        actor_output: ActorOutput,
+        actor_output: list[dict[str, ActorOutput]],
         result: TrainingMetrics,
     ) -> None:
         actor_obj = self.actor_objects[name]
@@ -155,13 +148,25 @@ class GRPOTrainer(BaseRLTrainer):
                 reload_optimizer=actor_obj.training_config.offload_optimizer,
                 reload_model=actor_obj.training_config.offload_model,
             )
-        total_rewards = actor_output.rewards
-        advantages = self._calculate_advantages(
-            name, total_rewards, self.group_size, actor_output.ended_in_eos
-        )
 
-        ids_list = actor_output.input_ids
-        mask_list = actor_output.attention_mask
+        flattened_actor_outputs = [
+            ao for group in actor_output for ao in group.values()
+        ]
+        advantage_groups = []
+        for ac_out in flattened_actor_outputs:
+            total_rewards = ac_out.rewards
+            advantages = self._calculate_advantages(
+                name, total_rewards, ac_out.ended_in_eos
+            )
+            advantage_groups.append(advantages)
+        advantages = [adv for group in advantage_groups for adv in group]
+        combined_actor_output = flattened_actor_outputs[0]
+        for ao in flattened_actor_outputs[1:]:
+            combined_actor_output += ao
+
+        ids_list = combined_actor_output.input_ids
+        mask_list = combined_actor_output.attention_mask
+        total_rewards = combined_actor_output.rewards
 
         assert (
             len(ids_list) == len(mask_list) == len(total_rewards) == len(advantages)
@@ -177,6 +182,26 @@ class GRPOTrainer(BaseRLTrainer):
             f"Actor '{name}' input_ids and attention_mask lengths mismatch: "
             f"ids={len(ids_list)}, mask={len(mask_list)}"
         )
+        # If the len of ids_list and all entries is not equal to the batch size, we make a warning.
+        if len(ids_list) != actor_obj.training_config.batch_size:
+            num_processes = self.accel.num_processes
+            if len(ids_list) % num_processes != 0:
+                # Closest divisible by num_processes
+                closest_divisible = (len(ids_list) // num_processes) * num_processes
+                self.logger.warning(
+                    f"Actor '{name}' has {len(ids_list)} input_ids, "
+                    f"which is not divisible by the number of processes ({num_processes}). "
+                    f"Using {closest_divisible} instead."
+                )
+                ids_list = ids_list[:closest_divisible]
+                mask_list = mask_list[:closest_divisible]
+                total_rewards = total_rewards[:closest_divisible]
+                advantages = advantages[:closest_divisible]
+            else:
+                self.logger.warning(
+                    f"Actor '{name}' has {len(ids_list)} input_ids, "
+                    f"but expected {actor_obj.training_config.batch_size}. We will scale the batch size."
+                )
 
         old_lp: Sequence[Sequence[float]] | None = None
         ref_lp: Sequence[Sequence[float]] | None = None
@@ -267,11 +292,11 @@ class GRPOTrainer(BaseRLTrainer):
                 result.add_actor_rewards(name, total_rewards)
 
                 # Add reward component statistics
-                if actor_output.reward_components:
+                if combined_actor_output.reward_components:
                     for (
                         comp_name,
                         comp_rewards,
-                    ) in actor_output.reward_components.items():
+                    ) in combined_actor_output.reward_components.items():
                         result.add_actor_reward_component(name, comp_name, comp_rewards)
 
             result.add_substep_metric(

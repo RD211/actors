@@ -9,13 +9,15 @@ from .collaborative_env import (
 )
 from .env_base import Environment
 from .masking import mask_turns_and_encode
+from .parallel_environment import (
+    CombinerActorConfig,
+    ParallelActorConfig,
+    ParallelEnvironment,
+)
 from .single_turn_env import RewardFunction, SingleTurnEnvironment
 from .types import (
     ActorOutput,
-    ActorOutputDict,
     EnvironmentOutput,
-    GroupedEnvironmentOutput,
-    RewardComponents,
 )
 
 __all__ = [
@@ -24,9 +26,6 @@ __all__ = [
     # Type definitions
     "EnvironmentOutput",
     "ActorOutput",
-    "RewardComponents",
-    "ActorOutputDict",
-    "GroupedEnvironmentOutput",
     # Single turn environment
     "SingleTurnEnvironment",
     "RewardFunction",
@@ -37,4 +36,8 @@ __all__ = [
     "sample_schedule",
     # Masking utility
     "mask_turns_and_encode",
+    # Parallel environment
+    "ParallelEnvironment",
+    "ParallelActorConfig",
+    "CombinerActorConfig",
 ]

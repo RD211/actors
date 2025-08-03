@@ -1,370 +1,300 @@
-"""
-Type definitions for environment outputs with support for multiple reward types.
-"""
-
 from __future__ import annotations
 
+import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+from transformers import PreTrainedTokenizerBase
+
+from actors.environments.masking import mask_turns_and_encode
 
 
+# ════════════════════════════════════════════════════════════════════════
+# Actor-level payload
+# ════════════════════════════════════════════════════════════════════════
 @dataclass
 class ActorOutput:
-    """
-    Type-safe output for a single actor from an environment step.
-
-    Attributes:
-        input_ids: List of token sequences for generated text
-        attention_mask: Attention masks corresponding to input_ids
-        rewards: Primary reward values (for backward compatibility)
-        reward_components: Optional dictionary of named reward components
-        ended_in_eos: Optional list indicating if each sequence ended with an EOS token. If not provided, it is assumed all sequences ended in EOS.
-        metadata: Optional metadata about the generation
-    """
-
     input_ids: list[list[int]]
     rewards: list[float]
+    reward_components: dict[str, list[float]]
     attention_mask: list[list[int]] | None = None
-    reward_components: dict[str, list[float]] | None = None
-    ended_in_eos: list[bool] = None
-    metadata: dict[str, Any] | None = field(default_factory=dict)
+    ended_in_eos: list[bool] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self):
-        """Validate that all lists have consistent lengths."""
-        if not self.attention_mask:
+    def __post_init__(self) -> None:
+        if self.attention_mask is None:
             self.attention_mask = [[1] * len(seq) for seq in self.input_ids]
-
-        lengths = [len(self.input_ids), len(self.attention_mask), len(self.rewards)]
-        if self.reward_components:
-            for _, values in self.reward_components.items():
-                lengths.append(len(values))
-
-        if not all(length == lengths[0] for length in lengths):
-            raise ValueError(
-                f"Inconsistent lengths in ActorOutput: "
-                f"input_ids={len(self.input_ids)}, attention_mask={len(self.attention_mask)}, "
-                f"rewards={len(self.rewards)}"
-                + (
-                    f", reward_components={[(name, len(values)) for name, values in self.reward_components.items()]}"
-                    if self.reward_components
-                    else ""
-                )
-            )
-        # verify that if ended_in_eos is provided, it matches the length of input_ids
-        if self.ended_in_eos is not None and len(self.ended_in_eos) != len(
-            self.input_ids
-        ):
-            raise ValueError(
-                f"ended_in_eos length {len(self.ended_in_eos)} does not match input_ids length {len(self.input_ids)}"
-            )
         if self.ended_in_eos is None:
             self.ended_in_eos = [True] * len(self.input_ids)
 
-        # We must also make sure that there is no empty sequence in input_ids or attention_mask
+        n = len(self.input_ids)
+        if (
+            n == 0
+            or len(self.attention_mask) != n
+            or len(self.rewards) != n
+            or len(self.ended_in_eos) != n
+        ):
+            raise ValueError("length mismatch")
         if any(len(seq) == 0 for seq in self.input_ids):
-            raise ValueError("input_ids contains an empty sequence")
-        if any(len(seq) == 0 for seq in self.attention_mask):
-            raise ValueError("attention_mask contains an empty sequence")
-
-    def get_total_reward(self, weights: dict[str, float] | None = None) -> list[float]:
-        """
-        Compute total reward as weighted sum of components.
-
-        Args:
-            weights: Dictionary mapping reward component names to weights.
-                    If None, uses only the primary rewards.
-
-        Returns:
-            List of total reward values
-        """
-        if weights is None or self.reward_components is None:
-            return self.rewards.copy()
-
-        total_rewards = []
-        for i in range(len(self.rewards)):
-            total = self.rewards[i]
-            for component_name, weight in weights.items():
-                if component_name in self.reward_components:
-                    total += weight * self.reward_components[component_name][i]
-            total_rewards.append(total)
-
-        return total_rewards
+            raise ValueError("empty sequence")
+        for v in self.reward_components.values():
+            if len(v) != n:
+                raise ValueError("reward component length mismatch")
 
     def get_reward_stats(self) -> dict[str, dict[str, float]]:
-        """
-        Get statistics for all reward types.
-
-        Returns:
-            Dictionary mapping reward names to their statistics (mean, std, min, max)
-        """
-
-        def compute_stats(values: list[float]) -> dict[str, float]:
-            if not values:
-                return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
-
-            tensor_vals = torch.tensor(values, dtype=torch.float32)
+        def stats(vals: list[float]) -> dict[str, float]:
+            t = torch.tensor(vals, dtype=torch.float32)
             return {
-                "mean": tensor_vals.mean().item(),
-                "std": tensor_vals.std(unbiased=False).item(),
-                "min": tensor_vals.min().item(),
-                "max": tensor_vals.max().item(),
+                "mean": t.mean().item(),
+                "std": t.std(unbiased=False).item(),
+                "min": t.min().item(),
+                "max": t.max().item(),
             }
 
-        stats = {"primary": compute_stats(self.rewards)}
+        out = {"primary": stats(self.rewards)}
+        out.update({k: stats(v) for k, v in self.reward_components.items()})
+        return out
 
-        if self.reward_components:
-            for name, values in self.reward_components.items():
-                stats[name] = compute_stats(values)
+    def __iadd__(self, other: ActorOutput) -> ActorOutput:
+        if not isinstance(other, ActorOutput):
+            raise ValueError("Can only merge with another ActorOutput")
 
-        return stats
+        prev_len = len(self.input_ids)
+        new_len = len(other.input_ids)
+
+        for k, v in self.reward_components.items():
+            if k not in other.reward_components:
+                v.extend([None] * new_len)
+
+        for k, v in other.reward_components.items():
+            if k in self.reward_components:
+                self.reward_components[k].extend(v)
+            else:
+                self.reward_components[k] = ([None] * prev_len) + list(v)
+
+        self.input_ids.extend(other.input_ids)
+        self.attention_mask.extend(other.attention_mask)
+        self.rewards.extend(other.rewards)
+        self.ended_in_eos.extend(other.ended_in_eos)
+
+        return self
 
 
+# ════════════════════════════════════════════════════════════════════════
+# Environment-level container
+# ════════════════════════════════════════════════════════════════════════
 @dataclass
 class EnvironmentOutput:
-    """
-    Type-safe output from an environment step containing outputs for all actors.
+    # problem_idx -> actor_name -> group_name -> ActorOutput
+    outputs: list[dict[str, dict[str, ActorOutput]]] = field(default_factory=list)
+    problems: list[dict[str, Any]] = field(default_factory=list)
 
-    Attributes:
-        actors: Dictionary mapping actor names to their outputs
-        global_metadata: Optional metadata about the environment step
-    """
+    def _ensure_problem_idx(self, idx: int) -> None:
+        while len(self.outputs) <= idx:
+            self.outputs.append(defaultdict(dict))
 
-    actors: dict[str, ActorOutput]
-    global_metadata: dict[str, Any] | None = field(default_factory=dict)
+    @staticmethod
+    def _to_list_floats(x: float | list[float]) -> list[float]:
+        return [float(x)] if not isinstance(x, list) else [float(v) for v in x]
 
-    def __post_init__(self):
-        """Validate that all actor outputs have consistent structure."""
+    @staticmethod
+    def _compile_patterns(rx: str | list[str] | None) -> list[re.Pattern]:
+        if rx is None:
+            return []
+        pats = [rx] if isinstance(rx, str) else list(rx)
+        return [re.compile(p) for p in pats]
 
-        # We need to check that all actors have the same lengths for input_ids, attention_mask, and rewards
-        if not self.actors:
-            raise ValueError("EnvironmentOutput must contain at least one actor output")
-        lengths = None
-        for actor_name, actor_output in self.actors.items():
-            if lengths is None:
-                lengths = {
-                    "input_ids": len(actor_output.input_ids),
-                    "attention_mask": len(actor_output.attention_mask),
-                    "rewards": len(actor_output.rewards),
-                }
-            elif (
-                len(actor_output.input_ids) != lengths["input_ids"]
-                or len(actor_output.attention_mask) != lengths["attention_mask"]
-                or len(actor_output.rewards) != lengths["rewards"]
-            ):
-                raise ValueError(
-                    f"Inconsistent lengths in actor '{actor_name}': "
-                    f"input_ids={len(actor_output.input_ids)}, "
-                    f"attention_mask={len(actor_output.attention_mask)}, "
-                    f"rewards={len(actor_output.rewards)}"
-                )
+    def _encode_text_with_mask(
+        self,
+        tok: PreTrainedTokenizerBase,
+        text: str,
+        mask_regex: str | list[str] | None = None,
+        mask_spans: list[tuple[int, int]] | None = None,
+    ) -> tuple[list[int], list[int]]:
+        enc = tok.encode_plus(
+            text, add_special_tokens=False, return_offsets_mapping=True
+        )
+        ids = enc["input_ids"]
+        offs = enc["offset_mapping"]
+        mask = [1] * len(ids)
+        for pat in self._compile_patterns(mask_regex):
+            for m in pat.finditer(text):
+                sc, ec = m.span()
+                for ti, (ts, te) in enumerate(offs):
+                    if ts < ec and te > sc:
+                        mask[ti] = 0
+        if mask_spans:
+            T = len(ids)
+            for s, e in mask_spans:
+                for ti in range(max(0, s), min(T, e)):
+                    mask[ti] = 0
+        return ids, mask
 
-    def to_dict(self) -> dict[str, dict[str, Any]]:
-        """
-        Convert to dictionary format for backward compatibility.
+    def add_entry(
+        self,
+        *,
+        problem_idx: int,
+        actor_name: str,
+        group_name: str,
+        tokenizer: PreTrainedTokenizerBase | None = None,
+        text: str | None = None,
+        input_ids: list[int] | None = None,
+        messages: list[dict[str, str]] | None = None,
+        rewards: float | list[float],
+        reward_components: dict[str, float | list[float]],
+        attention_mask: list[int] | None = None,
+        mask_non_actor_turns: bool = False,
+        mask_regex: str | list[str] | None = None,
+        mask_spans: list[tuple[int, int]] | None = None,
+        ended_in_eos: bool | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        opts = [text is not None, input_ids is not None, messages is not None]
+        if sum(opts) != 1:
+            raise ValueError("provide exactly one of text, input_ids, messages")
+        if (text is not None or messages is not None) and tokenizer is None:
+            raise ValueError("tokenizer required for text or messages")
 
-        Returns:
-            Dictionary in the format expected by the current trainer
-        """
-        result = {}
-        for actor_name, actor_output in self.actors.items():
-            result[actor_name] = {
-                "input_ids": actor_output.input_ids,
-                "attention_mask": actor_output.attention_mask,
-                "rewards": actor_output.rewards,
-            }
-            if actor_output.reward_components:
-                result[actor_name]["reward_components"] = actor_output.reward_components
-            if actor_output.metadata:
-                result[actor_name]["metadata"] = actor_output.metadata
+        # build ids / mask
+        if text is not None:
+            ids, loss_mask = self._encode_text_with_mask(
+                tokenizer, text, mask_regex, mask_spans
+            )
+        elif messages is not None:
+            ids, loss_mask = mask_turns_and_encode(
+                tokenizer, messages, mask_non_actor_turns
+            )
+        else:
+            ids = input_ids
+            loss_mask = attention_mask or [1] * len(ids)
 
+        if not ids:
+            raise ValueError("empty ids")
+        if len(ids) != len(loss_mask):
+            raise ValueError("ids mask length mismatch")
+
+        rewards_list = self._to_list_floats(rewards)
+        rc_norm = {k: self._to_list_floats(v) for k, v in reward_components.items()}
+
+        for v in rc_norm.values():
+            if len(v) != len(rewards_list):
+                raise ValueError("reward component length mismatch")
+
+        self._ensure_problem_idx(problem_idx)
+        new_ao = ActorOutput(
+            input_ids=[ids],
+            attention_mask=[loss_mask],
+            rewards=rewards_list,
+            reward_components=rc_norm,
+            ended_in_eos=[ended_in_eos if ended_in_eos is not None else True],
+            metadata=metadata or {},
+        )
+
+        problem_bucket = self.outputs[problem_idx]
+        actor_bucket = problem_bucket.setdefault(actor_name, {})
+        if group_name in actor_bucket:
+            actor_bucket[group_name] += new_ao
+        else:
+            actor_bucket[group_name] = new_ao
+
+    def get_actor_output(
+        self,
+        actor_name: str,
+        *,
+        problem_indices: list[int] | None = None,
+        groups: list[str] | None = None,
+    ) -> list[dict[str, ActorOutput]]:
+        result: list[dict[str, ActorOutput]] = []
+        for idx, pb in enumerate(self.outputs):
+            if problem_indices is not None and idx not in problem_indices:
+                continue
+            group_outs: dict[str, ActorOutput] = {}
+            if actor_name in pb:
+                for g, ao in pb[actor_name].items():
+                    if groups is None or g in groups:
+                        group_outs[g] = ao
+            result.append(group_outs)
         return result
 
-    @classmethod
-    def from_dict(cls, data: dict[str, dict[str, Any]]) -> EnvironmentOutput:
-        """
-        Create EnvironmentOutput from dictionary format.
+    def reward_stats(self, actor_name: str) -> dict[str, dict[str, float]]:
+        agg: dict[str, list[float]] = {}
+        prim: list[float] = []
+        for probs in self.get_actor_output(actor_name):
+            for ao in probs:
+                prim.extend(ao.rewards)
+                for k, v in ao.reward_components.items():
+                    agg.setdefault(k, []).extend(v)
 
-        Args:
-            data: Dictionary in the format returned by current environments
+        def stats(vals: list[float]) -> dict[str, float]:
+            if not vals:
+                return {"mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+            t = torch.tensor(vals, dtype=torch.float32)
+            return {
+                "mean": t.mean().item(),
+                "std": t.std(unbiased=False).item(),
+                "min": t.min().item(),
+                "max": t.max().item(),
+            }
 
-        Returns:
-            EnvironmentOutput instance
-        """
-        actors = {}
-        for actor_name, actor_data in data.items():
-            # Extract required fields
-            input_ids = actor_data["input_ids"]
-            attention_mask = actor_data["attention_mask"]
-            rewards = actor_data["rewards"]
+        out = {"primary": stats(prim)}
+        out.update({k: stats(v) for k, v in agg.items()})
+        return out
 
-            # Extract optional fields
-            reward_components = actor_data.get("reward_components")
-            metadata = actor_data.get("metadata", {})
+    # merge in-place
+    def __iadd__(self, other: EnvironmentOutput) -> EnvironmentOutput:
+        for p_idx, pb in enumerate(other.outputs):
+            self._ensure_problem_idx(p_idx)
+            for actor, gb in pb.items():
+                for grp, ao in gb.items():
+                    bucket = self.outputs[p_idx][actor]
+                    if grp in bucket:
+                        bucket[grp] += ao
+                    else:
+                        bucket[grp] = ao
+        self.problems.extend(other.problems)
+        return self
 
-            actors[actor_name] = ActorOutput(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                rewards=rewards,
-                reward_components=reward_components,
-                metadata=metadata,
-            )
+    # out-of-place +
+    def __add__(self, other: EnvironmentOutput) -> EnvironmentOutput:
+        merged = EnvironmentOutput()
+        merged += self
+        merged += other
+        return merged
 
-        return cls(actors=actors)
+    @staticmethod
+    def combine_and_group(
+        env_outputs: list[EnvironmentOutput],
+        problem_groups: list[int],
+        problems: list[dict[str, Any]],
+    ) -> EnvironmentOutput:
+        pre_combined_out = EnvironmentOutput()
+        for eo in env_outputs:
+            pre_combined_out += eo
 
-
-@dataclass
-class GroupedEnvironmentOutput:
-    """
-    Environment output organized by problems and groups.
-
-    This organizes the outputs by problems (unique inputs) and groups (multiple generations per problem).
-
-    Attributes:
-        problems: List of unique problem inputs
-        groups: Dictionary mapping actor names to their grouped outputs
-                Format: {actor_name: [[group1_for_problem1], [group2_for_problem1], ...]}
-        group_size: Number of generations per problem
-    """
-
-    problems: list[dict[str, Any]]
-    groups: dict[str, list[list[ActorOutput]]]
-    group_size: int
-
-    @classmethod
-    def from_environment_output(
-        cls,
-        env_output: EnvironmentOutput,
-        original_batch: list[dict[str, Any]],
-        group_size: int,
-    ) -> GroupedEnvironmentOutput:
-        """
-        Create GroupedEnvironmentOutput from regular EnvironmentOutput.
-
-        Args:
-            env_output: Original environment output
-            original_batch: The original problems before group expansion
-            group_size: Number of generations per problem
-        """
-        problems = original_batch
-        groups = {}
-
-        for actor_name, actor_output in env_output.actors.items():
-            actor_groups = []
-
-            # Reshape the flat actor output into groups
-            total_outputs = len(actor_output.input_ids)
-            num_problems = total_outputs // group_size
-
-            for problem_idx in range(num_problems):
-                group_outputs = []
-                for group_idx in range(group_size):
-                    flat_idx = problem_idx * group_size + group_idx
-                    if flat_idx < total_outputs:
-                        group_output = ActorOutput(
-                            input_ids=[actor_output.input_ids[flat_idx]],
-                            attention_mask=[actor_output.attention_mask[flat_idx]],
-                            rewards=[actor_output.rewards[flat_idx]],
-                            reward_components=(
-                                {
-                                    comp_name: [comp_values[flat_idx]]
-                                    for comp_name, comp_values in actor_output.reward_components.items()
-                                }
-                                if actor_output.reward_components
-                                else None
-                            ),
-                            ended_in_eos=(
-                                [actor_output.ended_in_eos[flat_idx]]
-                                if actor_output.ended_in_eos
-                                else None
-                            ),
+        # We now have a single EnvironmentOutput with all problems.
+        # We need to group them by problem_groups.
+        combined_out = EnvironmentOutput()
+        for problem_idx, problem_out in enumerate(pre_combined_out.outputs):
+            corresponding_group = problem_groups[problem_idx]
+            for actor_name, group_outs in problem_out.items():
+                for group_name, actor_output in group_outs.items():
+                    for i in range(len(actor_output.input_ids)):
+                        combined_out.add_entry(
+                            problem_idx=corresponding_group,
+                            actor_name=actor_name,
+                            group_name=group_name,
+                            input_ids=actor_output.input_ids[i],
+                            attention_mask=actor_output.attention_mask[i],
+                            rewards=actor_output.rewards[i],
+                            reward_components={
+                                k: v[i]
+                                for k, v in actor_output.reward_components.items()
+                            },
+                            ended_in_eos=actor_output.ended_in_eos[i],
                             metadata=actor_output.metadata,
                         )
-                        group_outputs.append(group_output)
-
-                actor_groups.append(group_outputs)
-
-            groups[actor_name] = actor_groups
-
-        return cls(
-            problems=problems,
-            groups=groups,
-            group_size=group_size,
-        )
-
-    def to_environment_output(self) -> EnvironmentOutput:
-        """Convert back to regular EnvironmentOutput by flattening groups."""
-        actors = {}
-
-        for actor_name, actor_groups in self.groups.items():
-            # Flatten the grouped outputs back to a single actor output
-            all_input_ids = []
-            all_attention_mask = []
-            all_rewards = []
-            all_reward_components = {}
-            all_ended_in_eos = []
-
-            for problem_groups in actor_groups:
-                for group_output in problem_groups:
-                    all_input_ids.extend(group_output.input_ids)
-                    all_attention_mask.extend(group_output.attention_mask)
-                    all_rewards.extend(group_output.rewards)
-                    all_ended_in_eos.extend(
-                        group_output.ended_in_eos
-                        or [True] * len(group_output.input_ids)
-                    )
-
-                    if group_output.reward_components:
-                        for (
-                            comp_name,
-                            comp_values,
-                        ) in group_output.reward_components.items():
-                            if comp_name not in all_reward_components:
-                                all_reward_components[comp_name] = []
-                            all_reward_components[comp_name].extend(comp_values)
-
-            actors[actor_name] = ActorOutput(
-                input_ids=all_input_ids,
-                attention_mask=all_attention_mask,
-                rewards=all_rewards,
-                reward_components=(
-                    all_reward_components if all_reward_components else None
-                ),
-                ended_in_eos=all_ended_in_eos,
-                metadata={},
-            )
-
-        return EnvironmentOutput(actors=actors)
-
-    def __add__(self, other: GroupedEnvironmentOutput) -> GroupedEnvironmentOutput:
-        if self.group_size != other.group_size:
-            raise ValueError(
-                f"Cannot add GroupedEnvironmentOutput with different group sizes: "
-                f"{self.group_size} != {other.group_size}"
-            )
-
-        if set(self.groups.keys()) != set(other.groups.keys()):
-            raise ValueError(
-                "Cannot add GroupedEnvironmentOutput with different actor sets: "
-                f"{set(self.groups.keys())} != {set(other.groups.keys())}"
-            )
-
-        combined_problems = self.problems + other.problems
-        combined_groups = {}
-
-        for actor_name in self.groups:
-            combined_groups[actor_name] = (
-                self.groups[actor_name] + other.groups[actor_name]
-            )
-
-        return GroupedEnvironmentOutput(
-            problems=combined_problems,
-            groups=combined_groups,
-            group_size=self.group_size,
-        )
-
-
-# Type aliases for convenience
-RewardComponents = dict[str, list[float]]
-ActorOutputDict = dict[str, ActorOutput]
+            if corresponding_group >= len(combined_out.problems):
+                combined_out.problems.append(problems[corresponding_group])
+        return combined_out

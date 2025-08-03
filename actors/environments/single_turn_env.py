@@ -9,7 +9,7 @@ from vllm import SamplingParams
 
 from actors.actors.base import TrainableLLMActor
 from actors.environments.env_base import Environment
-from actors.environments.types import ActorOutput, EnvironmentOutput
+from actors.environments.types import EnvironmentOutput
 from actors.rewards import RewardFunction
 
 
@@ -26,10 +26,7 @@ class SingleTurnEnvironment(Environment):
             HFDataset | DatasetDict | dict[str, HFDataset | DatasetDict] | None
         ) = None,
     ):
-        super().__init__(
-            train_data=train_data,
-            eval_data=eval_data,
-        )
+        super().__init__(train_data=train_data, eval_data=eval_data)
 
         if not reward_functions:
             raise ValueError("At least one reward function must be provided")
@@ -38,10 +35,7 @@ class SingleTurnEnvironment(Environment):
         self.tokenizer = self.actor.training_config.tokenizer_factory()
         self.prompt_column = prompt_column
         self.mask_prompt_for_loss = mask_prompt_for_loss
-
-        # Set actor.loss_temp to sampling_params.temperature
         self.actor.training_config.loss_temp = sampling_params.temperature
-
         self.sampling_params = sampling_params
 
         self.reward_functions: list[RewardFunction] = []
@@ -49,105 +43,69 @@ class SingleTurnEnvironment(Environment):
             if isinstance(rf, RewardFunction):
                 self.reward_functions.append(rf)
             elif callable(rf):
-                func_name = rf.__name__ if hasattr(rf, "__name__") else "reward_func"
+                name = getattr(rf, "__name__", "reward")
                 self.reward_functions.append(
-                    RewardFunction(name=func_name, weight=1.0, func=rf)
+                    RewardFunction(name=name, weight=1.0, func=rf)
                 )
             else:
-                raise ValueError(
-                    f"Reward function must be RewardFunction or callable, "
-                    f"got {type(rf)}"
-                )
+                raise ValueError(f"Unsupported reward function type: {type(rf)}")
 
-        names = [rf.name for rf in self.reward_functions]
+        names = [r.name for r in self.reward_functions]
         if len(names) != len(set(names)):
-            raise ValueError(f"Reward function names must be unique, got: {names}")
+            raise ValueError(f"Reward function names must be unique: {names}")
 
     async def generate(self, batch: dict[str, Any]) -> EnvironmentOutput:
+        prompts: list[str] = batch[self.prompt_column]
+
         self.actor.wake()
+        gens = await self.actor.agenerate(prompts, self.sampling_params)
+        completions = [g.outputs[0].text for g in gens]
+        self.actor.sleep()
 
-        prompts = batch[self.prompt_column]
-        generations = await self.actor.agenerate(
-            prompts, sampling_params=self.sampling_params
-        )
+        env_out = EnvironmentOutput()
 
-        completions = [gen.outputs[0].text for gen in generations]
-
-        generated_texts = []
-        for prompt, completion in zip(prompts, completions, strict=False):
-            generated_texts.append(prompt + completion)
-
-        input_ids_list = []
-        attention_mask_list = []
-
-        for text in generated_texts:
-            tokenized = self.tokenizer(
-                text, return_tensors="pt", padding=False, truncation=False
-            )
-            input_ids_list.append(tokenized.input_ids.squeeze(0).tolist())
-            attention_mask_list.append(tokenized.attention_mask.squeeze(0).tolist())
-
-        if self.mask_prompt_for_loss:
-            modified_attention_mask_list = []
-
-            for i, prompt in enumerate(prompts):
-                prompt_tokens = (
-                    self.tokenizer(
-                        prompt, return_tensors="pt", padding=False, truncation=False
-                    )
-                    .input_ids.squeeze(0)
-                    .tolist()
-                )
-
-                prompt_length = len(prompt_tokens)
-                current_mask = attention_mask_list[i].copy()
-
-                for j in range(len(current_mask)):
-                    if j < prompt_length and current_mask[j] == 1:
-                        current_mask[j] = 0
-
-                modified_attention_mask_list.append(current_mask)
-
-            attention_mask_list = modified_attention_mask_list
-
-        rewards_by_function = {}
-        total_rewards = []
-
-        for i, (prompt, completion) in enumerate(
+        for idx, (prompt, completion) in enumerate(
             zip(prompts, completions, strict=False)
         ):
-            entry_rewards = {}
-            total_reward = 0.0
+            full_text = prompt + completion
 
-            for reward_func in self.reward_functions:
-                reward_value = reward_func.compute_reward(
+            enc = self.tokenizer(
+                full_text, return_tensors="pt", add_special_tokens=False
+            )
+            ids = enc.input_ids.squeeze(0).tolist()
+            mask = enc.attention_mask.squeeze(0).tolist()
+
+            if self.mask_prompt_for_loss:
+                prompt_ids_len = len(
+                    self.tokenizer(prompt, add_special_tokens=False).input_ids
+                )
+                for j in range(prompt_ids_len):
+                    mask[j] = 0
+
+            reward_components: dict[str, float] = {}
+            total_reward = 0.0
+            for rf in self.reward_functions:
+                val = rf.compute_reward(
                     prompt=prompt,
                     completion=completion,
                     actor_name=self.actor.name,
                     **{
-                        k: v[i]
+                        k: v[idx]
                         for k, v in batch.items()
-                        if k != self.prompt_column and type(v) is list
+                        if k != self.prompt_column and isinstance(v, list)
                     },
                 )
+                reward_components[rf.name] = val
+                total_reward += rf.weight * val
 
-                entry_rewards[reward_func.name] = reward_value
-                total_reward += reward_func.weight * reward_value
+            env_out.add_entry(
+                problem_idx=idx,
+                actor_name=self.actor.name,
+                group_name="completion",
+                input_ids=ids,
+                attention_mask=mask,
+                rewards=total_reward,
+                reward_components=reward_components,
+            )
 
-            for name, value in entry_rewards.items():
-                if name not in rewards_by_function:
-                    rewards_by_function[name] = []
-                rewards_by_function[name].append(value)
-
-            total_rewards.append(total_reward)
-
-        actor_output = ActorOutput(
-            input_ids=input_ids_list,
-            attention_mask=attention_mask_list,
-            rewards=total_rewards,
-            reward_components=rewards_by_function,
-        )
-
-        return EnvironmentOutput(
-            actors={self.actor.name: actor_output},
-        )
+        return env_out
