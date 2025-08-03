@@ -102,7 +102,7 @@ We plan to have the following environments; suggestions for new environments are
 | ---------------------- | --------------------------------- | :----: | -------------------------------------------------------------------------------------------------------------------------- |
 | Single Trainable Agent | **SingleTurnEnvironment**         |    ✅   | Standard environment with only one actor and one turn.                                                                     |
 | Multi Trainable Agent  | **CollaborativeEnvironment**      |    ✅   | Iterates on a task together in alternating turns.                                                                          |
-| Multi Trainable Agent  | **ParallelEnvironment**           |    ⏳   | Samples multiple solutions in parallel and combines them at the end. This is probably what Grok 4 Heavy does.              |
+| Multi Trainable Agent  | **ParallelEnvironment**           |    ✅   | Samples multiple solutions in parallel and combines them at the end. This is probably a simplified version of what Grok 4 Heavy does.              |
 | Fun Environments       | **JailbreakEnvironment**          |    ⏳   | One trainable actor tries to convince a frozen actor to do unsafe things from this [dataset](rl-actors/Jailbreak-dataset). |
 | Fun Environments       | **CodeforcesParallelEnvironment** |    ⏳   | Same as the parallel environment but with code execution feedback.                                                         |
 

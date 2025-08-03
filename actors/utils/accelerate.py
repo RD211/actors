@@ -18,7 +18,12 @@ def free_port() -> str:
 
 @functools.lru_cache(maxsize=1)
 def init_distributed_one_gpu(backend: str = "nccl") -> None:
-    if not dist.is_available() or dist.is_initialized():
+    if (
+        not dist.is_available()
+        or dist.is_initialized()
+        or os.environ.get("RANK") is not None
+        or os.environ.get("WORLD_SIZE") is not None
+    ):
         return False
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("LOCAL_RANK", "0")
