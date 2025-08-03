@@ -3,10 +3,9 @@ import shutil
 import tempfile
 import time
 import warnings
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from functools import reduce
-from operator import add
 from typing import Any
 
 import deepspeed
@@ -18,7 +17,10 @@ from transformers import PreTrainedTokenizerBase
 
 from actors.actors.base import TrainableLLMActor
 from actors.environments.env_base import Environment
-from actors.environments.types import ActorOutput, GroupedEnvironmentOutput
+from actors.environments.types import (
+    ActorOutput,
+    EnvironmentOutput,
+)
 from actors.trainers.base_config import (
     ActorTrainState,
     EvalStrategy,
@@ -252,11 +254,23 @@ class BaseRLTrainer:
             actor = trainable_actors[name]
             cfg = self.ds_plugins[name].deepspeed_config
             cfg["max_grad_norm"] = actor.training_config.max_grad_norm
-            cfg["train_batch_size"] = self.cfg.batch_size
-            cfg["gradient_accumulation_steps"] = self.cfg.grad_accumulation_steps
-            cfg["train_micro_batch_size_per_gpu"] = (
+            cfg["train_batch_size"] = (
                 self.cfg.batch_size
-                // self.cfg.grad_accumulation_steps
+                if actor.training_config.batch_size is None
+                else actor.training_config.batch_size
+            )
+            actor.training_config.batch_size = cfg["train_batch_size"]
+            cfg["gradient_accumulation_steps"] = (
+                self.cfg.grad_accumulation_steps
+                if actor.training_config.grad_accumulation_steps is None
+                else actor.training_config.grad_accumulation_steps
+            )
+            actor.training_config.grad_accumulation_steps = cfg[
+                "gradient_accumulation_steps"
+            ]
+            cfg["train_micro_batch_size_per_gpu"] = (
+                cfg["train_batch_size"]
+                // cfg["gradient_accumulation_steps"]
                 // torch.cuda.device_count()
             )
             cfg["zero_optimization"]["stage3_gather_16bit_weights_on_model_save"] = True
@@ -567,12 +581,6 @@ class BaseRLTrainer:
                         group_size=self.group_size,
                         accelerator=self.accel,
                     )
-                    # We combine the env_output from all local_main_processes.
-                    env_output = self.accel.gather_for_metrics([env_output])
-                    # We remove Nones.
-                    env_output = [eo for eo in env_output if eo is not None]
-                    env_output = reduce(add, env_output)
-
                     # We sleep all trainable actors.
                     for actor_name, _ in self.actors.items():
                         actor_obj = self.actor_objects[actor_name]
@@ -698,8 +706,8 @@ class BaseRLTrainer:
             if self.accel.is_main_process:
                 self.logger.quiet(colorize("💾 Models saved", Palette.VERB))
 
-    def train_step(self, env_output: GroupedEnvironmentOutput) -> TrainingMetrics:
-        """Train step that takes GroupedEnvironmentOutput directly."""
+    def train_step(self, env_output: EnvironmentOutput) -> TrainingMetrics:
+        """Train step that takes EnvironmentOutput directly."""
         raise NotImplementedError("train_step must be implemented in subclasses.")
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -717,18 +725,7 @@ class BaseRLTrainer:
         eval_outputs = None
         if self.accel.is_local_main_process:
             eval_outputs = self.env.eval(group_size=1)
-        # gather
-        eval_outputs = self.accel.gather_for_metrics([eval_outputs])
-        # Remove Nones
-        eval_outputs = [eo for eo in eval_outputs if eo is not None]
-        new_eval_outputs = {}
-        for eo in eval_outputs:
-            for eval_name, output in eo.items():
-                if eval_name not in new_eval_outputs:
-                    new_eval_outputs[eval_name] = output
-                else:
-                    new_eval_outputs[eval_name].extend(output)
-        eval_outputs = new_eval_outputs
+
         all_eval_metrics = {}
         self.accel.wait_for_everyone()
         for eval_name, env_output in eval_outputs.items():
@@ -741,33 +738,34 @@ class BaseRLTrainer:
 
         return all_eval_metrics
 
-    def eval_step(self, env_output: GroupedEnvironmentOutput) -> EvaluationMetrics:
+    def eval_step(self, env_output: EnvironmentOutput) -> EvaluationMetrics:
         """Generic eval step implementation."""
         result = EvaluationMetrics()
 
-        flat_output = env_output.to_environment_output()
-
-        for actor_name, actor_output in flat_output.actors.items():
-            if actor_name not in self.actors:
-                continue
+        for actor_name in self.actors:
+            actor_part = env_output.get_actor_output(actor_name=actor_name)
 
             ta = self.actors[actor_name]
 
-            metrics = self._compute_actor_eval_metrics(actor_output)
+            metrics = self._compute_actor_eval_metrics(actor_part)
             result.add_actor_metrics(actor_name, metrics)
 
             completion_data = self._build_completion_data(
-                ta, actor_output, actor_name, is_eval=True
+                ta, actor_part, actor_name, is_eval=True
             )
             result.add_completion_data(actor_name, completion_data)
 
         return result
 
     def _compute_actor_eval_metrics(
-        self, actor_output: "ActorOutput"
+        self, actor_output: list[dict[str, ActorOutput]]
     ) -> dict[str, float]:
         """Compute evaluation metrics for an actor output."""
-        rewards = actor_output.rewards
+        actor_outputs = [out for mapping in actor_output for out in mapping.values()]
+        combined_actor = actor_outputs[0]
+        for ac_out in actor_outputs[1:]:
+            combined_actor += ac_out
+        rewards = combined_actor.rewards
         reward_mean = sum(rewards) / len(rewards) if rewards else 0.0
         reward_std = (
             (sum((r - reward_mean) ** 2 for r in rewards) / len(rewards)) ** 0.5
@@ -775,7 +773,7 @@ class BaseRLTrainer:
             else 0.0
         )
 
-        completion_lens = [len(ids) for ids in actor_output.input_ids]
+        completion_lens = [len(ids) for ids in combined_actor.input_ids]
         completion_len_mean = (
             sum(completion_lens) / len(completion_lens) if completion_lens else 0.0
         )
@@ -786,8 +784,8 @@ class BaseRLTrainer:
             "completion_len_mean": completion_len_mean,
         }
 
-        if actor_output.reward_components:
-            for comp_name, comp_rewards in actor_output.reward_components.items():
+        if combined_actor.reward_components:
+            for comp_name, comp_rewards in combined_actor.reward_components.items():
                 filtered_comp_rewards = [r for r in comp_rewards if r is not None]
                 comp_mean = (
                     sum(filtered_comp_rewards) / len(filtered_comp_rewards)
@@ -811,36 +809,60 @@ class BaseRLTrainer:
     def _build_completion_data(
         self,
         ta: ActorTrainState,
-        actor_output: "ActorOutput",
+        actor_output: list[dict[str, ActorOutput]],
         actor_name: str,
         is_eval: bool = False,
     ) -> dict[str, list[Any]]:
-        """Build completion data for logging. Works for both training and eval."""
-        data = {}
+        data: dict[str, list[Any]] = defaultdict(list)
 
-        data["completion"] = [
-            ta.tokenizer.decode(completion_ids, skip_special_tokens=False)
-            for completion_ids in actor_output.input_ids
-        ]
+        for mapping in actor_output:  # every micro-batch
+            if not isinstance(mapping, dict):
+                raise TypeError(
+                    "Each element of `actor_output` must be a dict[str, ActorOutput]"
+                )
 
-        data["total_reward"] = actor_output.rewards
+            for group_name, out in mapping.items():  # every inner group
+                n = len(out.input_ids)  # same length for all fields
 
-        # Add advantages only for training
-        if not is_eval and hasattr(self, "_calculate_advantages"):
-            advantages = self._calculate_advantages(
-                actor_name,
-                actor_output.rewards,
-                self.group_size,
-                actor_output.ended_in_eos,
-            )
-            data["advantage"] = advantages
+                # ---------------- common column ----------------------------------------
+                data["inner_group_type"].extend([group_name] * n)
 
-        # Add reward components if available
-        if actor_output.reward_components:
-            for comp_name, comp_values in actor_output.reward_components.items():
-                data[comp_name] = comp_values
+                # ---------------- decoded completions ----------------------------------
+                data["completion"].extend(
+                    ta.tokenizer.decode(ids, skip_special_tokens=False)
+                    for ids in out.input_ids
+                )
 
-        return data
+                # ---------------- total reward -----------------------------------------
+                data["total_reward"].extend(out.rewards)
+
+                # ---------------- advantages (training only) ---------------------------
+                if not is_eval and hasattr(self, "_calculate_advantages"):
+                    data["advantage"].extend(
+                        self._calculate_advantages(
+                            actor_name,
+                            out.rewards,
+                            out.ended_in_eos,
+                        )
+                    )
+
+                # ---------------- individual reward components -------------------------
+                desired_len = len(data["inner_group_type"]) - n
+                if out.reward_components:
+                    for comp_name, comp_vals in out.reward_components.items():
+                        if data[comp_name] and len(data[comp_name]) != desired_len:
+                            data[comp_name].extend(
+                                [None] * (desired_len - len(data[comp_name]))
+                            )
+                        if not data[comp_name] and desired_len > 0:
+                            data[comp_name] = [None] * desired_len
+                        data[comp_name].extend(comp_vals)
+        desired_len = len(data["inner_group_type"])
+        for key, values in data.items():
+            if len(values) != desired_len:
+                # Fill with None if the length is not as expected
+                data[key].extend([None] * (desired_len - len(values)))
+        return dict(data)
 
     # ═══════════════════════════════════════════════════════════════════════
     # Checkpointing & Uploading methods
@@ -1194,6 +1216,8 @@ class BaseRLTrainer:
                     return
 
             columns = list(data.keys())
+            # We remove all columns that start with _
+            columns = [col for col in columns if not col.startswith("_")]
             table = wandb.Table(columns=columns)
 
             for i in range(data_length):
@@ -1316,7 +1340,7 @@ class BaseRLTrainer:
         self,
         eval_name: str,
         metrics: "EvaluationMetrics",
-        env_output: GroupedEnvironmentOutput,
+        env_output: EnvironmentOutput,
         is_final: bool = False,
     ):
         if self.accel.is_main_process:
@@ -1359,6 +1383,7 @@ class BaseRLTrainer:
                     enhanced_completion_data.update(completion_data)
 
                     columns = list(enhanced_completion_data.keys())
+                    columns = [col for col in columns if not col.startswith("_")]
                     table = wandb.Table(columns=columns)
 
                     data_length = len(next(iter(enhanced_completion_data.values())))

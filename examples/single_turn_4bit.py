@@ -161,6 +161,9 @@ def main():
     env = SingleTurnEnvironment(
         actor=actor,
         train_data=ds,
+        eval_data={
+            "test1": ds["test"],
+        },
         reward_functions=[reward, strict_format_reward_func, count_xml],
         sampling_params=SamplingParams(
             temperature=1.0,
@@ -177,8 +180,8 @@ def main():
         grad_accumulation_steps=1,
         num_iterations=2,
         log_every_n=1,
-        eval_every_n=None,  # No periodic evaluation
-        eval_strategy=EvalStrategy.NONE,  # No evaluation
+        eval_every_n=5,  # No periodic evaluation
+        eval_strategy=EvalStrategy.STEPS,  # No evaluation
         checkpoint_every_n=30,
         save_strategy=SaveStrategy.ALL,
     )

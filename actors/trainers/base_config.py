@@ -92,6 +92,8 @@ class ActorTrainCfg:
     learning_rate: float = 1e-6
     max_grad_norm: float = 0.1
     gradient_checkpointing: bool = True
+    batch_size: int | None = None  # None means use the normal batch size from trainer.
+    grad_accumulation_steps: int | None = None
     reference_batch_size: int = -1  # -1 is full batch size
 
     # Advantage calculation and normalization
@@ -139,6 +141,9 @@ class ActorTrainCfg:
     offload_optimizer: bool = True
     offload_model: bool = True
 
+    # Other
+    attn_implementation: str | None = None
+
     def __init__(
         self,
         *,
@@ -146,6 +151,9 @@ class ActorTrainCfg:
         learning_rate: float = 1e-6,
         max_grad_norm: float = 1.0,
         gradient_checkpointing: bool = True,
+        batch_size: int
+        | None = None,  # None means use the normal batch size from trainer.
+        grad_accumulation_steps: int | None = None,
         reference_batch_size: int = -1,
         # Advantage calculation and normalization
         advantage_calculator: Callable[..., list[float]] | None = None,
@@ -163,6 +171,7 @@ class ActorTrainCfg:
         loss_kwargs: dict[str, Any] | None = None,
         scheduler: str | type | Callable | None = "cosine",
         scheduler_kwargs: dict[str, Any] | None = None,
+        attn_implementation: str | None = None,  # e.g. "flash_attention_2"
         # Factory functions
         model_factory: Callable[[], nn.Module] | None = None,
         tokenizer_factory: Callable[[], PreTrainedTokenizer] | None = None,
@@ -182,6 +191,8 @@ class ActorTrainCfg:
             learning_rate: Learning rate for training
             max_grad_norm: Maximum gradient norm for clipping
             gradient_checkpointing: Whether to use gradient checkpointing
+            batch_size: Batch size for training (None means use trainer's batch size)
+            grad_accumulation_steps: Number of gradient accumulation steps
             reference_batch_size: Batch size for reference model inference
             advantage_calculator: Optional function to calculate advantages
             std_normalization: Whether to apply standard normalization
@@ -196,6 +207,7 @@ class ActorTrainCfg:
             loss_kwargs: Additional arguments for loss
             scheduler: Scheduler class, string name, or factory function
             scheduler_kwargs: Additional arguments for scheduler
+            attn_implementation: Attention implementation to use (e.g. "flash_attention_2")
             model_factory: Factory function to create the model
             tokenizer_factory: Factory function to create the tokenizer
             reference_model_factory: Factory function to create reference model
@@ -215,6 +227,8 @@ class ActorTrainCfg:
         self.learning_rate = learning_rate
         self.max_grad_norm = max_grad_norm
         self.gradient_checkpointing = gradient_checkpointing
+        self.batch_size = batch_size
+        self.grad_accumulation_steps = grad_accumulation_steps
         self.reference_batch_size = reference_batch_size
         self.advantage_calculator = advantage_calculator
         self.std_normalization = std_normalization
@@ -227,6 +241,7 @@ class ActorTrainCfg:
         self.offload_optimizer = offload_optimizer
         self.offload_model = offload_model
         self.update_weights_batch_size = update_weights_batch_size
+        self.attn_implementation = attn_implementation
 
         # Set factories if provided, otherwise keep the dataclass defaults
         if model_factory is not None:
@@ -289,6 +304,14 @@ class ActorTrainCfg:
                 "trust_remote_code": True,
                 "torch_dtype": torch.bfloat16,
             }
+            from transformers.utils import is_flash_attn_2_available
+
+            if (
+                is_flash_attn_2_available()
+                and self.attn_implementation == "flash_attention_2"
+                or self.attn_implementation is None
+            ):
+                default_kwargs["attn_implementation"] = "flash_attention_2"
             merged_kwargs = {**default_kwargs, **self.model_kwargs}
 
             # Add quantization config if provided

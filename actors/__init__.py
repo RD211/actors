@@ -3,15 +3,16 @@ __version__ = "0.1.1"
 from .actors import LLMActor, OpenAIActor, TrainableLLMActor, vLLMActor
 from .environments import (
     ActorOutput,
-    ActorOutputDict,
     CollaborativeActorConfig,
     CollaborativeEnvironment,
+    CombinerActorConfig,
     Environment,
     EnvironmentOutput,
-    GroupedEnvironmentOutput,
-    RewardComponents,
+    ParallelActorConfig,
+    ParallelEnvironment,
     RewardFunction,
     SingleTurnEnvironment,
+    mask_turns_and_encode,
 )
 from .rewards import conversation_reward_function, reward_function
 from .trainers import (
@@ -49,10 +50,12 @@ __all__ = [
     "CollaborativeEnvironment",
     "CollaborativeActorConfig",
     "RewardFunction",
+    "ParallelEnvironment",
+    "ParallelActorConfig",
+    "CombinerActorConfig",
     # Types
     "ActorOutput",
-    "ActorOutputDict",
     "EnvironmentOutput",
-    "GroupedEnvironmentOutput",
-    "RewardComponents",
+    # Utility functions
+    "mask_turns_and_encode",
 ]

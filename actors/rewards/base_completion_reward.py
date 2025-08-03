@@ -71,7 +71,7 @@ class RewardFunction:
         if not self.batched:
             if not (len(prompts) == len(completions) == len(actor_names)):
                 raise ValueError(
-                    "prompts, completions, and actor_names must have equal length"
+                    f"prompts, completions, and actor_names must have equal length; got {len(prompts)}, {len(completions)}, {len(actor_names)}"
                 )
             return [
                 self.compute_reward(

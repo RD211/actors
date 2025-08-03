@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import random
 from typing import Any
 
 import torch
 from datasets import Dataset as HFDataset
-from datasets import DatasetDict
+from datasets import DatasetDict, concatenate_datasets
 from torch.utils.data import DataLoader, RandomSampler
 
-from actors.environments.types import EnvironmentOutput, GroupedEnvironmentOutput
+from actors.environments.types import EnvironmentOutput
 
 
 class Environment(abc.ABC):
@@ -183,11 +184,16 @@ class Environment(abc.ABC):
     def expand_batch_for_groups(
         self, batch: dict[str, list[Any]], group_size: int
     ) -> dict[str, list[Any]]:
-        """Expand a batch by duplicating each item group_size times."""
+        """
+        Expand a batch by duplicating each item group_size times.
+
+        Also adds identifier for the group to each item.
+        """
         if not isinstance(batch, dict):
             raise ValueError("batch must be a dictionary")
 
         expanded = {}
+
         for k, v in batch.items():
             if isinstance(v, list):
                 expanded[k] = [item for item in v for _ in range(group_size)]
@@ -219,16 +225,16 @@ class Environment(abc.ABC):
 
     def __call__(
         self, batch_size: int, group_size: int = 1, accelerator=None
-    ) -> GroupedEnvironmentOutput | None:
+    ) -> EnvironmentOutput | None:
         """
         Get a batch from the data and run generation.
 
         Args:
             batch_size: Number of problems to include in batch
-            group_size: Number of generations per problem
+            group_size: Number of generations/base rollouts per problem
 
         Returns:
-            GroupedEnvironmentOutput
+            EnvironmentOutput
         """
         # Get the next batch from data
         raw_batch = self.get_next_batch(batch_size)
@@ -236,6 +242,7 @@ class Environment(abc.ABC):
             raise StopIteration("No more batches available")
 
         expanded_batch = self.expand_batch_for_groups(raw_batch, group_size)
+        group_ids = [i // group_size for i in range(batch_size * group_size)]
         # Expand batch for groups
         if accelerator is not None:
             expanded_batch = self.split_batch_in_parts(
@@ -244,55 +251,79 @@ class Environment(abc.ABC):
             expanded_batch = expanded_batch[
                 accelerator.process_index // torch.cuda.device_count()
             ]
-
-            if not accelerator.is_local_main_process:
-                return None
         # Run generation
-        env_output = asyncio.run(self.generate(expanded_batch))
+        env_output: EnvironmentOutput = None
+        if accelerator.is_local_main_process:
+            env_output = asyncio.run(self.generate(expanded_batch))
 
-        # Convert expanded batch back to original format for GroupedEnvironmentOutput
-        original_batch = []
-        first_key = next(iter(raw_batch.keys()))
-        for i in range(len(raw_batch[first_key])):
-            item = {k: v[i] for k, v in raw_batch.items()}
-            original_batch.append(item)
-
-        return GroupedEnvironmentOutput.from_environment_output(
-            env_output, original_batch, group_size
+        # We gather.
+        env_outputs = accelerator.gather_for_metrics([env_output])
+        env_outputs = [eo for eo in env_outputs if eo is not None]
+        env_out_combined: EnvironmentOutput = EnvironmentOutput.combine_and_group(
+            env_outputs,
+            group_ids,
+            [{k: v[i] for k, v in raw_batch.items()} for i in range(batch_size)],
         )
 
-    def eval(self, group_size: int = 1) -> dict[str, GroupedEnvironmentOutput]:
+        return env_out_combined
+
+    def eval(
+        self,
+        group_size: int = 1,
+        accelerator=None,
+    ) -> dict[str, EnvironmentOutput]:
         """
-        Run evaluation on all eval datasets.
+        Evaluate all registered evaluation splits with the same distributed
+        pattern used in `__call__`.
 
         Args:
-            group_size: Number of generations per problem
+            group_size: number of generations per prompt
+            accelerator: `accelerate.Accelerator` (may be None for single-GPU)
 
         Returns:
-            Dictionary mapping dataset names to their GroupedEnvironmentOutput
+            {split_name: grouped EnvironmentOutput}
         """
         if not self.eval_datasets:
             return {}
 
-        results = {}
-        for eval_name, eval_data in self.eval_datasets.items():
-            # Convert eval dataset to batch format
-            eval_batch = {key: eval_data[:][key] for key in eval_data.column_names}
+        results: dict[str, EnvironmentOutput] = {}
 
-            # Always expand batch for groups (even if group_size=1)
-            expanded_batch = self.expand_batch_for_groups(eval_batch, group_size)
-            env_output = asyncio.run(self.generate(expanded_batch))
+        for split_name, ds in self.eval_datasets.items():
+            # build a full batch from the whole eval dataset
+            eval_batch = {k: ds[:][k] for k in ds.column_names}
+            expanded = self.expand_batch_for_groups(eval_batch, group_size)
+            group_ids = [
+                i // group_size for i in range(len(expanded[next(iter(expanded))]))
+            ]
+            if accelerator is not None:
+                parts = accelerator.num_processes // torch.cuda.device_count()
+                expanded = self.split_batch_in_parts(expanded, parts)
+                expanded = expanded[
+                    accelerator.process_index // torch.cuda.device_count()
+                ]
 
-            # Convert to original format for GroupedEnvironmentOutput
-            original_batch = []
-            first_key = next(iter(eval_batch.keys()))
-            for i in range(len(eval_batch[first_key])):
-                item = {k: v[i] for k, v in eval_batch.items()}
-                original_batch.append(item)
+            env_out: EnvironmentOutput | None = None
+            if accelerator is None or accelerator.is_local_main_process:
+                env_out = asyncio.run(self.generate(expanded))
 
-            results[eval_name] = GroupedEnvironmentOutput.from_environment_output(
-                env_output, original_batch, group_size
+            # gather outputs from all ranks
+            if accelerator is not None:
+                gathered = accelerator.gather_for_metrics([env_out])
+                gathered = [eo for eo in gathered if eo is not None]
+            else:
+                gathered = [env_out]
+
+            # merge + group
+            env_out_combined: EnvironmentOutput = EnvironmentOutput.combine_and_group(
+                gathered,
+                group_ids,
+                [
+                    {k: v[i] for k, v in eval_batch.items()}
+                    for i in range(len(eval_batch[next(iter(eval_batch))]))
+                ],
             )
+
+            results[split_name] = env_out_combined
 
         return results
 
@@ -313,30 +344,23 @@ class Environment(abc.ABC):
     # ═════════════════════════════════════════════════════════════════════════════
 
     def __add__(self, other: Environment) -> Environment:
-        """
-        Combine two environments by merging their datasets and data states.
-        """
-
-        import random
-
-        from datasets import concatenate_datasets
-
         if not isinstance(other, Environment):
-            raise TypeError("Can only combine with another Environment")
+            raise TypeError
 
         class CombinedEnvironment(Environment):
             def __init__(
                 self, env1: Environment, env2: Environment, seed: int | None = None
             ):
+                self.env1 = env1
+                self.env2 = env2
                 self.keys_for_env1 = (
                     set(env1.train_data.column_names) if env1.train_data else set()
                 )
                 self.keys_for_env2 = (
                     set(env2.train_data.column_names) if env2.train_data else set()
                 )
-                self.all_keys = self.keys_for_env1.union(self.keys_for_env2)
-                # We add a special random column to distinguish between datasets
-                self.random_column_name = f"_GROUP_{random.randint(0, 1e10)}"
+                self.all_keys = self.keys_for_env1 | self.keys_for_env2
+                self.random_column_name = f"_GROUP_{random.randint(0, 10**10)}"
                 if env1.train_data is not None:
                     env1.train_data = env1.train_data.add_column(
                         self.random_column_name, ["env1"] * len(env1.train_data)
@@ -345,86 +369,48 @@ class Environment(abc.ABC):
                     env2.train_data = env2.train_data.add_column(
                         self.random_column_name, ["env2"] * len(env2.train_data)
                     )
-
-                self.env1 = env1
-                self.env2 = env2
-
-                # Concatenate datasets
                 train_data = None
                 if env1.train_data is not None and env2.train_data is not None:
                     train_data = concatenate_datasets(
                         [env1.train_data, env2.train_data]
                     )
-                    if seed is not None:
-                        train_data = train_data.shuffle(seed=seed)
-                    else:
-                        train_data = train_data.shuffle()
+                    train_data = (
+                        train_data.shuffle(seed=seed)
+                        if seed is not None
+                        else train_data.shuffle()
+                    )
                 elif env1.train_data is not None:
                     train_data = env1.train_data
                 elif env2.train_data is not None:
                     train_data = env2.train_data
-
-                self.eval_datasets_env1 = (
-                    set(env1.eval_datasets.keys()) if env1.eval_datasets else set()
-                )
-                self.eval_datasets_env2 = (
-                    set(env2.eval_datasets.keys()) if env2.eval_datasets else set()
-                )
-
-                # If they share a common eval dataset we change the name to {name}_env1 or _env2
                 eval_datasets = {}
                 for name, data in env1.eval_datasets.items():
                     if name in env2.eval_datasets:
                         eval_datasets[f"{name}_env1"] = data
                         eval_datasets[f"{name}_env2"] = env2.eval_datasets[name]
+                        # We add the column.
+                        eval_datasets[f"{name}_env2"] = data.add_column(
+                            self.random_column_name, ["env1"] * len(data)
+                        )
+                        eval_datasets[f"{name}_env2"] = env2.eval_datasets[
+                            name
+                        ].add_column(
+                            self.random_column_name,
+                            ["env2"] * len(env2.eval_datasets[name]),
+                        )
                     else:
                         eval_datasets[name] = data
-
+                        eval_datasets[name] = data.add_column(
+                            self.random_column_name, ["env1"] * len(data)
+                        )
+                    # We add the column.
                 for name, data in env2.eval_datasets.items():
-                    if (
-                        name not in eval_datasets
-                        and name not in self.eval_datasets_env1
-                    ):
+                    if name not in eval_datasets:
                         eval_datasets[name] = data
-
-                super().__init__(
-                    train_data=train_data,
-                    eval_data={
-                        **env1.eval_datasets,
-                        **env2.eval_datasets,
-                    },
-                )
-
-            def eval(self, group_size: int = 1) -> dict[str, GroupedEnvironmentOutput]:
-                """
-                Run evaluation on all eval datasets.
-
-                Args:
-                    group_size: Number of generations per problem
-
-                Returns:
-                    Dictionary mapping dataset names to their GroupedEnvironmentOutput
-                """
-                if not self.eval_datasets:
-                    return {}
-
-                results = {}
-                env1_results = self.env1.eval(group_size)
-                env2_results = self.env2.eval(group_size)
-                keys_env1 = set(env1_results.keys())
-                keys_env2 = set(env2_results.keys())
-
-                for name, output in env1_results.items():
-                    if name in keys_env2:
-                        name = f"{name}_env1"
-                    results[name] = output
-
-                for name, output in env2_results.items():
-                    if name in keys_env1:
-                        name = f"{name}_env2"
-                    results[name] = output
-
-                return results
+                        eval_datasets[name] = data.add_column(
+                            self.random_column_name, ["env2"] * len(data)
+                        )
+                super().__init__(train_data=train_data, eval_data=eval_datasets)
 
             async def generate(self, batch: dict[str, Any]) -> EnvironmentOutput:
                 ids_of_env1 = [
@@ -447,90 +433,44 @@ class Environment(abc.ABC):
                     for k, v in batch.items()
                     if k in self.keys_for_env2
                 }
-
-                env_output1: EnvironmentOutput = (
+                env_output1 = (
                     await self.env1.generate(batch_env1) if ids_of_env1 else None
                 )
-                env_output2: EnvironmentOutput = (
+                env_output2 = (
                     await self.env2.generate(batch_env2) if ids_of_env2 else None
                 )
-                if not env_output1:
-                    return env_output2
-                if not env_output2:
-                    return env_output1
+                combined = EnvironmentOutput()
 
-                # Merge outputs
-                for actor_name in env_output1.actors:
-                    actor_output1 = env_output1.actors[actor_name]
-                    actor_output2 = env_output2.actors[actor_name]
+                def _merge(eo: EnvironmentOutput, id_map: list[int], prefix: str):
+                    for sub_idx, pb in enumerate(eo.outputs):
+                        tgt_idx = id_map[sub_idx]
+                        for actor_name, groups in pb.items():
+                            for group_name, ao in groups.items():
+                                new_group = f"{prefix}/{group_name}"
+                                for i in range(len(ao.input_ids)):
+                                    combined.add_entry(
+                                        problem_idx=tgt_idx,
+                                        actor_name=actor_name,
+                                        group_name=new_group,
+                                        input_ids=ao.input_ids[i],
+                                        attention_mask=ao.attention_mask[i]
+                                        if ao.attention_mask
+                                        else None,
+                                        rewards=ao.rewards[i],
+                                        reward_components={
+                                            k: v[i]
+                                            for k, v in ao.reward_components.items()
+                                        },
+                                        ended_in_eos=ao.ended_in_eos[i]
+                                        if ao.ended_in_eos
+                                        else None,
+                                        metadata=ao.metadata,
+                                    )
 
-                    input_ids = [None] * (
-                        len(actor_output1.input_ids) + len(actor_output2.input_ids)
-                    )
-                    for i, input_id in enumerate(actor_output1.input_ids):
-                        input_ids[ids_of_env1[i]] = input_id
-                    for i, input_id in enumerate(actor_output2.input_ids):
-                        input_ids[ids_of_env2[i]] = input_id
-
-                    attention_mask = [None] * (
-                        len(actor_output1.attention_mask)
-                        + len(actor_output2.attention_mask)
-                    )
-                    for i, mask in enumerate(actor_output1.attention_mask):
-                        attention_mask[ids_of_env1[i]] = mask
-                    for i, mask in enumerate(actor_output2.attention_mask):
-                        attention_mask[ids_of_env2[i]] = mask
-
-                    ended_in_eos = [None] * (
-                        len(actor_output1.ended_in_eos)
-                        + len(actor_output2.ended_in_eos)
-                    )
-                    for i, eos in enumerate(actor_output1.ended_in_eos):
-                        ended_in_eos[ids_of_env1[i]] = eos
-                    for i, eos in enumerate(actor_output2.ended_in_eos):
-                        ended_in_eos[ids_of_env2[i]] = eos
-
-                    rewards = [None] * (
-                        len(actor_output1.rewards) + len(actor_output2.rewards)
-                    )
-                    for i, reward in enumerate(actor_output1.rewards):
-                        rewards[ids_of_env1[i]] = reward
-                    for i, reward in enumerate(actor_output2.rewards):
-                        rewards[ids_of_env2[i]] = reward
-
-                    reward_components = {
-                        k: [None]
-                        * (len(actor_output1.rewards) + len(actor_output2.rewards))
-                        for k in set(actor_output1.reward_components.keys())
-                        | set(actor_output2.reward_components.keys())
-                    }
-                    for k, v in actor_output1.reward_components.items():
-                        for i, comp in enumerate(v):
-                            reward_components[k][ids_of_env1[i]] = comp
-                    for k, v in actor_output2.reward_components.items():
-                        for i, comp in enumerate(v):
-                            reward_components[k][ids_of_env2[i]] = comp
-
-                    metadata = {
-                        k: [None]
-                        * (len(actor_output1.metadata) + len(actor_output2.metadata))
-                        for k in actor_output1.metadata.keys()
-                        | actor_output2.metadata.keys()
-                    }
-                    for k, v in actor_output1.metadata.items():
-                        for i, meta in enumerate(v):
-                            metadata[k][ids_of_env1[i]] = meta
-                    for k, v in actor_output2.metadata.items():
-                        for i, meta in enumerate(v):
-                            metadata[k][ids_of_env2[i]] = meta
-
-                    actor_output1.input_ids = input_ids
-                    actor_output1.attention_mask = attention_mask
-                    actor_output1.ended_in_eos = ended_in_eos
-                    actor_output1.rewards = rewards
-                    actor_output1.reward_components = reward_components
-                    actor_output1.metadata = metadata
-                    env_output1.actors[actor_name] = actor_output1
-                return env_output1
+                if env_output1:
+                    _merge(env_output1, ids_of_env1, "env1")
+                if env_output2:
+                    _merge(env_output2, ids_of_env2, "env2")
+                return combined
 
         return CombinedEnvironment(self, other)

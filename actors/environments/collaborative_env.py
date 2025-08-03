@@ -3,20 +3,20 @@ from __future__ import annotations
 import asyncio
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from datasets import Dataset as HFDataset
 from datasets import DatasetDict
 from jinja2 import Template
-from vllm import RequestOutput, SamplingParams
+from vllm import SamplingParams
 
 from actors.actors.base import TrainableLLMActor
 from actors.environments.actors_schedule_dsl import sample_schedule
 from actors.environments.env_base import Environment
 from actors.environments.masking import mask_turns_and_encode
-from actors.environments.types import ActorOutput, EnvironmentOutput
+from actors.environments.types import EnvironmentOutput
 from actors.rewards import (
     ConversationRewardFunction,
 )
@@ -100,125 +100,84 @@ class CollaborativeEnvironment(Environment):
 
     async def generate(self, batch: Mapping[str, Any]) -> EnvironmentOutput:
         problems = batch[self.prompt_column]
-        batch_size = len(problems)
+        n = len(problems)
 
-        def get_prompt(cfg: CollaborativeActorConfig, idx: int) -> str:
+        def prompt_for(cfg: CollaborativeActorConfig, idx: int) -> str:
             if looks_like_jinja2_template(cfg.system_prompt):
-                template = Template(cfg.system_prompt)
-                keys_in_batch = set(batch.keys())
-                entry = {k: batch[k][idx] for k in keys_in_batch}
-                return template.render(**entry)
-            else:
-                return cfg.system_prompt + problems[idx]
+                tmpl = Template(cfg.system_prompt)
+                entry = {k: batch[k][idx] for k in batch}
+                return tmpl.render(**entry)
+            return cfg.system_prompt + problems[idx]
 
-        per_row_turns: list[list[str]] = [
-            sample_schedule(self.schedule_dsl_spec, self.all_names)
-            for _ in range(batch_size)
+        per_row_turns = [
+            sample_schedule(self.schedule_dsl_spec, self.all_names) for _ in range(n)
         ]
-
-        dialogs: list[list[dict[str, Any]]] = [[] for _ in range(batch_size)]
-
+        dialogs: list[list[dict[str, str]]] = [[] for _ in range(n)]
         max_turns = max(len(ts) for ts in per_row_turns)
 
+        async def _chat_one_actor(name: str, row_indices: list[int]) -> None:
+            cfg = self.actor_by_name[name]
+            tok = cfg.actor.training_config.tokenizer_factory()
+            prompts = []
+
+            cfg.actor.wake()
+            for ridx in row_indices:
+                conv_msgs = [{"role": "system", "content": prompt_for(cfg, ridx)}]
+                for m in dialogs[ridx]:
+                    role = "assistant" if m["author"] == name else "user"
+                    content = m["content"]
+                    if self.prefill_name and role == "user":
+                        content = f"{m['author']} says: {content}"
+                    conv_msgs.append({"role": role, "content": content})
+                prompts.append(
+                    tok.apply_chat_template(
+                        conv_msgs, add_generation_prompt=True, tokenize=False
+                    )
+                )
+
+            outs = await cfg.actor.agenerate(prompts, cfg.sampling_params)
+            completions = [o.outputs[0].text for o in outs]
+            for ridx, comp in zip(row_indices, completions, strict=False):
+                dialogs[ridx].append({"content": comp, "author": name})
+            cfg.actor.sleep()
+
         for turn_idx in range(max_turns):
-            rows_with_turn: list[int] = [
-                i for i, turns in enumerate(per_row_turns) if turn_idx < len(turns)
+            row_has_turn = [
+                i for i, ts in enumerate(per_row_turns) if turn_idx < len(ts)
             ]
-            if not rows_with_turn:
-                continue
-
-            actor_for_row: dict[int, str] = {
-                i: per_row_turns[i][turn_idx] for i in rows_with_turn
-            }
-
             rows_by_actor: dict[str, list[int]] = defaultdict(list)
-            for row_idx, name in actor_for_row.items():
-                rows_by_actor[name].append(row_idx)
+            for ridx in row_has_turn:
+                rows_by_actor[per_row_turns[ridx][turn_idx]].append(ridx)
 
-            order: Iterable[str] = rows_by_actor.keys()
-
-            async def _chat_one_actor(name: str, row_indices: list[int]) -> None:
-                cfg = self.actor_by_name[name]
-                actor_prompts: list[str] = []
-                tokenizer = cfg.actor.training_config.tokenizer_factory()
-
-                cfg.actor.wake()
-                for idx in row_indices:
-                    conv_msgs: list[dict[str, str]] = []
-                    conv_msgs.append(
-                        {
-                            "role": "system",
-                            "content": get_prompt(cfg, idx),
-                        }
-                    )
-
-                    for m in dialogs[idx]:
-                        role = "user" if m["author"] != name else "assistant"
-                        content = m["content"]
-                        if self.prefill_name and role == "user":
-                            content = f"{m['author']} says: {content}"
-                        conv_msgs.append({"role": role, "content": content})
-
-                    prompt = tokenizer.apply_chat_template(
-                        conv_msgs,
-                        add_generation_prompt=True,
-                        tokenize=False,
-                    )
-                    actor_prompts.append(prompt)
-
-                outs: list[RequestOutput] = await cfg.actor.agenerate(
-                    prompts=actor_prompts,
-                    sampling_params=cfg.sampling_params,
-                )
-                completions = [o.outputs[0].text for o in outs]
-                for idx, comp in zip(row_indices, completions, strict=False):
-                    dialogs[idx].append(
-                        {
-                            "content": comp,
-                            "author": name,
-                        }
-                    )
-                cfg.actor.sleep()
-
-            if self.run_concurrently:
-                await asyncio.gather(
-                    *[
-                        _chat_one_actor(name, rows_by_actor[name])
-                        for name in list(order)
-                    ]
-                )
-            else:
-                for name in order:
-                    await _chat_one_actor(name, rows_by_actor[name])
-
-        # ------------------------------------------------------------------------
-        n = len(dialogs)
-        actors_out: dict[str, ActorOutput] = {}
+            coros = [
+                _chat_one_actor(name, rows_by_actor[name]) for name in rows_by_actor
+            ]
+            await (
+                asyncio.gather(*coros)
+                if self.run_concurrently
+                else asyncio.gather(*list(coros))
+            )
 
         actors_tok: dict[str, dict[str, list[list[int]]]] = {}
         conversations_by_actor: dict[str, list[list[dict[str, str]]]] = {}
 
         for cfg in self.actor_cfgs:
             tok = cfg.actor.training_config.tokenizer_factory()
-            ids_batch, mask_batch = [], []
-            convs: list[list[dict[str, str]]] = []
+            ids_batch, mask_batch, conv_batch = [], [], []
 
-            for i, row_msgs in enumerate(dialogs):
-                converted: list[dict[str, str]] = [
-                    {"role": "system", "content": get_prompt(cfg, i)}
-                ]
-                for m in row_msgs:
-                    role = "assistant" if m.get("author") == cfg.actor.name else "user"
-                    content = m.get("content", "")
+            for idx in range(n):
+                conv_msgs = [{"role": "system", "content": prompt_for(cfg, idx)}]
+                for m in dialogs[idx]:
+                    role = "assistant" if m["author"] == cfg.actor.name else "user"
+                    content = m["content"]
                     if self.prefill_name and role == "user":
                         content = f"{m['author']} says: {content}"
-                    converted.append({"role": role, "content": content})
+                    conv_msgs.append({"role": role, "content": content})
 
-                convs.append(converted)
-
+                conv_batch.append(conv_msgs)
                 ids, msk = mask_turns_and_encode(
                     tok,
-                    converted,
+                    conv_msgs,
                     mask_non_assistant_turns=self.mask_other_agents_for_loss,
                 )
                 ids_batch.append(ids)
@@ -228,27 +187,25 @@ class CollaborativeEnvironment(Environment):
                 "input_ids": ids_batch,
                 "attention_mask": mask_batch,
             }
-            conversations_by_actor[cfg.actor.name] = convs
+            conversations_by_actor[cfg.actor.name] = conv_batch
 
-        # ------------------------------------------------------------------------
-        A = len([cfg for cfg in self.actor_cfgs if cfg.actor.is_actually_trainable])
+        # ---------------------------------------------------------------
+        # Compute rewards
+        # ---------------------------------------------------------------
+        trainable_cfgs = [
+            cfg for cfg in self.actor_cfgs if cfg.actor.is_actually_trainable
+        ]
+        A = len(trainable_cfgs)
+
         conversations_flat = [
             conv
-            for cfg in self.actor_cfgs
+            for cfg in trainable_cfgs
             for conv in conversations_by_actor[cfg.actor.name]
-            if cfg.actor.is_actually_trainable
         ]
-        actor_names_flat = [
-            cfg.actor.name
-            for cfg in self.actor_cfgs
-            for _ in range(n)
-            if cfg.actor.is_actually_trainable
-        ]
+        actor_names_flat = [cfg.actor.name for cfg in trainable_cfgs for _ in range(n)]
 
         reward_components_by_actor: dict[str, dict[str, list[float]]] = {
-            cfg.actor.name: {}
-            for cfg in self.actor_cfgs
-            if cfg.actor.is_actually_trainable
+            cfg.actor.name: {} for cfg in trainable_cfgs
         }
 
         for rf in self.reward_functions:
@@ -259,27 +216,34 @@ class CollaborativeEnvironment(Environment):
             )
             if len(vals) != A * n:
                 raise ValueError(
-                    f"Reward '{rf.name}' returned {len(vals)} items; expected {A * n}."
+                    f"Reward '{rf.name}' returned {len(vals)}, expected {A * n}"
                 )
-
-            for a, cfg in enumerate(
-                [cfg for cfg in self.actor_cfgs if cfg.actor.is_actually_trainable]
-            ):
+            for a, cfg in enumerate(trainable_cfgs):
                 reward_components_by_actor[cfg.actor.name][rf.name] = [
                     float(x) for x in vals[a * n : (a + 1) * n]
                 ]
 
-        for cfg in [cfg for cfg in self.actor_cfgs if cfg.actor.is_actually_trainable]:
+        # ---------------------------------------------------------------
+        # Assemble EnvironmentOutput
+        # ---------------------------------------------------------------
+        env_out = EnvironmentOutput()
+
+        for cfg in trainable_cfgs:
             comps = reward_components_by_actor[cfg.actor.name]
             totals = [
                 sum(rf.weight * comps[rf.name][i] for rf in self.reward_functions)
                 for i in range(n)
             ]
-            actors_out[cfg.actor.name] = ActorOutput(
-                input_ids=actors_tok[cfg.actor.name]["input_ids"],
-                attention_mask=actors_tok[cfg.actor.name]["attention_mask"],
-                rewards=totals,
-                reward_components=comps,
-            )
 
-        return EnvironmentOutput(actors=actors_out)
+            for idx in range(n):
+                env_out.add_entry(
+                    problem_idx=idx,
+                    actor_name=cfg.actor.name,
+                    group_name="conversation",
+                    input_ids=actors_tok[cfg.actor.name]["input_ids"][idx],
+                    attention_mask=actors_tok[cfg.actor.name]["attention_mask"][idx],
+                    rewards=totals[idx],
+                    reward_components={k: v[idx] for k, v in comps.items()},
+                )
+
+        return env_out
