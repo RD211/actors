@@ -36,6 +36,10 @@ from actors.utils.deepspeed import (
 from actors.utils.get_logps import chunked_logp
 from actors.utils.ipc_utils import gather_and_stream_state_dict
 from actors.utils.logger import Palette, colorize, init_logger
+from actors.utils.monkey_patch_unsloth_gradient_checkpointing import (
+    apply_unsloth_offloaded_gradient_checkpoint_monkey_patch,
+    revert_unsloth_offloaded_gradient_checkpoint_monkey_patch,
+)
 from actors.utils.tracker import (
     _step_profiler,
     log_step_profiling,
@@ -345,6 +349,11 @@ class BaseRLTrainer:
                 ).train()
 
             if actor_obj.training_config.gradient_checkpointing:
+                if (
+                    actor_obj.training_config.gradient_checkpointing_strategy
+                    == "unsloth"
+                ):
+                    apply_unsloth_offloaded_gradient_checkpoint_monkey_patch()
                 if is_peft_model(model):
                     model.base_model.gradient_checkpointing_enable(
                         gradient_checkpointing_kwargs={
@@ -370,6 +379,12 @@ class BaseRLTrainer:
                     )
                     model.config.use_cache = False
                     model.enable_input_require_grads()
+
+                if (
+                    actor_obj.training_config.gradient_checkpointing_strategy
+                    == "unsloth"
+                ):
+                    revert_unsloth_offloaded_gradient_checkpoint_monkey_patch()
 
             disable_dropout_in_model(model)
             model_cfg = model.config

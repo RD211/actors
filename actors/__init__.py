@@ -1,4 +1,4 @@
-__version__ = "0.1.1-post1"
+__version__ = "0.1.2"
 
 from .actors import LLMActor, OpenAIActor, TrainableLLMActor, vLLMActor
 from .environments import (

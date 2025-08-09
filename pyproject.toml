@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rl-actors"
-version = "0.1.1-post1"
+version = "0.1.2"
 authors = [
   { name="David Dinucu-Jianu", email="david.dinucujianu@gmail.com" },
 ]
 description = "Actors: A hackable library for doing Multi-Turn Multi-Agent RL with LLMs for the GPU poor and middle class."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

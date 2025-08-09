@@ -145,9 +145,11 @@ Here are some examples:
 
 ```python
 # Training env for Codeforces.
-codeforces_env = CodeforcesParallelEnvironment(
+creative_env = SingleTurnEnvironment(
   actors=[bob_actor],
-  reward_functions=[codeforces_reward]
+  reward_functions=[creative_writing],
+  prompt_column='text',
+  # ...
 )
 
 # Training env for math.
@@ -172,7 +174,7 @@ aime_eval = SingleTurnEnvironment(
 )
 
 # Final combined environment.
-env = codeforces_env + math_env + aime_eval
+env = creative_env + math_env + aime_eval
 ```
 
 ---
@@ -219,6 +221,7 @@ Training multiple models at the same time requires a lot of careful VRAM managem
 * Triton kernel for computing log‑probabilities. Helps with long context a bit. [More details here.](docs/logps_kernel.md)
 * [Liger kernels](https://github.com/linkedin/Liger-Kernel) for computing the GRPO loss.
 * Efficient streamed implementation for updating vLLM weights along with LoRA in‑memory updates. [More details here.](docs/updating_weights.md)
+* Shamelessly copied [Unsloth gradient checkpointing](https://github.com/unslothai/unsloth) to allow for larger context lengths.
 
 #### Debugging VRAM
 

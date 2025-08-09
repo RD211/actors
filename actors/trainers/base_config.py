@@ -94,6 +94,7 @@ class ActorTrainCfg:
     gradient_checkpointing: bool = True
     batch_size: int | None = None  # None means use the normal batch size from trainer.
     grad_accumulation_steps: int | None = None
+    gradient_checkpointing_strategy: str = "unsloth"  # unsloth or anything.
     reference_batch_size: int = -1  # -1 is full batch size
 
     # Advantage calculation and normalization
@@ -154,6 +155,7 @@ class ActorTrainCfg:
         batch_size: int
         | None = None,  # None means use the normal batch size from trainer.
         grad_accumulation_steps: int | None = None,
+        gradient_checkpointing_strategy: str = "unsloth",
         reference_batch_size: int = -1,
         # Advantage calculation and normalization
         advantage_calculator: Callable[..., list[float]] | None = None,
@@ -193,6 +195,7 @@ class ActorTrainCfg:
             gradient_checkpointing: Whether to use gradient checkpointing
             batch_size: Batch size for training (None means use trainer's batch size)
             grad_accumulation_steps: Number of gradient accumulation steps
+            gradient_checkpointing_strategy: Strategy for gradient checkpointing
             reference_batch_size: Batch size for reference model inference
             advantage_calculator: Optional function to calculate advantages
             std_normalization: Whether to apply standard normalization
@@ -229,6 +232,7 @@ class ActorTrainCfg:
         self.gradient_checkpointing = gradient_checkpointing
         self.batch_size = batch_size
         self.grad_accumulation_steps = grad_accumulation_steps
+        self.gradient_checkpointing_strategy = gradient_checkpointing_strategy
         self.reference_batch_size = reference_batch_size
         self.advantage_calculator = advantage_calculator
         self.std_normalization = std_normalization
