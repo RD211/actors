@@ -63,6 +63,9 @@ venv.bak/
 # Wandb
 wandb/
 
+# uv
+uv.lock
+
 # Others
 checkpoints/
 checkpoint/

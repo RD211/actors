@@ -28,7 +28,27 @@ class vLLMActor(TrainableLLMActor):
         insomnia: bool = False,  # If true all sleep calls will be ignored
         non_trainable: bool = False,
         training_config: ActorTrainCfg = None,
+        # Typed sharing controls
+        allow_sharing: bool = False,
+        expected_max_lora_rank: int | None = None,
     ):
+        """
+        vLLM-based actor supporting training with PEFT/LoRA.
+        Args:
+            name: Unique name for the actor.
+            model_path: Path to the model.
+            gpu_groups: List of GPU groups (list of list of GPU indices) for model parallelism.
+                If an integer is provided, it is treated as a single group with that many GPUs.
+                If None, defaults to using all available GPUs as a single group.
+            use_v1_engine: Whether to use the vLLM v1 engine.
+            engine_kwargs: Additional keyword arguments for the vLLM engine.
+            insomnia: If true, the actor will not enter sleep mode.
+            non_trainable: If true, the actor will not support training.
+            training_config: Training configuration for the actor.
+            allow_sharing: If true, allows this actor to share its base model with others.
+            expected_max_lora_rank: Expected maximum LoRA rank for this actor, used for
+                determining shared model capacity when sharing is enabled.
+        """
         self.logger = init_logger(name=name)
         if gpu_groups is None:
             gpu_groups = [list(range(torch.cuda.device_count()))]
@@ -69,14 +89,20 @@ class vLLMActor(TrainableLLMActor):
         # Enable LoRA in vLLM if PEFT config is provided
         if self.training_config.peft_config is not None:
             final_engine_kwargs["enable_lora"] = True
-            # Set reasonable defaults for LoRA if not already specified
+            # Propagate typed sharing preference
+            final_engine_kwargs["allow_sharing"] = bool(allow_sharing)
+            # Choose per-actor capacity: prefer explicit expected_max_lora_rank,
+            # else actor's LoRA rank, else 512
+            actor_rank = getattr(self.training_config.peft_config, "r", None)
+            chosen_capacity = (
+                int(expected_max_lora_rank)
+                if expected_max_lora_rank is not None
+                else (int(actor_rank) if actor_rank is not None else 512)
+            )
             if "max_lora_rank" not in final_engine_kwargs:
-                lora_rank = getattr(
-                    self.training_config.peft_config, "r", 16
-                )  # Default to rank 16
-                final_engine_kwargs["max_lora_rank"] = lora_rank
+                final_engine_kwargs["max_lora_rank"] = chosen_capacity
             if "max_loras" not in final_engine_kwargs:
-                final_engine_kwargs["max_loras"] = 1  # Default to 1 LoRA adapter
+                final_engine_kwargs["max_loras"] = 4  # Default adapters capacity
 
         self.pool.load_model(
             name=name,
@@ -85,6 +111,19 @@ class vLLMActor(TrainableLLMActor):
             use_v1_engine=use_v1_engine,
             engine_kwargs=final_engine_kwargs,
         )
+
+        # Log information about shared model usage
+        if name in self.pool.models:
+            model_record = self.pool.models[name]
+            if model_record.is_shared and model_record.shared_config:
+                base_model_id = model_record.shared_config.base_model_id
+                shared_record = self.pool.shared_models[base_model_id]
+                num_adapters = len(shared_record.lora_adapters)
+                self.logger.info(
+                    f"{colorize(Palette.SUCCESS, 'SHARED MODEL:')} "
+                    f"{name} is using shared base model {base_model_id} "
+                    f"with {num_adapters} LoRA adapter(s)"
+                )
         # Register cleanup function for this actor
         atexit.register(self._cleanup)
         self.name = name

@@ -81,6 +81,9 @@ def to_vllm_lora_state_dict(state_dict):
     - qkv_proj.lora_A/lora_B as lists: [q_tensor, k_tensor, v_tensor]
     - gate_up_proj.lora_A/lora_B as lists: [gate_tensor, up_tensor]
 
+    This function is resilient to partial LoRA targeting (e.g. only q & v). Missing parts
+    are zero-filled to match the expected fused shapes.
+
     Args:
         state_dict: Dictionary of LoRA parameter names to tensors
 
@@ -88,10 +91,10 @@ def to_vllm_lora_state_dict(state_dict):
         OrderedDict with vLLM-compatible LoRA parameter groupings
     """
     out_sd = OrderedDict()
-    qkv_cache = {}  # (prefix, lora_type) -> {'q': tensor, 'k': tensor, 'v': tensor}
-    gate_up_cache = {}  # (prefix, lora_type) -> {'gate': tensor, 'up': tensor}
+    qkv_cache = {}  # (prefix, lora_type, adapter_name) -> {'q': tensor, 'k': tensor, 'v': tensor}
+    gate_up_cache = {}  # (prefix, lora_type, adapter_name) -> {'gate': tensor, 'up': tensor}
 
-    # Patterns for LoRA parameters - updated to handle adapter names like '.default.'
+    # Patterns for LoRA parameters
     qkv_lora_pat = re.compile(
         r"(.+)\.self_attn\.(q|k|v)_proj\.(lora_[AB])\.([^.]+)\.weight$"
     )
@@ -107,14 +110,6 @@ def to_vllm_lora_state_dict(state_dict):
             cache_key = (prefix, lora_type, adapter_name)
             bucket = qkv_cache.setdefault(cache_key, {})
             bucket[proj_type] = v
-
-            # If we have all three (q, k, v), create the list
-            if len(bucket) == 3:
-                qkv_list = [bucket["q"], bucket["k"], bucket["v"]]
-                out_sd[
-                    f"{prefix}.self_attn.qkv_proj.{lora_type}.{adapter_name}.weight"
-                ] = qkv_list
-                del qkv_cache[cache_key]
             continue
 
         # Check for gate/up LoRA parameters
@@ -124,21 +119,41 @@ def to_vllm_lora_state_dict(state_dict):
             cache_key = (prefix, lora_type, adapter_name)
             bucket = gate_up_cache.setdefault(cache_key, {})
             bucket[proj_type] = v
-
-            # If we have both (gate, up), create the list
-            if len(bucket) == 2:
-                gate_up_list = [bucket["gate"], bucket["up"]]
-                out_sd[
-                    f"{prefix}.mlp.gate_up_proj.{lora_type}.{adapter_name}.weight"
-                ] = gate_up_list
-                del gate_up_cache[cache_key]
             continue
 
         # For all other parameters, keep as-is
         out_sd[k] = v
 
-    # Ensure all cached items were processed
-    assert not qkv_cache, f"Incomplete q/k/v LoRA groups: {qkv_cache.keys()}"
-    assert not gate_up_cache, f"Incomplete gate/up LoRA groups: {gate_up_cache.keys()}"
+    # Materialize qkv fused lists, zero-filling missing parts if needed
+    for (prefix, lora_type, adapter_name), bucket in qkv_cache.items():
+        # Determine exemplar shape to zero-fill if needed
+        exemplar = next(iter(bucket.values()))
+        dtype = exemplar.dtype
+        device = exemplar.device
+        shape = exemplar.shape
+        # All q/k/v share same shapes for LoRA A/B in attention projections
+        zeros = lambda: torch.zeros(shape, dtype=dtype, device=device)  # noqa
+        q = bucket.get("q", zeros())
+        k = bucket.get("k", zeros())
+        v = bucket.get("v", zeros())
+        out_sd[f"{prefix}.self_attn.qkv_proj.{lora_type}.{adapter_name}.weight"] = [
+            q,
+            k,
+            v,
+        ]
+
+    # Materialize gate_up fused lists, zero-filling missing parts if needed
+    for (prefix, lora_type, adapter_name), bucket in gate_up_cache.items():
+        exemplar = next(iter(bucket.values()))
+        dtype = exemplar.dtype
+        device = exemplar.device
+        shape = exemplar.shape
+        zeros = lambda: torch.zeros(shape, dtype=dtype, device=device)  # noqa
+        gate = bucket.get("gate", zeros())
+        up = bucket.get("up", zeros())
+        out_sd[f"{prefix}.mlp.gate_up_proj.{lora_type}.{adapter_name}.weight"] = [
+            gate,
+            up,
+        ]
 
     return out_sd

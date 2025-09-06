@@ -109,11 +109,13 @@ class ModelWorker:
         except Exception:
             return "ERROR", traceback.format_exc()
 
-    def create_lora_if_not_present(self, lora_path: str) -> tuple[str, str | None]:
+    def create_lora_if_not_present(
+        self, lora_path: str, adapter_id: int
+    ) -> tuple[str, str | None]:
         """Create and initialize LoRA adapter if not already present."""
         try:
             self.engine.collective_rpc(
-                "_create_lora_if_not_present", args=(lora_path, self.model_name)
+                "_create_lora_if_not_present", args=(lora_path, adapter_id)
             )
             return "OK", None
         except Exception:

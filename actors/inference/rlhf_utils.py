@@ -72,15 +72,19 @@ class ColocateWorkerExtension:
         # Clean up the cache to free memory
         self.cpu_cache = {}
 
-    def _create_lora_if_not_present(self, lora_path: str, name: str):
+    def _create_lora_if_not_present(self, lora_path: str, identifier):
         from vllm.lora.request import LoRARequest
 
-        self.name = name
+        adapter_id = identifier
+        adapter_name = f"adapter_{adapter_id}"
+
+        self.adapter_name = adapter_name
+        self.adapter_id = adapter_id
 
         self.model_runner.add_lora(
             lora_request=LoRARequest(
-                lora_name=f"lora_{name}",
-                lora_int_id=1,
+                lora_name=f"lora_{adapter_name}",
+                lora_int_id=adapter_id,
                 lora_local_path=lora_path,
             )
         )
@@ -108,36 +112,48 @@ class ColocateWorkerExtension:
         lora_B_keys = [k for k in self.cpu_cache.keys() if "lora_B" in k]
         loras = adapter_manager.modules
 
-        def _copy_lora_from_cpu(
-            src: torch.Tensor, dst: torch.Tensor, tp_idx: int, tp_world_size: int
-        ):
-            if src.shape == dst.shape:
-                dst.data.copy_(src)
-                return
+        # TP info: compute local rank as index within gpu_group
+        try:
+            tp_idx = self.gpu_group.index(self.device.index)
+        except ValueError:
+            tp_idx = 0
 
-            shard_dim = None
-            for dim, (full, local) in enumerate(
-                zip(src.shape, dst.shape, strict=False)
-            ):
-                if full != local:
-                    if full // tp_world_size == local and full % tp_world_size == 0:
-                        shard_dim = dim
-                        break
-            if shard_dim is None:
-                raise RuntimeError(
-                    f"Shape mismatch {src.shape} → {dst.shape} does not "
-                    "look like tensor-parallel sharding."
-                )
-            slice_size = src.shape[shard_dim] // tp_world_size
-            start = tp_idx * slice_size
-            end = start + slice_size
+        # Determine adapter slot (0-based) from adapter_id
+        adapter_slot = max(int(getattr(self, "adapter_id", 1)) - 1, 0)
 
-            sl = [slice(None)] * src.ndim
-            sl[shard_dim] = slice(start, end)
-            dst.data.copy_(src[tuple(sl)])
+        def _copy_A_padded(cpu_A: torch.Tensor, gpu_A: torch.Tensor):
+            # cpu_A: [r_small, in_full]
+            # gpu_A slice: [1, 1, Rcap, in_local]; full tensor: [max_loras, 1, Rcap, in_local]
+            r_cap = gpu_A.shape[2]
+            in_local = gpu_A.shape[3]
+            in_full = int(cpu_A.shape[1])
 
-        tp_idx = self.device.index
-        tp_world_size = len(self.gpu_group)
+            src = torch.zeros(
+                (1, 1, r_cap, in_full), dtype=gpu_A.dtype, device=gpu_A.device
+            )
+            r_small = cpu_A.shape[0]
+            src[0, 0, :r_small, :in_full] = cpu_A.to(src.dtype)
+
+            start = int(tp_idx) * in_local
+            end = start + in_local
+            gpu_A.copy_(src[:, :, :, start:end])
+
+        def _copy_B_padded(cpu_B: torch.Tensor, gpu_B: torch.Tensor):
+            # cpu_B: [out_full, r_small]
+            # gpu_B slice: [1, 1, out_local, Rcap]; full tensor: [max_loras, 1, out_local, Rcap]
+            r_cap = gpu_B.shape[3]
+            out_local = gpu_B.shape[2]
+            out_full = int(cpu_B.shape[0])
+
+            src = torch.zeros(
+                (1, 1, out_full, r_cap), dtype=gpu_B.dtype, device=gpu_B.device
+            )
+            r_small = cpu_B.shape[1]
+            src[0, 0, :out_full, :r_small] = cpu_B.to(src.dtype)
+
+            start = int(tp_idx) * out_local
+            end = start + out_local
+            gpu_B.copy_(src[:, :, start:end, :])
 
         for lora_key in loras.keys():
             lora_a_key = [
@@ -148,25 +164,31 @@ class ColocateWorkerExtension:
             ]
             if not lora_a_key and not lora_b_key:
                 continue
-            lora_a_key = lora_a_key[0]
-            lora_b_key = lora_b_key[0]
+            lora_a_key = lora_a_key[0] if lora_a_key else None
+            lora_b_key = lora_b_key[0] if lora_b_key else None
 
-            if not isinstance(self.cpu_cache[lora_a_key], list):
+            # Ensure list grouping
+            if lora_a_key and not isinstance(self.cpu_cache[lora_a_key], list):
                 self.cpu_cache[lora_a_key] = [self.cpu_cache[lora_a_key]]
-            if not isinstance(self.cpu_cache[lora_b_key], list):
+            if lora_b_key and not isinstance(self.cpu_cache[lora_b_key], list):
                 self.cpu_cache[lora_b_key] = [self.cpu_cache[lora_b_key]]
 
             for i, _ in enumerate(loras[lora_key].lora_a_stacked):
                 # LoRA‑A
                 if lora_a_key:
-                    cpu_tensor = self.cpu_cache[lora_a_key][i].unsqueeze(0).unsqueeze(0)
-                    gpu_tensor = loras[lora_key].lora_a_stacked[i]
-                    _copy_lora_from_cpu(cpu_tensor, gpu_tensor, tp_idx, tp_world_size)
+                    cpu_A = self.cpu_cache[lora_a_key][i]  # [r_small, in_full]
+                    gpu_A = loras[lora_key].lora_a_stacked[i][
+                        adapter_slot : adapter_slot + 1, :, :, :
+                    ]
+                    _copy_A_padded(cpu_A, gpu_A)
 
                 # LoRA‑B
                 if lora_b_key:
-                    cpu_tensor = self.cpu_cache[lora_b_key][i].unsqueeze(0).unsqueeze(0)
-                    gpu_tensor = loras[lora_key].lora_b_stacked[i]
-                    _copy_lora_from_cpu(cpu_tensor, gpu_tensor, tp_idx, tp_world_size)
+                    cpu_B = self.cpu_cache[lora_b_key][i]  # [out_full, r_small]
+                    gpu_B = loras[lora_key].lora_b_stacked[i][
+                        adapter_slot : adapter_slot + 1, :, :, :
+                    ]
+                    _copy_B_padded(cpu_B, gpu_B)
 
+        # Clear CPU cache after updates
         self.cpu_cache = {}
