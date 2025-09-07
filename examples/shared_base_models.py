@@ -51,7 +51,7 @@ SHARED_ENGINE_KWARGS = {
 # Explicit capacity we want for the shared base (used by Alice via expected_max_lora_rank)
 BASE_CAPACITY_R = 128
 
-print("🚀 Creating actors with shared base model configuration (rank-aware)...")
+print("🚀 Creating actors with shared base model configuration...")
 print(f"📦 Shared model: {SHARED_MODEL_PATH}")
 print(f"⚙️  Shared engine base config: {SHARED_ENGINE_KWARGS}")
 print(f"📐 Configured base capacity (expected_max_lora_rank): r={BASE_CAPACITY_R}")
@@ -142,56 +142,6 @@ charlie_actor = vLLMActor(
     training_config=training_config_charlie,
     allow_sharing=True,
 )
-
-# ----------------------------------------------------------
-# Demonstrate shared model information
-# ----------------------------------------------------------
-
-print("\n📊 Shared Model Information:")
-print("=" * 50)
-
-from actors.inference.pool import ModelPool
-
-pool = ModelPool()
-
-print(f"Total models loaded: {len(pool.models)}")
-print(f"Shared base models: {len(pool.shared_models)}")
-
-# Show details for each actor
-for actor_name in ["Alice", "Bob", "Charlie"]:
-    if actor_name in pool.models:
-        record = pool.models[actor_name]
-        if record.is_shared and record.shared_config:
-            base_id = record.shared_config.base_model_id
-            adapter_info = record.lora_adapters[actor_name]
-            capacity = (
-                record.shared_config.max_lora_rank if record.shared_config else -1
-            )
-            required_r = (
-                training_config_alice.peft_config.r
-                if actor_name == "Alice"
-                else (
-                    training_config_bob.peft_config.r
-                    if actor_name == "Bob"
-                    else training_config_charlie.peft_config.r
-                )
-            )
-            print(
-                f"  🔗 {actor_name}: shared model {base_id[:8]}... "
-                f"(adapter_id={adapter_info.adapter_id}, base capacity r={capacity}, required r={required_r})"
-            )
-        else:
-            print(f"  ❌ {actor_name}: not using shared model")
-
-# Show shared model statistics
-if pool.shared_models:
-    for base_id, shared_record in pool.shared_models.items():
-        adapters = list(shared_record.lora_adapters.keys())
-        capacity = shared_record.shared_config.max_lora_rank
-        print(
-            f"  📦 Base model {base_id[:8]}...: {len(adapters)} actors {adapters}, capacity r={capacity}"
-        )
-        print("     💾 Potential savings: merges avoid extra model loads")
 
 # ----------------------------------------------------------
 # Reward: Extract boxed answer from last assistant message and compare to golden
@@ -338,9 +288,7 @@ cfg = GRPOTrainerCfg(
 
 def main():
     """Main training function."""
-    print(
-        "\n🚀 Starting collaborative training with shared base models (rank-aware)..."
-    )
+    print("\n🚀 Starting collaborative training with shared base models...")
     print("=" * 60)
 
     trainer = GRPOTrainer(

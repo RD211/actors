@@ -737,9 +737,7 @@ class BaseRLTrainer:
             self.logger.normal(colorize("🔍 Starting evaluation...", Palette.INFO))
 
         # Use environment's eval method to get all eval results
-        eval_outputs = None
-        if self.accel.is_local_main_process:
-            eval_outputs = self.env.eval(group_size=1)
+        eval_outputs = self.env.eval(group_size=1, accelerator=self.accel)
 
         all_eval_metrics = {}
         self.accel.wait_for_everyone()
