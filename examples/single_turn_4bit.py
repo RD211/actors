@@ -181,7 +181,7 @@ def main():
         num_iterations=2,
         log_every_n=1,
         eval_every_n=5,  # No periodic evaluation
-        eval_strategy=EvalStrategy.STEPS,  # No evaluation
+        eval_strategy=EvalStrategy.STEPS,
         checkpoint_every_n=30,
         save_strategy=SaveStrategy.ALL,
     )

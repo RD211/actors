@@ -131,7 +131,6 @@ def to_vllm_lora_state_dict(state_dict):
         dtype = exemplar.dtype
         device = exemplar.device
         shape = exemplar.shape
-        # All q/k/v share same shapes for LoRA A/B in attention projections
         zeros = lambda: torch.zeros(shape, dtype=dtype, device=device)  # noqa
         q = bucket.get("q", zeros())
         k = bucket.get("k", zeros())

@@ -81,7 +81,6 @@ class LoRAAdapterInfo:
 
     actor_name: str
     lora_path: str | None
-    lora_rank: int
     max_loras: int
     adapter_id: int  # Unique ID for this adapter within the shared model
 
@@ -133,7 +132,6 @@ class ModelPool:
         self.shared_models: dict[
             str, ModelRecord
         ] = {}  # base_model_id -> shared model record
-        self.next_adapter_id = 1  # Global counter for adapter IDs
         os.environ["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
         ray.init(ignore_reinit_error=True)
         self._init_done = True
@@ -367,11 +365,10 @@ class ModelPool:
         adapter_info = LoRAAdapterInfo(
             actor_name=name,
             lora_path=None,  # Will be set when LoRA is created
-            lora_rank=16,  # Default, will be updated when LoRA is created
             max_loras=engine_kwargs.get("max_loras", 1),
-            adapter_id=self.next_adapter_id,
+            adapter_id=len(shared_record.lora_adapters)
+            + 1,  # Unique ID within shared model
         )
-        self.next_adapter_id += 1
 
         # Add adapter to shared model
         shared_record.lora_adapters[name] = adapter_info
@@ -478,11 +475,9 @@ class ModelPool:
             adapter_info = LoRAAdapterInfo(
                 actor_name=name,
                 lora_path=None,
-                lora_rank=16,  # Default, will be updated when LoRA is created
                 max_loras=engine_kwargs.get("max_loras", 1),
-                adapter_id=self.next_adapter_id,
+                adapter_id=1,
             )
-            self.next_adapter_id += 1
 
             # Create shared model record
             shared_record = ModelRecord(
@@ -647,11 +642,9 @@ class ModelPool:
             adapter_info = LoRAAdapterInfo(
                 actor_name=name,
                 lora_path=None,
-                lora_rank=16,  # Default, will be updated when LoRA is created
                 max_loras=rec.kwargs.get("max_loras", 1),
-                adapter_id=self.next_adapter_id,
+                adapter_id=1,
             )
-            self.next_adapter_id += 1
             rec.lora_adapters[name] = adapter_info
 
         # Update the LoRA path in adapter info
@@ -776,25 +769,17 @@ class ModelPool:
         # Handle LoRA request logic at pool level
         # Convert DEFAULT_LORA to actual LoRARequest if model has LoRA enabled
         if lora_request is DEFAULT_LORA and rec.kwargs.get("enable_lora", False):
-            import os
-
             from vllm.lora.request import LoRARequest
 
             # Get the adapter info for this actor
             adapter_info = rec.lora_adapters.get(name)
-            if (
-                adapter_info
-                and adapter_info.lora_path
-                and os.path.exists(adapter_info.lora_path)
-            ):
-                # Only create LoRA request if the path exists
+            if adapter_info and adapter_info.lora_path:
                 lora_request = LoRARequest(
                     lora_name=f"lora_{name}",
                     lora_int_id=adapter_info.adapter_id,
                     lora_local_path=adapter_info.lora_path,
                 )
             else:
-                # No LoRA request if adapter doesn't exist yet
                 lora_request = None
         if lora_request is DEFAULT_LORA:
             lora_request = None
