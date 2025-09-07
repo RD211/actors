@@ -136,6 +136,11 @@ class ColocateWorkerExtension:
 
             start = int(tp_idx) * in_local
             end = start + in_local
+
+            if src.shape == gpu_A.shape:
+                gpu_A.copy_(src)
+                return
+
             gpu_A.copy_(src[:, :, :, start:end])
 
         def _copy_B_padded(cpu_B: torch.Tensor, gpu_B: torch.Tensor):
@@ -153,6 +158,9 @@ class ColocateWorkerExtension:
 
             start = int(tp_idx) * out_local
             end = start + out_local
+            if src.shape == gpu_B.shape:
+                gpu_B.copy_(src)
+                return
             gpu_B.copy_(src[:, :, start:end, :])
 
         for lora_key in loras.keys():

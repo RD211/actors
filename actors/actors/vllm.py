@@ -70,7 +70,7 @@ class vLLMActor(TrainableLLMActor):
                 tensor_parallel_size = len(gpu_g)
                 if num_heads % tensor_parallel_size != 0:
                     self.logger.error(
-                        f"{colorize(Palette.RED, 'ERROR:')} "
+                        f"{colorize(Palette.ERROR, 'ERROR:')} "
                         f"num_attention_heads ({num_heads}) is not divisible by "
                         f"tensor_parallel_size ({tensor_parallel_size}). "
                         "This will probably crash but let's try anyway."
@@ -112,18 +112,6 @@ class vLLMActor(TrainableLLMActor):
             engine_kwargs=final_engine_kwargs,
         )
 
-        # Log information about shared model usage
-        if name in self.pool.models:
-            model_record = self.pool.models[name]
-            if model_record.is_shared and model_record.shared_config:
-                base_model_id = model_record.shared_config.base_model_id
-                shared_record = self.pool.shared_models[base_model_id]
-                num_adapters = len(shared_record.lora_adapters)
-                self.logger.info(
-                    f"{colorize(Palette.SUCCESS, 'SHARED MODEL:')} "
-                    f"{name} is using shared base model {base_model_id} "
-                    f"with {num_adapters} LoRA adapter(s)"
-                )
         # Register cleanup function for this actor
         atexit.register(self._cleanup)
         self.name = name

@@ -70,7 +70,8 @@ env = CollaborativeEnvironment(
 You can install the library from source for the latest features and bug fixes:
 ```bash
 git clone https://github.com/RD211/actors.git
-pip install .
+cd actors
+pip install -e .
 ```
 Or install from PyPI:
 ```bash

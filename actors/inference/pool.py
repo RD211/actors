@@ -475,7 +475,6 @@ class ModelPool:
             )
 
             # Create LoRA adapter info for this actor
-            # Note: The actual LoRA rank will be set when the LoRA adapter is created
             adapter_info = LoRAAdapterInfo(
                 actor_name=name,
                 lora_path=None,
@@ -645,7 +644,15 @@ class ModelPool:
         # Get the adapter info for this actor
         adapter_info = rec.lora_adapters.get(name)
         if not adapter_info:
-            raise RuntimeError(f"No LoRA adapter info found for actor {name}")
+            adapter_info = LoRAAdapterInfo(
+                actor_name=name,
+                lora_path=None,
+                lora_rank=16,  # Default, will be updated when LoRA is created
+                max_loras=rec.kwargs.get("max_loras", 1),
+                adapter_id=self.next_adapter_id,
+            )
+            self.next_adapter_id += 1
+            rec.lora_adapters[name] = adapter_info
 
         # Update the LoRA path in adapter info
         adapter_info.lora_path = lora_path
