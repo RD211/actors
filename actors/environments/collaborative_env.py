@@ -107,7 +107,7 @@ class CollaborativeEnvironment(Environment):
                 tmpl = Template(cfg.system_prompt)
                 entry = {k: batch[k][idx] for k in batch}
                 return tmpl.render(**entry)
-            return cfg.system_prompt + problems[idx]
+            return cfg.system_prompt
 
         per_row_turns = [
             sample_schedule(self.schedule_dsl_spec, self.all_names) for _ in range(n)

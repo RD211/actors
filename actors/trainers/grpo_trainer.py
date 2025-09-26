@@ -366,8 +366,8 @@ class GRPOTrainer(BaseRLTrainer):
                 old_lp,
             )
 
+        # TODO: Fix this to not also do .step() silently.
         ta.accel.backward(loss)
-
         result.add_substep_metric(actor_name, substep_idx, "loss", loss.item())
         if "kl" in stats and getattr(ta.loss_fn, "beta", 0.0) != 0.0:
             result.add_substep_metric(actor_name, substep_idx, "kl", stats["kl"])

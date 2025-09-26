@@ -543,7 +543,7 @@ class BaseRLTrainer:
         return grad_norm
 
     def _optim_step(self, ta: ActorTrainState) -> None:
-        ta.optim.step()
+        # ta.optim.step()
         ta.sched.step()
         ta.optim.zero_grad()
         ta.accel.wait_for_everyone()

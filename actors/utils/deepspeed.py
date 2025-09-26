@@ -242,62 +242,6 @@ def reload_model_and_optimizer(
     return info
 
 
-def prepare_deepspeed_reference(model, accelerator: "accelerate", use_cpu_offload=True):
-    deepspeed_plugin = accelerator.state.deepspeed_plugin
-    config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
-
-    if use_cpu_offload:
-        config_kwargs.update(
-            {
-                "zero_optimization": {
-                    "stage": 3,
-                    "offload_param": {
-                        "device": "cpu",
-                        "pin_memory": True,
-                        "buffer_count": 1,
-                        "buffer_size": 1e8,
-                        "max_in_cpu": 1e9,
-                    },
-                    "offload_optimizer": {
-                        "device": "cpu",
-                        "pin_memory": True,
-                    },
-                    "stage3_param_persistence_threshold": 0,
-                    "stage3_prefetch_bucket_size": 1e6,
-                    "stage3_max_live_parameters": 1e6,
-                    "stage3_max_reuse_distance": 0,
-                    "reduce_bucket_size": 1e6,
-                    "contiguous_gradients": False,
-                    "overlap_comm": False,
-                    "sub_group_size": 1e6,
-                },
-            }
-        )
-
-        if model is not None:
-            hidden_size = (
-                max(model.config.hidden_sizes)
-                if getattr(model.config, "hidden_sizes", None)
-                else getattr(model.config, "hidden_size", None)
-            )
-            if hidden_size is not None:
-                config_kwargs["zero_optimization"].update(
-                    {
-                        "stage3_param_persistence_threshold": 0,
-                        "stage3_prefetch_bucket_size": min(hidden_size * 10, 1e6),
-                        "stage3_max_live_parameters": min(hidden_size * 100, 1e6),
-                    }
-                )
-    else:
-        stage = config_kwargs["zero_optimization"]["stage"]
-        if stage != 3:
-            config_kwargs["zero_optimization"]["stage"] = 0
-
-    model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
-    model.eval()
-    return model
-
-
 # Hack to allow offloading other optimizers too.
 
 
