@@ -21,10 +21,6 @@ from actors.rewards import (
 SAMPLER_PROMPT = r"""
 You are tasked with helping a user with a task.
 You will try to be very creative and helpful with your answers.
-You must put your hidden thinking like such:
-<think>
-... your hidden thinking here ...
-</think>
 You will then provide a response to the user normally after the thinking has been completed.
 You must always think before you answer and never leak your hidden thinking to the user.
 
@@ -295,8 +291,6 @@ class ParallelEnvironment(Environment):
 
         # sampler drafts
         for cfg in self.sampler_cfgs:
-            if not cfg.actor.is_actually_trainable:
-                continue
             tok = cfg.actor.training_config.tokenizer_factory()
             gen_w = {rf.name: rf.weight for rf in self.gen_rewards}
 
@@ -335,24 +329,23 @@ class ParallelEnvironment(Environment):
                     )
 
         # combiner
-        if self.final_combiner.actor.is_actually_trainable:
-            tok_c = self.final_combiner.actor.training_config.tokenizer_factory()
-            comb_w = {rf.name: rf.weight for rf in self.comb_rewards}
-            for idx in range(B):
-                comp_vals = {k: comb_reward[k][idx] for k in comb_reward}
-                total = sum(comb_w[n] * v for n, v in comp_vals.items())
+        tok_c = self.final_combiner.actor.training_config.tokenizer_factory()
+        comb_w = {rf.name: rf.weight for rf in self.comb_rewards}
+        for idx in range(B):
+            comp_vals = {k: comb_reward[k][idx] for k in comb_reward}
+            total = sum(comb_w[n] * v for n, v in comp_vals.items())
 
-                env_out.add_entry(
-                    problem_idx=idx,
-                    actor_name=self.final_combiner.actor.name,
-                    group_name="combiner",
-                    tokenizer=tok_c,
-                    messages=[
-                        {"role": "user", "content": comb_prompts[idx][0]["content"]},
-                        {"role": "assistant", "content": comb_answers[idx]},
-                    ],
-                    rewards=total,
-                    reward_components=comp_vals,
-                )
+            env_out.add_entry(
+                problem_idx=idx,
+                actor_name=self.final_combiner.actor.name,
+                group_name="combiner",
+                tokenizer=tok_c,
+                messages=[
+                    {"role": "user", "content": comb_prompts[idx][0]["content"]},
+                    {"role": "assistant", "content": comb_answers[idx]},
+                ],
+                rewards=total,
+                reward_components=comp_vals,
+            )
 
         return env_out
