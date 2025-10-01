@@ -223,8 +223,8 @@ class EnvironmentOutput:
         prim: list[float] = []
         for probs in self.get_actor_output(actor_name):
             for ao in probs:
-                prim.extend(ao.rewards)
-                for k, v in ao.reward_components.items():
+                prim.extend(probs[ao].rewards)
+                for k, v in probs[ao].reward_components.items():
                     agg.setdefault(k, []).extend(v)
 
         def stats(vals: list[float]) -> dict[str, float]:

@@ -380,12 +380,6 @@ class BaseRLTrainer:
                     model.config.use_cache = False
                     model.enable_input_require_grads()
 
-                if (
-                    actor_obj.training_config.gradient_checkpointing_strategy
-                    == "unsloth"
-                ):
-                    revert_unsloth_offloaded_gradient_checkpoint_monkey_patch()
-
             disable_dropout_in_model(model)
             model_cfg = model.config
 
